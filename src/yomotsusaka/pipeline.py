@@ -27,6 +27,16 @@ from yomotsusaka.validator import Validator
 # or break restoration via restoration_api.restore.
 _DOC_ID_PATTERN = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
 
+# Windows reserved device names (case-insensitive, with or without extension).
+# Writing to e.g. ``private/NUL.json`` on Windows opens the NUL device instead
+# of a regular file, so reject these up front for cross-platform safety.
+# Reference: https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
 
 def _validate_doc_id(doc_id: str) -> None:
     if not isinstance(doc_id, str) or not _DOC_ID_PATTERN.fullmatch(doc_id):
@@ -36,6 +46,14 @@ def _validate_doc_id(doc_id: str) -> None:
         )
     if doc_id in {".", ".."}:
         raise ValueError("doc_id must not be a path traversal segment")
+    # Windows-reserved device names apply to the basename (the portion before
+    # the first dot), case-insensitively, with or without an extension.
+    stem = doc_id.split(".", 1)[0].upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        raise ValueError(
+            f"doc_id stem {stem!r} collides with a Windows reserved device name; "
+            "choose a different identifier"
+        )
 
 
 def process_document(
