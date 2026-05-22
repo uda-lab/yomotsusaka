@@ -157,6 +157,7 @@ _KNOWN_NON_RESPONSE_EXPORTS: frozenset[str] = frozenset(
         "InspectRequest",
         "SearchRequest",
         "RestorationRequest",
+        "RestorationFailureReason",
         "StatusReportRequest",
     }
 )
@@ -472,19 +473,31 @@ def test_search_response_with_raw_value_queries_yields_no_leak(
 # ---------------------------------------------------------------------------
 
 
+def _exposure_restoration_request(handle: PublicHandle) -> RestorationRequest:
+    from datetime import datetime, timezone
+
+    return RestorationRequest(
+        caller_label="exposure-contract-test",
+        reason="exposure-contract-test",
+        timestamp=datetime.now(timezone.utc),
+        target_public_handle=handle,
+        requested_entity_kinds=[EntityKind.PERSON],
+    )
+
+
 def test_restoration_response_serialisation_is_opaque(
     canonical_vault: tuple[Path, ProcessResponse, PublicHandle],
 ) -> None:
     vault_root, _response, handle = canonical_vault
     response = restoration_request(
-        RestorationRequest(locator=handle.locator, purpose="exposure-contract-test"),
+        _exposure_restoration_request(handle),
+        scope=ResolverScope.ORDINARY_AGENT,
         vault_root=vault_root,
     )
-    # MVP-2 always returns the deferred shape (Literal["deferred"]); #27
-    # may widen the type. We deliberately do NOT assert against a hard-coded
-    # set of strings here because Pydantic enforces the current Literal at
-    # construction time — a free-form set check would be vacuous. The
-    # serialised-blob scans below are the real privacy invariant; the
+    # MVP-2 with #27 always returns one of the well-typed outcomes
+    # (``accepted`` / ``accepted_but_redacted`` / ``failed``); the
+    # ordinary-agent scope here yields ``failed`` with ``scope_denied``.
+    # The serialised-blob scans below are the real privacy invariant; the
     # outcome value itself is whatever the boundary chose to emit.
     assert isinstance(response, RestorationResponse)
 
@@ -496,8 +509,11 @@ def test_restoration_response_serialisation_is_opaque(
             extra=_scrub_for_path_assertion(vault_root),
         )
 
-    count = _walk_handles(response.model_dump(mode="json"), surface="RestorationResponse")
-    assert count >= 1
+    # The new RestorationResponse intentionally does not carry a public
+    # locator field (it carries `document_id` and the redacted handle is
+    # already in the audit log). No `count >= 1` assertion here; the
+    # locator round-trip test below excludes RestorationResponse for the
+    # same reason.
 
 
 # ---------------------------------------------------------------------------
@@ -671,21 +687,28 @@ def test_resolver_failure_purpose_not_permitted_is_opaque(tmp_path: Path) -> Non
             extra=_scrub_for_path_assertion(vault_root),
         )
 
-    # Also exercise the deferred restoration_request path, whose own purpose
-    # check returns the same failure reason.
+    # Also exercise the restoration_request scope-denied path, whose
+    # response is a different failure variant but must satisfy the same
+    # leak-scan invariants.
+    from yomotsusaka.boundary import RestorationFailureReason
+
     restore_failure = restoration_request(
-        RestorationRequest(locator=_expected_locator("any-id"), purpose=""),
+        _exposure_restoration_request(
+            PublicHandle(locator=_expected_locator("any-id"))
+        ),
+        scope=ResolverScope.ORDINARY_AGENT,
         vault_root=vault_root,
     )
-    assert isinstance(restore_failure, ResolverFailure)
-    assert restore_failure.reason is ResolverFailureReason.PurposeNotPermitted
+    assert isinstance(restore_failure, RestorationResponse)
+    assert restore_failure.outcome == "failed"
+    assert restore_failure.reason is RestorationFailureReason.ScopeDenied
     for blob in _both_json_renders(restore_failure):
         _assert_no_raw_values(
-            blob, surface="restoration_request.PurposeNotPermitted"
+            blob, surface="restoration_request.ScopeDenied"
         )
         _assert_no_paths(
             blob,
-            surface="restoration_request.PurposeNotPermitted",
+            surface="restoration_request.ScopeDenied",
             extra=_scrub_for_path_assertion(vault_root),
         )
 
@@ -857,7 +880,8 @@ def test_boundary_entry_points_do_not_log_raw_values(
         gateway = _make_indexed_gateway(vault_root, "caplog-doc")
         search_request(SearchRequest(query="<PERSON_"), gateway=gateway)
         restoration_request(
-            RestorationRequest(locator=proc.handle.locator, purpose="t"),
+            _exposure_restoration_request(proc.handle),
+            scope=ResolverScope.ORDINARY_AGENT,
             vault_root=vault_root,
         )
         status_report_request(
@@ -918,7 +942,8 @@ def test_boundary_entry_points_do_not_print_raw_values(
     gateway = _make_indexed_gateway(vault_root, "capsys-doc")
     search_request(SearchRequest(query="<PERSON_"), gateway=gateway)
     restoration_request(
-        RestorationRequest(locator=proc.handle.locator, purpose="t"),
+        _exposure_restoration_request(proc.handle),
+        scope=ResolverScope.ORDINARY_AGENT,
         vault_root=vault_root,
     )
     status_report_request(
@@ -1007,9 +1032,10 @@ def test_every_locator_field_round_trips_through_parse_locator(
     gateway = _make_indexed_gateway(vault_root, "exposure-doc-001")
     search_resp = search_request(SearchRequest(query="<PERSON_"), gateway=gateway)
 
-    # RestorationResponse (deferred)
+    # RestorationResponse (scope-denied via ordinary-agent path)
     restore_resp = restoration_request(
-        RestorationRequest(locator=handle.locator, purpose="t"),
+        _exposure_restoration_request(handle),
+        scope=ResolverScope.ORDINARY_AGENT,
         vault_root=vault_root,
     )
     assert isinstance(restore_resp, RestorationResponse)
@@ -1030,7 +1056,12 @@ def test_every_locator_field_round_trips_through_parse_locator(
         ("ProcessResponse", process_response),
         ("InspectResponse", inspect_resp),
         ("SearchResponse", search_resp),
-        ("RestorationResponse", restore_resp),
+        # RestorationResponse intentionally does NOT carry a public locator
+        # field under the #27 audit-logged contract — the response carries
+        # `document_id`, `audit_record_id`, and (for `accepted`)
+        # `private_entries`; the public handle is in the audit log, not the
+        # response body. Walking it would assert ``count >= 1`` for a
+        # surface that legitimately has no locator string, so we omit it.
         ("StatusReportResponse(committed)", status_committed),
         ("StatusReportResponse(unknown)", status_unknown),
     ):
@@ -1039,8 +1070,12 @@ def test_every_locator_field_round_trips_through_parse_locator(
         )
 
     # Conservative lower bound: ProcessResponse(1) + handle(1) +
-    # SearchResponse(>=1) + Restoration(1) + Status(2) = 6.
-    assert total_locators >= 6, (
-        f"expected >=6 locator-bearing fields across successful surfaces, "
+    # SearchResponse(>=1) + Status(2) = 5.
+    assert total_locators >= 5, (
+        f"expected >=5 locator-bearing fields across successful surfaces, "
         f"got {total_locators}"
     )
+    # Sanity: the omitted RestorationResponse still must not leak raw
+    # values or vault paths (asserted elsewhere); the omission is purely
+    # structural.
+    assert isinstance(restore_resp, RestorationResponse)

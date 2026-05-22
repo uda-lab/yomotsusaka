@@ -18,9 +18,13 @@ The facade adds **no code path** that returns a value the underlying
   semantics (e.g. the future #27 restoration flow) must call
   :func:`boundary.resolve` directly with the appropriate scope value.
 * No path imports or invokes the private restoration kernel module. The
-  shape-only :func:`boundary.restoration_request` is the only restoration
-  surface this facade exposes, and it returns
-  :class:`RestorationResponse(outcome="deferred")` in MVP-2.
+  facade calls :func:`boundary.restoration_request` with
+  ``scope=ResolverScope.ORDINARY_AGENT`` only; the boundary's scope gate
+  guarantees that ordinary-agent restoration requests are denied with
+  ``failure_reason="scope_denied"`` **before** the kernel module is
+  imported or invoked. Callers needing private-boundary semantics must
+  invoke :func:`boundary.restoration_request` directly with the
+  appropriate scope.
 * No path reads from ``<vault_root>/private/`` or exposes the internal
   ``vault_path`` field. The boundary already discards ``vault_path`` before
   returning a :class:`PublicHandle`; the facade is a pure delegator over
@@ -53,6 +57,7 @@ from yomotsusaka.boundary import (
     ProcessRequest,
     ProcessResponse,
     ResolverFailure,
+    ResolverScope,
     RestorationRequest,
     RestorationResponse,
     SearchRequest,
@@ -130,14 +135,24 @@ class LocalFacade:
 
     def request_restore(
         self, request: RestorationRequest
-    ) -> RestorationResponse | ResolverFailure:
-        """Delegate to :func:`boundary.restoration_request`.
+    ) -> RestorationResponse:
+        """Delegate to :func:`boundary.restoration_request` with ordinary scope.
 
-        Always shape-only in MVP-2: success returns
-        :class:`RestorationResponse(outcome="deferred")`. The real
-        restoration flow is scoped to #27.
+        The facade is hard-wired to ``ResolverScope.ORDINARY_AGENT`` so an
+        ordinary-agent caller can submit a restoration request through the
+        sanctioned audit-logged path while remaining unable to obtain raw
+        private values: the boundary's scope gate returns
+        ``failure_reason="scope_denied"`` for every non-ordinary scope,
+        after writing the denial to the audit log. Callers that actually
+        need raw values must invoke
+        :func:`yomotsusaka.boundary.restoration_request` directly with the
+        narrower scope value, not via this facade.
         """
-        return restoration_request(request, vault_root=self._vault_root)
+        return restoration_request(
+            request,
+            scope=ResolverScope.ORDINARY_AGENT,
+            vault_root=self._vault_root,
+        )
 
     def status_report(
         self, request: StatusReportRequest

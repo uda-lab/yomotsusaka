@@ -197,27 +197,49 @@ def test_search_with_lazy_gateway_returns_empty(tmp_path: Path) -> None:
     assert response.hits == []
 
 
-def test_request_restore_is_deferred(tmp_path: Path) -> None:
-    """``request_restore`` must produce the same shape-only deferred response
-    as the direct boundary call. This pins that the facade did NOT bypass
-    :func:`boundary.restoration_request` (e.g. by calling
-    ``restoration_api.restore`` directly)."""
+def _facade_restore_request(doc_id: str) -> RestorationRequest:
+    from datetime import datetime, timezone
+
+    return RestorationRequest(
+        caller_label="facade-test",
+        reason="facade-delegation-test",
+        timestamp=datetime.now(timezone.utc),
+        document_id=doc_id,
+        requested_entity_kinds=[EntityKind.PERSON],
+    )
+
+
+def test_request_restore_is_scope_denied(tmp_path: Path) -> None:
+    """``request_restore`` must produce the same scope-denied response as the
+    direct ordinary-agent boundary call. The facade is hard-wired to
+    ``ResolverScope.ORDINARY_AGENT`` so #27's audit-logged path runs but
+    the kernel is never invoked."""
+    from yomotsusaka.boundary import (
+        ResolverScope,
+        RestorationFailureReason,
+    )
+
     vault = tmp_path / "vault"
     doc_id = "facade-restore-001"
     facade = LocalFacade(vault)
     facade.process(_process_request(doc_id))
 
-    facade_response = facade.request_restore(
-        RestorationRequest(locator=_expected_locator(doc_id), purpose="t")
-    )
+    facade_response = facade.request_restore(_facade_restore_request(doc_id))
     direct_response = restoration_request(
-        RestorationRequest(locator=_expected_locator(doc_id), purpose="t"),
+        _facade_restore_request(doc_id),
+        scope=ResolverScope.ORDINARY_AGENT,
         vault_root=vault,
     )
 
     assert isinstance(facade_response, RestorationResponse)
-    assert facade_response.outcome == "deferred"
-    assert facade_response.model_dump() == direct_response.model_dump()
+    assert facade_response.outcome == "failed"
+    assert facade_response.reason is RestorationFailureReason.ScopeDenied
+    assert facade_response.private_entries is None
+    # The facade response is shape-identical to a direct ordinary-agent call,
+    # modulo the per-request audit_record_id which is freshly generated.
+    assert facade_response.outcome == direct_response.outcome
+    assert facade_response.reason == direct_response.reason
+    assert facade_response.document_id == direct_response.document_id
 
 
 def test_request_restore_does_not_call_restoration_api(
@@ -225,7 +247,8 @@ def test_request_restore_does_not_call_restoration_api(
 ) -> None:
     """Mechanical guard: ``LocalFacade.request_restore`` must not invoke
     ``restoration_api.restore``. The boundary already enforces this for its
-    own entry point; this test verifies the facade did not add a bypass."""
+    own entry point (scope gate); this test verifies the facade did not
+    add a bypass."""
     vault = tmp_path / "vault"
     doc_id = "facade-restore-no-call"
     facade = LocalFacade(vault)
@@ -238,21 +261,32 @@ def test_request_restore_does_not_call_restoration_api(
 
     monkeypatch.setattr(restoration_api, "restore", boom)
 
-    response = facade.request_restore(
-        RestorationRequest(locator=_expected_locator(doc_id), purpose="t")
-    )
+    response = facade.request_restore(_facade_restore_request(doc_id))
     assert isinstance(response, RestorationResponse)
 
 
-def test_request_restore_propagates_resolver_failure(tmp_path: Path) -> None:
-    """Malformed locator must surface as ``ResolverFailure``; the facade
-    does not paper over failure typing."""
+def test_request_restore_propagates_request_schema_failure(tmp_path: Path) -> None:
+    """A malformed ``target_public_handle`` must surface as a failed
+    ``RestorationResponse`` with ``RequestSchemaInvalid``; the facade does
+    not paper over failure typing."""
+    from datetime import datetime, timezone
+
+    from yomotsusaka.boundary import PublicHandle, RestorationFailureReason
+
     facade = LocalFacade(tmp_path)
-    response = facade.request_restore(
-        RestorationRequest(locator="bogus", purpose="t")
+    req = RestorationRequest(
+        caller_label="facade-test",
+        reason="facade-delegation-test",
+        timestamp=datetime.now(timezone.utc),
+        target_public_handle=PublicHandle(
+            locator="private://agent_redacted/private_dict/some-id"
+        ),
+        requested_entity_kinds=[EntityKind.PERSON],
     )
-    assert isinstance(response, ResolverFailure)
-    assert response.reason is ResolverFailureReason.MalformedLocator
+    response = facade.request_restore(req)
+    assert isinstance(response, RestorationResponse)
+    assert response.outcome == "failed"
+    assert response.reason is RestorationFailureReason.RequestSchemaInvalid
 
 
 def test_status_report_committed_after_process(tmp_path: Path) -> None:
