@@ -5,6 +5,7 @@ Plugin boundary: a real implementation would back this with a vector store
 (e.g. Qdrant, ChromaDB) or a keyword index.  The stub performs a naive
 substring search over in-memory manifests.
 """
+# MVP: substring-only; see docs/scaffold-status.md
 
 from __future__ import annotations
 
