@@ -1,4 +1,5 @@
-"""
+"""Private-side internal kernel. Ordinary agents should use ``yomotsusaka.boundary`` instead.
+
 Pipeline — local orchestrator that walks raw text through redact → validate → commit.
 
 This module wires the existing primitives (:mod:`yomotsusaka.redactor`,

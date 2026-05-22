@@ -1,4 +1,5 @@
-"""
+"""Private-side internal kernel. Ordinary agents should use ``yomotsusaka.boundary`` instead.
+
 Commit — persist a processed manifest and return an artifact handle.
 
 In the MVP the vault is a local directory.  A real implementation would write

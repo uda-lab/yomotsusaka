@@ -32,7 +32,8 @@ this table refines that model down to per-module classification.
 
 | Module | Classification | Current behavior | MVP role |
 | --- | --- | --- | --- |
-| `src/yomotsusaka/schemas.py` | functional | Pydantic v2 models (`EntityKind`, `EntityRecord`, `PrivateDictEntry`, `DocumentManifest`, `ArtifactHandle`, `BatchState`, `BatchStatus`) with frozen defaults and UUID factories. | Shared schema layer that every other module imports; the public/private boundary is encoded here. |
+| `src/yomotsusaka/boundary.py` | functional | Opaque public surface. Defines the `private://<exposure_class>/<artifact_kind>/<opaque_id>[#<fragment>]` locator grammar (`build_locator`, `parse_locator`, `ParsedLocator`), `PublicHandle`, `SpanSpec`; the fail-closed `resolve(...)` contract with `ResolverScope`, `ResolverFailureReason`, `ResolverSuccess`/`ResolverFailure`, `PrivateState`, `ResolverError`; and the five MVP-2 request/response models (process/inspect/search/restoration/status_report) with matching entry points. The internal `ArtifactHandle.vault_path` is discarded at the boundary; only the opaque locator survives. | Public boundary (architecture §5.7.1, §5.7.2) — the only surface ordinary agents are intended to import; restoration is shape-only and deferred to #27. |
+| `src/yomotsusaka/schemas.py` | functional | Pydantic v2 models (`EntityKind`, `EntityRecord`, `PrivateDictEntry`, `DocumentManifest`, `ArtifactHandle`, `BatchState`, `BatchStatus`) with frozen defaults and UUID factories. `ArtifactHandle` carries `vault_path` and is reclassified as private-side internal state (see "Kernel reclassification" below). | Shared schema layer that every other module imports; the public/private boundary is encoded here. |
 | `src/yomotsusaka/redactor.py` | functional | `redact(text, spans)` replaces each non-overlapping span with `<KIND_sha256[:8]>`, returning redacted text, `EntityRecord`s, and `PrivateDictEntry`s; silently drops overlapping or out-of-range spans. | Redaction and keying boundary (architecture §5.4) — deterministic span-to-key substitution. |
 | `src/yomotsusaka/commit.py` | functional | Writes the manifest JSON to `<vault_root>/manifests/<doc_id>.json` and the private dictionary to `<vault_root>/private/<doc_id>.json`; returns an `ArtifactHandle` pointing at the private file. | Commit boundary (architecture §5.6) — atomic local persistence of manifest + private dictionary. |
 | `src/yomotsusaka/restoration_api.py` | functional | `restore(handle)` resolves the handle's `vault_path`, enforces that it stays inside `<vault_root>/private/`, and reads the JSON back into `PrivateDictEntry` objects; raises `RestorationError` on boundary violation or missing file. | Restoration model (architecture §9) — sole sanctioned re-hydration path for private values. |
@@ -45,6 +46,19 @@ this table refines that model down to per-module classification.
 | `src/yomotsusaka/transfer.py` | deferred | `TransferBackend.upload` logs a warning and returns `"stub://<destination>/<doc_id>"`; `download` raises `TransferError`; `TransferError` exception type is defined. | Transfer boundary (architecture §5.2) — S3 / GCS / SFTP backends slot in here; local MVP needs no remote transfer. |
 
 `src/yomotsusaka/__init__.py` is excluded by design (package entry point, no behavior to classify).
+
+## Kernel reclassification
+
+MVP-2 (#26 + #28) introduces `yomotsusaka.boundary` as the opaque public
+surface. The MVP-1 modules `pipeline.py`, `commit.py`, `restoration_api.py`,
+and `search_gateway.py` keep their existing import paths and behavior — no
+deprecation warning, no rename, no move — but are reclassified as
+**private-side internal kernel**: each carries a single-line docstring
+banner pointing ordinary agents to `yomotsusaka.boundary` instead. The
+`ArtifactHandle.vault_path` field similarly remains in `schemas.py` as
+private-side internal state; the public boundary never returns it (the
+opaque locator is the only handle ordinary agents see). Test fixtures
+that already depend on the kernel APIs continue to import them directly.
 
 ## Maintenance
 

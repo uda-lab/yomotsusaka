@@ -1,4 +1,5 @@
-"""
+"""Private-side internal kernel. Ordinary agents should use ``yomotsusaka.boundary`` instead.
+
 Search gateway — agent-facing search over redacted manifests.
 
 Plugin boundary: a real implementation would back this with a vector store
