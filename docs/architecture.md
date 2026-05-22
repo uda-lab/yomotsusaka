@@ -20,6 +20,214 @@ When guidance disagrees, follow this order:
 
 If these sources conflict on privacy-boundary decisions, follow `docs/architecture.md` and record the conflict in the active child issue or PR.
 
+## Capability and exposure model
+
+This section is the canonical decision surface for "may this role do this thing
+to an artifact of this exposure class?". Downstream MVP-2 work — request/response
+schemas, restoration request shape, resolver, contract tests, and the local
+boundary facade — must cite this section rather than re-deriving the split.
+
+The model adapts the publication-class discipline of `uda-lab/spread-applicant-ai`
+to the Yomotsusaka local firewall; it is not a direct copy. Identifiers below
+are documentation tokens. They are deliberately not introduced as Python
+identifiers in this section's PR; later issues may choose canonical Python names.
+
+### Roles
+
+- **ordinary agent** — a general-purpose coding or LLM agent (Claude Code,
+  similar) operating on the agent-facing workspace. It interacts with the
+  firewall only through boundary interfaces (public manifests, opaque handles,
+  redacted search, restoration requests). It does not read the private vault,
+  does not read private dictionary files, and does not import private-side
+  modules to bypass the boundary.
+- **private-boundary service** — code running inside the private trust
+  boundary (`restoration_api.py`, `redactor.py`'s key-issuing path, the search
+  gateway's query-resolution stage, the resolver in #28). It may read and write
+  the private vault, may read private dictionaries, and may handle raw private
+  values in memory. It is responsible for emitting only public-safe artifacts
+  back across the boundary.
+- **human/operator** — the project owner or another authorised human. The
+  operator may inspect the private vault directly out-of-band, configure
+  policy, approve sensitive restoration requests, and review audit logs. The
+  operator is not an automated agent; capability cells assume direct shell or
+  filesystem access rather than mediated request flows.
+- **restricted reviewer or task scope** — a reviewer agent or a task-scoped
+  subagent whose operating scope is narrower than the ordinary agent role
+  (e.g. a code-review subagent inspecting a PR without read access to private
+  vault contents, or a delegate restricted to a specific document subset). It
+  is a strict subset of the ordinary agent role and inherits ordinary-agent
+  denies; additional `scoped` cells encode the narrower envelope.
+- **test harness** — the `pytest` test runner and supporting fixtures. It
+  splits along the exposure boundary: tests under the private-boundary contract
+  (`test_redactor.py`, `test_restoration_api.py`, future resolver tests) may
+  assert against private dictionary contents using the canonical local fixture;
+  public-output contract tests (the #29 scan) must not contain raw private
+  values outside that fixture and must not assert that public artifacts equal
+  canonical raw values.
+
+### Exposure classes
+
+Each artifact in the system carries an exposure class. The class is operational,
+not a free-form label: it constrains where the artifact may live, which
+surfaces may emit it, and which fixtures may contain it.
+
+- **`agent_public`** — content that is intrinsically safe for ordinary agents.
+  - Vault locations: agent-facing index only (e.g. `<vault_root>/manifests/`
+    public fields, search index files).
+  - API/CLI surfaces: all ordinary agent-facing endpoints, ordinary log
+    streams, status responses, error messages returned to ordinary agents.
+  - Test fixtures: any test may contain `agent_public` values literally.
+- **`agent_redacted`** — derived material in which private spans have been
+  replaced by stable keys and any raw values have been removed.
+  - Vault locations: agent-facing index (redacted documents, redacted
+    summaries, redacted search snippets, public manifests' redacted-text
+    fields).
+  - API/CLI surfaces: the same surfaces as `agent_public`; ordinary agents
+    receive `agent_redacted` artifacts by default rather than `private` ones.
+  - Test fixtures: any test may contain `agent_redacted` values; public-output
+    contract tests assert that ordinary outputs are at most `agent_redacted`.
+- **`private`** — material that may be resolved only inside the private
+  boundary.
+  - Vault locations: private dictionary files (`<vault_root>/private/`), raw
+    documents under the private vault, restoration audit records.
+  - API/CLI surfaces: private-boundary service code only; never returned to
+    ordinary agents, never written to ordinary log streams, never embedded in
+    public manifests, search results, or batch state payloads.
+  - Test fixtures: private-boundary tests only (e.g. `test_redactor.py`,
+    `test_restoration_api.py`), and only against the canonical local fixture.
+- **`restricted`** — `private` plus a narrower scope/profile requirement. The
+  artifact is still private-boundary-only; additionally, even inside the
+  private boundary it requires a matching scope or profile to be resolved
+  (e.g. a sub-corpus that the operator has marked as additionally scoped, or a
+  restoration purpose that must satisfy a stricter policy than ordinary
+  `private` restoration).
+  - Vault locations: same as `private`, plus a scope/profile marker recorded
+    alongside the artifact.
+  - API/CLI surfaces: private-boundary services that present and check the
+    matching scope/profile; the resolver in #28 must fail-closed when the
+    caller's scope does not satisfy the artifact's requirement.
+  - Test fixtures: private-boundary tests that explicitly exercise the scope
+    check; public-output contract tests do not contain `restricted` artifacts.
+- **`never_expose`** — material that must not enter tracked, agent-facing, or
+  private-boundary outputs at all. This class is the deny-by-default sink for
+  values the system never legitimately needs to re-emit (e.g. cleared raw
+  buffers after keying, credential material loaded from environment).
+  - Vault locations: not stored; if present transiently in memory, must be
+    dropped after use.
+  - API/CLI surfaces: none. No surface may emit a `never_expose` artifact, and
+    error messages must not echo `never_expose` content back to the caller.
+  - Test fixtures: not permitted; tests assert absence rather than presence.
+
+### Capability decision matrix
+
+Rows are roles. Columns are capabilities. Cell values are exactly one of
+`permit`, `deny`, `scoped`, or `N/A`:
+
+- `permit` — the role may perform the capability without further restriction
+  beyond ordinary boundary checks.
+- `deny` — the role must not perform the capability; boundary interfaces and
+  tests should enforce this.
+- `scoped` — the role may perform the capability only within a stated
+  envelope; the envelope is given in the corresponding footnote.
+- `N/A` — the capability is not meaningful for this role in MVP-2; treat as
+  `deny` for safety, but the role does not have a real use case for it here.
+
+Capability semantics (neutral verbs, chosen so #26 schemas and #30 facade can
+adopt them without renaming):
+
+- `read` — observe an artifact's contents.
+- `write` — create or modify an artifact.
+- `request` — submit a structured request across a boundary (process, search,
+  restore, inspect, audit-log retrieval).
+- `restore` — obtain raw private values for a given key or handle.
+- `log` — emit a record into the audit/log stream.
+- `receive_output` — be a legitimate recipient of an operation's return value
+  or rendered output.
+
+The matrix encodes the default envelope per role; per-artifact policy refines
+it through the exposure class. The matrix does not authorise reading `private`
+artifacts when the role's `read` cell is `permit` — the exposure class is an
+independent gate.
+
+| Role                                | read           | write          | request        | restore        | log            | receive_output |
+| ----------------------------------- | -------------- | -------------- | -------------- | -------------- | -------------- | -------------- |
+| ordinary agent                      | scoped [^oa-r] | scoped [^oa-w] | permit         | deny           | scoped [^oa-l] | scoped [^oa-o] |
+| private-boundary service            | permit         | permit         | permit         | permit         | permit         | permit         |
+| human/operator                      | permit         | permit         | permit         | permit         | permit         | permit         |
+| restricted reviewer or task scope   | scoped [^rr-r] | deny           | scoped [^rr-q] | deny           | scoped [^rr-l] | scoped [^rr-o] |
+| test harness                        | scoped [^th-r] | scoped [^th-w] | permit         | scoped [^th-x] | permit         | scoped [^th-o] |
+
+[^oa-r]: Ordinary agents may read artifacts of exposure class `agent_public` or
+    `agent_redacted` only. Reading `private`, `restricted`, or `never_expose`
+    is denied; the boundary interfaces must refuse to surface such artifacts to
+    ordinary agents.
+[^oa-w]: Ordinary agents may write only to the agent-facing index through
+    boundary operations (e.g. submitting a process request that ultimately
+    produces `agent_public` / `agent_redacted` artifacts). Direct writes to
+    `<vault_root>/private/` or to private dictionary files are denied.
+[^oa-l]: Ordinary agents may cause log entries through their requests, but the
+    emitted log records themselves must be at most `agent_redacted`; raw
+    private values must not appear in any log stream observable by ordinary
+    agents.
+[^oa-o]: Ordinary agents may receive operation outputs whose exposure class is
+    `agent_public` or `agent_redacted`. Outputs of class `private`,
+    `restricted`, or `never_expose` are denied; restoration responses must be
+    delivered through the explicit restoration request path defined in #27,
+    not as ordinary operation outputs.
+[^rr-r]: Restricted reviewers inherit ordinary-agent read scoping and add the
+    reviewer's narrower task scope (e.g. only the documents named in the
+    current review). Cells default to the ordinary-agent envelope intersected
+    with the reviewer's scope.
+[^rr-q]: Restricted reviewers may submit requests only within their declared
+    task scope. Requests that escape the scope must be refused by the boundary
+    rather than silently broadened.
+[^rr-l]: Restricted reviewers may cause log entries within their scope;
+    cross-scope log access is denied even when the underlying records would be
+    `agent_redacted`.
+[^rr-o]: Restricted reviewers receive outputs at most `agent_redacted` and
+    only for artifacts within their declared scope.
+[^th-r]: The test harness may read artifacts of any exposure class up to
+    `private` when the test file is itself a private-boundary contract test
+    (per #29). Public-output contract tests must not read `private` or
+    `restricted` artifacts. `never_expose` is denied for all tests.
+[^th-w]: The test harness writes against temporary vault roots only; it must
+    not write into a production vault. Tests may construct `private` fixtures
+    only when those fixtures match the canonical local fixture and the test
+    is a private-boundary contract test.
+[^th-x]: The test harness may exercise `restore` only in private-boundary
+    contract tests, and only to assert the restoration contract; public-output
+    contract tests must not call `restore`.
+[^th-o]: The test harness receives outputs commensurate with the test's
+    classification: public-output tests receive only `agent_public` /
+    `agent_redacted`; private-boundary tests may receive `private` outputs for
+    assertion against the canonical fixture.
+
+### Boundary statements
+
+The capability matrix is bounded by the umbrella #24 settled boundaries.
+These are restated here because they bind the matrix even when a cell would
+otherwise read `permit`:
+
+1. **Ordinary agents use boundary interfaces only.** Ordinary agents do not
+   read or write the private vault directly, do not open private dictionary
+   files, and do not import private-side modules to bypass the boundary. The
+   `permit` and `scoped` cells in the ordinary-agent row are realised through
+   `agent_public` / `agent_redacted` surfaces, not through filesystem access
+   to `<vault_root>/private/`.
+2. **Local-first.** MVP-2 stays local. Remote transfer, hosted GPU
+   orchestration, and remote restoration backends remain out of scope. No
+   capability cell authorises crossing the local-first line.
+3. **No hosted proprietary LLM in the core private-data path.** The matrix's
+   `restore` and `read` cells for private-boundary services do not authorise
+   sending raw private values to a hosted proprietary LLM API. Open-weight
+   local backends remain the only sanctioned model substrate for private-data
+   processing.
+4. **Private vault is not mounted into ordinary agent workflows.** No cell —
+   including the operator row — authorises mounting `<vault_root>/private/`
+   into an ordinary agent container or into a workflow that an ordinary agent
+   shares. Operator access is direct and out-of-band; it is not a route to
+   widen ordinary-agent capability.
+
 ## 2. Design Philosophy
 
 ### 2.1 Best-effort privacy, not absolute isolation

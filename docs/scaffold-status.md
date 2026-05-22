@@ -23,6 +23,11 @@ Source-of-truth precedence is defined in
 [`docs/architecture.md`](architecture.md#source-of-truth-precedence). When
 this table and the code disagree, the code wins and this table is the bug.
 
+The role and exposure classification that governs which modules ordinary
+agents may invoke versus which stay private-boundary-only is defined in
+[`docs/architecture.md#capability-and-exposure-model`](architecture.md#capability-and-exposure-model);
+this table refines that model down to per-module classification.
+
 ## Module table
 
 | Module | Classification | Current behavior | MVP role |
