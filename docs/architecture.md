@@ -705,6 +705,7 @@ yomotsusaka/
     architecture.md
     runpod.md
     naming.md
+    scaffold-status.md
   src/yomotsusaka/
     __init__.py
     schemas.py
@@ -730,6 +731,8 @@ yomotsusaka/
 ```
 
 This structure keeps the conceptual boundaries visible without requiring a large framework.
+
+For the canonical per-module classification (functional / functional stub / deferred), current behavior, and MVP role, see [`docs/scaffold-status.md`](scaffold-status.md). Downstream agents should consult that table before extending any module.
 
 ## 17. Guiding Principle
 
