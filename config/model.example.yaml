@@ -1,0 +1,14 @@
+# Model backend configuration example
+# Copy to config/model.yaml and adjust for your deployment.
+
+backend: vllm  # options: dummy | vllm | (future: custom)
+
+vllm:
+  base_url: "http://localhost:8000"
+  model_id: "Qwen/Qwen3-8B"
+  max_tokens: 512
+  temperature: 0.0  # deterministic for redaction/summarisation tasks
+
+# DummyBackend — used when backend=dummy (development / CI)
+dummy:
+  echo_prefix: "[DummyBackend]"
