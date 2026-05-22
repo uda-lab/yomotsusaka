@@ -2,9 +2,11 @@
 
 Per AGENTS.md, raw private values must not appear in agent-facing returns,
 manifests, or test artifacts *except* inside private-dictionary assertions.
-This module keeps the canonical raw strings as locally-scoped literals
-inside the round-trip helper and asserts that job/batch state never
-exposes those raw values (it carries only manifest ids and redacted text).
+
+This module therefore keeps the canonical raw strings as locally-scoped
+literals inside the helpers that drive the fixture (never at module
+scope), and asserts that job/batch state never exposes those raw values
+(it carries only the manifest id and redacted manifest fields).
 """
 
 from __future__ import annotations
@@ -25,13 +27,6 @@ from yomotsusaka.schemas import (
 )
 
 
-# Canonical raw text per the issue spec. Confined to this module's scope
-# and only used to drive process_document; raw values must never reach
-# batch state assertions below.
-_CANONICAL_RAW_TEXT = "Alice Tan works at Acme Corp. Patient ID: 12345."
-_CANONICAL_RAW_VALUES: tuple[str, ...] = ("Alice Tan", "Acme Corp", "12345")
-
-
 @dataclass(frozen=True)
 class _SpanSpec:
     start: int
@@ -39,6 +34,7 @@ class _SpanSpec:
     kind: EntityKind
 
 
+# Offsets and kinds only; no raw values at module scope.
 _CANONICAL_SPAN_SPECS: tuple[_SpanSpec, ...] = (
     _SpanSpec(start=0, end=9, kind=EntityKind.PERSON),
     _SpanSpec(start=19, end=28, kind=EntityKind.ORG),
@@ -50,26 +46,37 @@ def _canonical_spans() -> list[Span]:
     return [Span(start=s.start, end=s.end, kind=s.kind) for s in _CANONICAL_SPAN_SPECS]
 
 
-def _process_canonical(tmp_path: Path, doc_id: str = "canonical-fixture-001") -> tuple[str, DocumentManifest]:
+def _process_canonical(
+    tmp_path: Path, doc_id: str = "canonical-fixture-001"
+) -> tuple[str, DocumentManifest]:
     """Drive the canonical fixture through the pipeline and read the manifest.
 
-    Returns the manifest id (doc_id) and the loaded DocumentManifest so
-    tests can assert the manifest is the redacted, agent-safe form.
+    Raw fixture literals are confined to this helper's local scope. They
+    are consumed only by ``process_document`` (which writes the *redacted*
+    manifest to the vault) and never returned to callers; the returned
+    manifest carries only redacted text and metadata.
     """
+    # Local-only raw literals — never returned, never logged, never exported.
+    raw_text = "Alice Tan works at Acme Corp. Patient ID: 12345."
+
     vault_root = tmp_path / "vault"
     handle = process_document(
         doc_id=doc_id,
-        raw_text=_CANONICAL_RAW_TEXT,
+        raw_text=raw_text,
         spans=_canonical_spans(),
         vault_root=vault_root,
     )
     manifest_path = vault_root / "manifests" / f"{handle.doc_id}.json"
-    manifest = DocumentManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    manifest = DocumentManifest.model_validate_json(
+        manifest_path.read_text(encoding="utf-8")
+    )
     return handle.doc_id, manifest
 
 
 def _assert_no_raw_values(blob: str) -> None:
-    for raw in _CANONICAL_RAW_VALUES:
+    # Raw values live only in this assertion helper's local scope.
+    raw_values: tuple[str, ...] = ("Alice Tan", "Acme Corp", "12345")
+    for raw in raw_values:
         assert raw not in blob, f"raw private value {raw!r} leaked into batch state"
 
 
@@ -139,6 +146,23 @@ def test_fail_transitions_running_to_failed(tmp_path: Path) -> None:
 # Illegal transitions
 # ---------------------------------------------------------------------------
 
+def _drive_to(queue: BatchQueue, manifest_id: str, manifest: DocumentManifest, target: BatchStatus) -> str:
+    """Submit a batch and drive it to *target* via legal transitions only."""
+    batch = queue.submit([manifest_id])
+    if target is BatchStatus.PENDING:
+        return batch.batch_id
+    queue.start(batch.batch_id)
+    if target is BatchStatus.RUNNING:
+        return batch.batch_id
+    if target is BatchStatus.DONE:
+        queue.complete(batch.batch_id, [manifest])
+        return batch.batch_id
+    if target is BatchStatus.FAILED:
+        queue.fail(batch.batch_id, "synthetic failure")
+        return batch.batch_id
+    raise AssertionError(f"unsupported target {target}")
+
+
 def test_start_on_done_job_raises(tmp_path: Path) -> None:
     manifest_id, manifest = _process_canonical(tmp_path)
     queue = BatchQueue()
@@ -176,6 +200,48 @@ def test_start_on_running_job_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         queue.start(batch.batch_id)
+
+
+@pytest.mark.parametrize(
+    ("from_status", "op"),
+    [
+        # `start` is only legal from PENDING; reject from every other status.
+        (BatchStatus.RUNNING, "start"),
+        (BatchStatus.DONE, "start"),
+        (BatchStatus.FAILED, "start"),
+        # `complete` is only legal from RUNNING; reject from every other status.
+        (BatchStatus.PENDING, "complete"),
+        (BatchStatus.DONE, "complete"),
+        (BatchStatus.FAILED, "complete"),
+        # `fail` is only legal from RUNNING; reject from every other status.
+        (BatchStatus.PENDING, "fail"),
+        (BatchStatus.DONE, "fail"),
+        (BatchStatus.FAILED, "fail"),
+    ],
+)
+def test_illegal_transitions_from_each_status_raise(
+    tmp_path: Path, from_status: BatchStatus, op: str
+) -> None:
+    """Exhaustive guard: every non-source status rejects each transition."""
+    manifest_id, manifest = _process_canonical(tmp_path)
+    queue = BatchQueue()
+    batch_id = _drive_to(queue, manifest_id, manifest, from_status)
+
+    # Sanity: the batch is in the expected source status before the illegal call.
+    assert queue.get(batch_id).status is from_status
+
+    with pytest.raises(ValueError):
+        if op == "start":
+            queue.start(batch_id)
+        elif op == "complete":
+            queue.complete(batch_id, [manifest])
+        elif op == "fail":
+            queue.fail(batch_id, "illegal-from-" + from_status.value)
+        else:
+            raise AssertionError(f"unknown op {op}")
+
+    # Status must not have changed after the rejected call.
+    assert queue.get(batch_id).status is from_status
 
 
 # ---------------------------------------------------------------------------
