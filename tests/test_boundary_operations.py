@@ -349,3 +349,86 @@ def test_status_report_for_malformed_locator_is_unknown(tmp_path: Path) -> None:
         vault_root=tmp_path,
     )
     assert response.status == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# SpanSpec validation
+# ---------------------------------------------------------------------------
+
+
+def test_span_spec_rejects_end_before_start() -> None:
+    """A SpanSpec with end < start is silently dropped by the kernel
+    redactor; the public boundary should reject it up front with a clear
+    validation error rather than producing no-op redaction."""
+    from pydantic import ValidationError as PydanticValidationError
+
+    with pytest.raises(PydanticValidationError, match="SpanSpec.end"):
+        SpanSpec(start=9, end=0, kind=EntityKind.PERSON)
+
+
+def test_span_spec_allows_zero_length_span() -> None:
+    """end == start is an empty span; allowed (the redactor drops it harmlessly)."""
+    spec = SpanSpec(start=5, end=5, kind=EntityKind.PERSON)
+    assert spec.start == spec.end == 5
+
+
+# ---------------------------------------------------------------------------
+# inspect_request fail-closed on corrupt vault state
+# ---------------------------------------------------------------------------
+
+
+def test_inspect_request_returns_failure_for_corrupt_manifest(tmp_path: Path) -> None:
+    """A manifest file that exists but is invalid JSON must produce a
+    ResolverFailure, not propagate an exception out of inspect_request."""
+    vault_root = tmp_path / "vault"
+    doc_id = "corrupt-manifest"
+    _process_canonical(vault_root, doc_id=doc_id)
+
+    manifest_path = vault_root / "manifests" / f"{doc_id}.json"
+    manifest_path.write_text("{not valid json", encoding="utf-8")
+
+    response = inspect_request(
+        InspectRequest(locator=_expected_locator(doc_id)),
+        vault_root=vault_root,
+    )
+    assert isinstance(response, ResolverFailure)
+    assert response.reason is ResolverFailureReason.ArtifactMissing
+
+
+def test_inspect_request_forwards_caller_purpose(tmp_path: Path) -> None:
+    """Caller-supplied purpose must reach resolve() so the audit field
+    captures intent rather than a hard-coded label."""
+    vault_root = tmp_path / "vault"
+    doc_id = "purpose-doc"
+    _process_canonical(vault_root, doc_id=doc_id)
+
+    # Default purpose still works.
+    default_resp = inspect_request(
+        InspectRequest(locator=_expected_locator(doc_id)),
+        vault_root=vault_root,
+    )
+    assert isinstance(default_resp, InspectResponse)
+
+    # Explicit purpose is accepted and does not change the response shape.
+    explicit_resp = inspect_request(
+        InspectRequest(
+            locator=_expected_locator(doc_id),
+            purpose="ticket-1234:reading-redacted-doc",
+        ),
+        vault_root=vault_root,
+    )
+    assert isinstance(explicit_resp, InspectResponse)
+
+
+def test_inspect_request_rejects_empty_purpose(tmp_path: Path) -> None:
+    """Empty purpose flows into resolve() and surfaces as a typed failure."""
+    vault_root = tmp_path / "vault"
+    doc_id = "empty-purpose-doc"
+    _process_canonical(vault_root, doc_id=doc_id)
+
+    response = inspect_request(
+        InspectRequest(locator=_expected_locator(doc_id), purpose="   "),
+        vault_root=vault_root,
+    )
+    assert isinstance(response, ResolverFailure)
+    assert response.reason is ResolverFailureReason.PurposeNotPermitted

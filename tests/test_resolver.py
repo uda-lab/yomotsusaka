@@ -331,7 +331,25 @@ def test_resolver_failure_detail_leaks_no_private_or_path_data(
     serialisation must not contain raw private values, absolute paths, or
     environment variable contents."""
     vault_root = tmp_path / "vault"
-    _commit_canonical_fixture(vault_root)
+    locator_committed = _commit_canonical_fixture(vault_root)
+
+    # Set up a second committed fixture, then delete its private dict, so
+    # the ArtifactMissing branch is reachable for the leak-scan sweep below.
+    second_doc_id = "leak-scan-second"
+    second_raw = "Alice Tan works at Acme Corp. Patient ID: 12345."
+    process_document(
+        doc_id=second_doc_id,
+        raw_text=second_raw,
+        spans=_canonical_spans(),
+        vault_root=vault_root,
+    )
+    (vault_root / "private" / f"{second_doc_id}.json").unlink()
+    locator_artifact_missing = build_locator(
+        exposure_class="agent_redacted",
+        artifact_kind="manifest",
+        opaque_id=second_doc_id,
+    )
+    _ = locator_committed  # keep the canonical fixture alive for the matrix
 
     abs_tmp = str(tmp_path.resolve())
     forbidden = (
@@ -374,6 +392,8 @@ def test_resolver_failure_detail_leaks_no_private_or_path_data(
             ResolverScope.ORDINARY_AGENT,
             "t",
         ),
+        # ArtifactMissing (manifest exists, private dict deleted, PRIVATE_BOUNDARY)
+        (locator_artifact_missing, ResolverScope.PRIVATE_BOUNDARY, "t"),
     ]
 
     for locator, scope, purpose in failure_cases:
@@ -393,3 +413,124 @@ def test_resolver_failure_detail_leaks_no_private_or_path_data(
             assert needle not in as_json, (
                 f"failure JSON for {outcome.reason} leaked {needle!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Corrupt / schema-drifted vault files must return ResolverFailure, not raise
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_returns_failure_for_corrupt_private_dict(tmp_path: Path) -> None:
+    """A private dict file that exists but is invalid JSON must produce a
+    ResolverFailure, not propagate an exception."""
+    vault_root = tmp_path / "vault"
+    locator = _commit_canonical_fixture(vault_root)
+
+    # Corrupt the private-dict file in place.
+    private_path = vault_root / "private" / f"{_DOC_ID}.json"
+    private_path.write_text("{not valid json", encoding="utf-8")
+
+    outcome = resolve(
+        locator,
+        scope=ResolverScope.PRIVATE_BOUNDARY,
+        purpose="restore-test",
+        vault_root=vault_root,
+    )
+    assert isinstance(outcome, ResolverFailure)
+    assert outcome.reason is ResolverFailureReason.ArtifactMissing
+
+
+def test_resolve_returns_failure_for_schema_mismatched_private_dict(
+    tmp_path: Path,
+) -> None:
+    """A private dict file with the wrong schema must produce a
+    ResolverFailure, not raise pydantic.ValidationError."""
+    vault_root = tmp_path / "vault"
+    locator = _commit_canonical_fixture(vault_root)
+
+    # Schema drift: write a JSON array of objects missing required fields.
+    private_path = vault_root / "private" / f"{_DOC_ID}.json"
+    private_path.write_text('[{"unexpected": "shape"}]', encoding="utf-8")
+
+    outcome = resolve(
+        locator,
+        scope=ResolverScope.PRIVATE_BOUNDARY,
+        purpose="restore-test",
+        vault_root=vault_root,
+    )
+    assert isinstance(outcome, ResolverFailure)
+    assert outcome.reason is ResolverFailureReason.ArtifactMissing
+
+
+# ---------------------------------------------------------------------------
+# PrivateState privacy invariant — never serialised to public output
+# ---------------------------------------------------------------------------
+
+
+def test_private_state_serialisation_is_kept_off_public_surfaces(
+    tmp_path: Path,
+) -> None:
+    """A PRIVATE_BOUNDARY ResolverSuccess intentionally carries raw private
+    values in its private_state field — that is the whole point of the
+    scope. The contract is that this surface is never returned to ordinary
+    agents.
+
+    This test pins the inverse property: an ORDINARY_AGENT / AUDIT_REVIEWER
+    success serialisation must contain NONE of the raw private values, and
+    the only path that can leak them is the PRIVATE_BOUNDARY one. The test
+    documents the invariant that downstream code is expected to enforce:
+    if you call ``outcome.model_dump_json()`` and you are not on the
+    PRIVATE_BOUNDARY path, the result is public-safe.
+    """
+    vault_root = tmp_path / "vault"
+    locator = _commit_canonical_fixture(vault_root)
+    abs_tmp = str(tmp_path.resolve())
+
+    # Ordinary-agent success: serialisation must be public-safe.
+    public_outcome = resolve(
+        locator,
+        scope=ResolverScope.ORDINARY_AGENT,
+        purpose="inspect-doc",
+        vault_root=vault_root,
+    )
+    assert isinstance(public_outcome, ResolverSuccess)
+    assert public_outcome.private_state is None
+    as_json = public_outcome.model_dump_json()
+    for needle in ("Alice Tan", "Acme Corp", "12345", abs_tmp):
+        assert needle not in as_json, (
+            f"ordinary-agent ResolverSuccess serialisation leaked {needle!r}"
+        )
+
+    # Audit-reviewer success: same invariant.
+    audit_outcome = resolve(
+        locator,
+        scope=ResolverScope.AUDIT_REVIEWER,
+        purpose="audit-review",
+        vault_root=vault_root,
+    )
+    assert isinstance(audit_outcome, ResolverSuccess)
+    assert audit_outcome.private_state is None
+    as_json = audit_outcome.model_dump_json()
+    for needle in ("Alice Tan", "Acme Corp", "12345", abs_tmp):
+        assert needle not in as_json, (
+            f"audit-reviewer ResolverSuccess serialisation leaked {needle!r}"
+        )
+
+    # PRIVATE_BOUNDARY: by contract this surface DOES carry private values
+    # (that is its purpose), and callers must not surface its serialisation
+    # to ordinary-agent paths. Pin this so a refactor that accidentally
+    # made PRIVATE_BOUNDARY responses public-safe would also break this
+    # test, prompting an architecture review rather than a silent change.
+    private_outcome = resolve(
+        locator,
+        scope=ResolverScope.PRIVATE_BOUNDARY,
+        purpose="restore-test",
+        vault_root=vault_root,
+    )
+    assert isinstance(private_outcome, ResolverSuccess)
+    assert private_outcome.private_state is not None
+    private_json = private_outcome.model_dump_json()
+    # All three raw values reachable through private_state.
+    assert "Alice Tan" in private_json
+    assert "Acme Corp" in private_json
+    assert "12345" in private_json

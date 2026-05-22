@@ -37,7 +37,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError as PydanticValidationError, model_validator
 
 from yomotsusaka.pipeline import process_document
 from yomotsusaka.redactor import Span
@@ -196,6 +196,19 @@ class SpanSpec(BaseModel, frozen=True):
     start: int = Field(ge=0)
     end: int = Field(ge=0)
     kind: EntityKind
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "SpanSpec":
+        # The kernel redactor silently drops out-of-range spans, which would
+        # be observable to ordinary agents as "redaction silently did
+        # nothing". Reject the obviously-malformed end < start case at the
+        # public boundary so the failure is a clear client-side validation
+        # error rather than a no-op.
+        if self.end < self.start:
+            raise ValueError(
+                f"SpanSpec.end ({self.end}) must be >= start ({self.start})"
+            )
+        return self
 
     def to_internal(self) -> Span:
         """Project this spec into the kernel :class:`Span` dataclass."""
@@ -397,8 +410,23 @@ def resolve(
                 reason=ResolverFailureReason.ArtifactMissing,
                 detail="private dictionary file is missing for this artifact",
             )
-        raw_entries = json.loads(private_dict_path.read_text(encoding="utf-8"))
-        private_entries = [PrivateDictEntry(**item) for item in raw_entries]
+        # A file that passed exists() but cannot be parsed (corrupt JSON, schema
+        # drift, race-deleted between exists() and read_text()) is an
+        # operational failure, not a programmer error. Per architecture
+        # §5.7.2 every expected failure category is a returned ResolverFailure,
+        # never a raised exception. Detail is intentionally generic so the
+        # parse error message (which can contain raw bytes from the file) is
+        # not propagated to public surfaces.
+        try:
+            raw_text = private_dict_path.read_text(encoding="utf-8")
+            raw_entries = json.loads(raw_text)
+            private_entries = [PrivateDictEntry(**item) for item in raw_entries]
+        except (OSError, ValueError, PydanticValidationError):
+            return ResolverFailure(
+                locator=locator,
+                reason=ResolverFailureReason.ArtifactMissing,
+                detail="private dictionary could not be read or parsed",
+            )
         private_state = PrivateState(
             manifest_path=manifest_path,
             private_dict_path=private_dict_path,
@@ -475,6 +503,10 @@ class ProcessResponse(BaseModel, frozen=True):
 class InspectRequest(BaseModel, frozen=True):
     model_config = ConfigDict(extra="forbid")
     locator: str
+    # Forwarded to resolve() so the caller's intent shows up on
+    # ResolverSuccess.purpose for the future #27 audit log. Defaults to a
+    # stable string so existing callers do not have to change.
+    purpose: str = "boundary.inspect_request"
 
 
 class InspectResponse(BaseModel, frozen=True):
@@ -586,15 +618,27 @@ def inspect_request(
     outcome = resolve(
         request.locator,
         scope=ResolverScope.ORDINARY_AGENT,
-        purpose="boundary.inspect_request",
+        purpose=request.purpose,
         vault_root=vault_root,
     )
     if isinstance(outcome, ResolverFailure):
         return outcome
     manifest_path, _ = _vault_paths(vault_root, outcome.opaque_id)
-    manifest = DocumentManifest.model_validate_json(
-        manifest_path.read_text(encoding="utf-8")
-    )
+    # The exists() check inside resolve() can race against a concurrent
+    # delete, and a manifest file with schema drift would otherwise raise
+    # pydantic.ValidationError. Both are operational failures, not
+    # programmer errors — return ResolverFailure to preserve the
+    # documented "homogeneous public surface" contract.
+    try:
+        manifest = DocumentManifest.model_validate_json(
+            manifest_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, PydanticValidationError):
+        return ResolverFailure(
+            locator=request.locator,
+            reason=ResolverFailureReason.ArtifactMissing,
+            detail="manifest could not be read or parsed",
+        )
     return InspectResponse(manifest=PublicManifestView.from_manifest(manifest))
 
 
