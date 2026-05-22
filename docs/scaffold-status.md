@@ -46,6 +46,9 @@ this table and the code disagree, the code wins and this table is the bug.
 - When a module changes classification, update this table in the same PR.
 - When a deferred module gains real behavior under a child issue, promote it
   to `functional stub` or `functional` here and add the corresponding tests
-  before merging.
+  before merging. The gate criteria for promoting a `deferred` backend (the
+  boundary-contract tests that must pass, the non-weakening clause, and the
+  Chikaeshi-specific additions for `execution_gateway.py`) are documented in
+  [`docs/backend-promotion.md`](backend-promotion.md).
 - If the issue body that originally specified a classification disagrees with
   this table, the code is authoritative and this table follows the code.

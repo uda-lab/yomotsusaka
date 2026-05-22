@@ -734,6 +734,8 @@ This structure keeps the conceptual boundaries visible without requiring a large
 
 For the canonical per-module classification (functional / functional stub / deferred), current behavior, and MVP role, see [`docs/scaffold-status.md`](scaffold-status.md). Downstream agents should consult that table before extending any module.
 
+Before promoting any `deferred` module to `functional stub` or `functional`, see [`docs/backend-promotion.md`](backend-promotion.md) for the gate criteria (boundary-contract tests that must pass, non-weakening clause, Chikaeshi-specific additions).
+
 ## 17. Guiding Principle
 
 The system should make the safe path the ordinary path.
