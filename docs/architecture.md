@@ -579,10 +579,19 @@ Restoration audit records (#27) live at `<vault_root>/audit/restoration.jsonl`:
 - JSONL append-only, one JSON object per line, UTF-8.
 - Every observable boundary call writes at least one record before returning.
 - The accepted path writes two records sharing the same `audit_record_id`:
-  an intent record (`returned_entry_count: null`) immediately before the
-  kernel call, and a result record (`returned_entry_count: <int>`) after
-  the kernel returns.
-- Denial and failure paths write a single record.
+  an *intent* record (`outcome: "accepted"`, `returned_entry_count: null`)
+  immediately before the kernel call, and a *result* record
+  (`outcome: "accepted"`, `returned_entry_count: <int>`) after the kernel
+  returns.
+- The kernel-error path (intent written, then kernel raised) also writes
+  two records sharing the same `audit_record_id`: the original intent
+  record followed by a corrective `outcome: "failed"` record. The intent
+  record is not rewritten — JSONL is append-only. Consumers reconstruct
+  the final outcome by taking the **last record per `audit_record_id`**;
+  raw line counts of `"accepted"` overcount unless correlated by
+  `audit_record_id`.
+- Schema-invalid and scope-denied paths write a single `outcome: "failed"`
+  record before returning.
 - Records never contain `PrivateDictEntry.original_value`, absolute
   filesystem paths, or the vault root.
 - Audit-write failure is a hard stop: the kernel is not called, and the

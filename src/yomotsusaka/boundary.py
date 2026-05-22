@@ -571,11 +571,18 @@ class RestorationFailureReason(str, Enum):
 
     Values are stable wire identifiers; do not rename without coordinating
     with downstream consumers and the umbrella #29 contract tests.
+
+    ``UnknownArtifact`` is grammar-reserved for future wiring (e.g. when the
+    boundary learns to resolve artifact_kinds other than ``"manifest"`` and
+    needs to distinguish "locator parses but addresses a kind not committed
+    locally" from the schema-invalid case). MVP-2 never emits it; callers
+    that exhaustively match this enum must handle it as an inert future
+    value.
     """
 
     RequestSchemaInvalid = "request_schema_invalid"
     ScopeDenied = "scope_denied"
-    UnknownArtifact = "unknown_artifact"
+    UnknownArtifact = "unknown_artifact"  # reserved; not emitted in MVP-2
     ArtifactMissing = "artifact_missing"
     AuditWriteFailed = "audit_write_failed"
     KernelError = "kernel_error"
@@ -874,10 +881,25 @@ def _append_restoration_audit(
 ) -> str:
     """Append one JSONL audit record to ``<vault_root>/audit/restoration.jsonl``.
 
-    The accepted path writes two records sharing the same ``audit_record_id``:
-    an intent record (``returned_entry_count=None``) before the kernel call,
-    and a result record (``returned_entry_count=<int>``) after the kernel
-    returns. Denial and failure paths write a single record.
+    The boundary writes records in the following pattern per request:
+
+    * **Schema-invalid / scope-denied / audit-only-failure paths**: one
+      record with ``outcome="failed"`` and a non-null ``failure_reason``.
+    * **Accepted path (kernel succeeds)**: two records sharing the same
+      ``audit_record_id`` — an *intent* record
+      (``outcome="accepted"``, ``returned_entry_count=None``) written
+      before the kernel call, and a *result* record
+      (``outcome="accepted"``, ``returned_entry_count=<int>``) written
+      after the kernel returns.
+    * **Kernel-error path (intent was written, then kernel failed)**: two
+      records sharing the same ``audit_record_id`` — the original intent
+      record (``outcome="accepted"``, ``returned_entry_count=None``) and a
+      corrective record (``outcome="failed"`` with a non-null
+      ``failure_reason``). The intent record is intentionally not deleted
+      or rewritten — JSONL is append-only — so consumers reconstruct the
+      final outcome by **taking the last record per ``audit_record_id``**.
+      Counting raw "accepted" lines without correlating by
+      ``audit_record_id`` will overcount accepted operations.
 
     Raises :class:`OSError` on filesystem failure. Returns the
     ``audit_record_id`` that was written (echo of the input).
@@ -1130,8 +1152,21 @@ def restoration_request(
         )
 
     # ---- step (e): kernel call ----
+    # The kernel may raise either RestorationError (documented contract) or
+    # an unexpected exception (corrupt JSON in the private dictionary file,
+    # PrivateDictEntry validation failure, OSError on read, etc.). Both
+    # cases must be classified as failed RestorationResponse values rather
+    # than escaping as raw exceptions — otherwise the boundary's own
+    # "every code path returns a structured response" contract is broken
+    # and callers lose the audit-record-id pairing. Unexpected exceptions
+    # map to KernelError with a generic detail string so the underlying
+    # message (which may contain raw bytes from a malformed file) is not
+    # propagated through the public surface.
     private_path = (vault_root / "private" / f"{document_id}.json").resolve()
     handle = ArtifactHandle(doc_id=document_id, vault_path=str(private_path))
+    reason_code: RestorationFailureReason | None = None
+    detail: str | None = None
+    entries: list[PrivateDictEntry] | None = None
     try:
         entries = restoration_api.restore(handle, vault_root=vault_root)
     except restoration_api.RestorationError as exc:
@@ -1142,6 +1177,15 @@ def restoration_request(
         else:
             reason_code = RestorationFailureReason.KernelError
             detail = _strip_vault_root(msg, vault_root)
+    except Exception:
+        # Any non-RestorationError leak (corrupt JSON, schema drift,
+        # OSError mid-read, etc.) is a kernel-side failure. Intentionally
+        # do not echo the underlying exception message — it may contain
+        # raw bytes from the private dictionary file.
+        reason_code = RestorationFailureReason.KernelError
+        detail = "kernel raised an unexpected exception while reading private data"
+
+    if reason_code is not None:
         # Corrective audit record for the failure.
         try:
             _append_restoration_audit(
@@ -1168,6 +1212,7 @@ def restoration_request(
             reason=reason_code,
             detail=detail,
         )
+    assert entries is not None  # narrow type after successful kernel call
 
     # ---- step (g): AND-filter on key + entity_kind. Both lists empty is
     # rejected by the request validator, so at least one filter is active.

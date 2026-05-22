@@ -440,6 +440,66 @@ def test_kernel_error_strips_vault_root_from_detail(
     # The placeholder should appear instead.
     assert "<vault_root>" in resp.detail
 
+    # Kernel-error path also writes a corrective audit record sharing the
+    # intent's audit_record_id. Consumers must reconcile by taking the last
+    # record per audit_record_id (architecture §6.1).
+    lines = _audit_lines(vault_root)
+    assert len(lines) == 2
+    assert all(ln["audit_record_id"] == resp.audit_record_id for ln in lines)
+    assert lines[0]["outcome"] == "accepted"  # intent record
+    assert lines[0]["returned_entry_count"] is None
+    assert lines[1]["outcome"] == "failed"  # corrective record (the truth)
+    assert lines[1]["failure_reason"] == "kernel_error"
+
+
+def test_non_restoration_error_kernel_exception_is_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kernel may raise non-RestorationError exceptions (corrupt JSON,
+    schema drift, OSError mid-read). The boundary must classify these as
+    KernelError, not let them escape as raw exceptions — otherwise callers
+    lose both the structured response and the audit-record-id pairing."""
+    vault_root = tmp_path / "vault"
+    doc_id = "doc-kernel-non-rest-err"
+    _process_canonical(vault_root, doc_id=doc_id)
+
+    leaky_raw_bytes = "RAW-PRIVATE-BYTES-Alice-from-corrupt-file"
+
+    def kernel_raises_value_error(*args: object, **kwargs: object) -> None:
+        # Simulate json.JSONDecodeError (a ValueError subclass) or a
+        # PydanticValidationError leaking through restoration_api.restore.
+        raise ValueError(leaky_raw_bytes)
+
+    monkeypatch.setattr(restoration_api, "restore", kernel_raises_value_error)
+
+    req = RestorationRequest(
+        **_base_kwargs(),
+        document_id=doc_id,
+        requested_keys=["any"],
+    )
+    # Must NOT raise — the boundary catches the exception.
+    resp = restoration_request(req, scope=ResolverScope.PRIVATE_BOUNDARY, vault_root=vault_root)
+
+    assert resp.outcome == "failed"
+    assert resp.reason is RestorationFailureReason.KernelError
+    assert resp.private_entries is None
+    # The raw bytes from the kernel exception message must NOT appear in the
+    # public detail — that would leak private data through the error path.
+    assert resp.detail is not None
+    assert leaky_raw_bytes not in resp.detail
+    blob = resp.model_dump_json()
+    assert leaky_raw_bytes not in blob
+
+    # And the corrective audit record was still written.
+    lines = _audit_lines(vault_root)
+    assert any(
+        ln["audit_record_id"] == resp.audit_record_id and ln["outcome"] == "failed"
+        for ln in lines
+    )
+    # The audit log itself does not contain the raw bytes either.
+    audit_text = (vault_root / "audit" / "restoration.jsonl").read_text(encoding="utf-8")
+    assert leaky_raw_bytes not in audit_text
+
 
 # ---------------------------------------------------------------------------
 # Reserved fields round-trip into audit
