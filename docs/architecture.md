@@ -683,34 +683,38 @@ A reasonable first MVP should implement only:
 
 Everything else is future work.
 
-## 16. Recommended Initial Shape
+## 16. Repository Layout
 
 ```text
-private-data-firewall/
+yomotsusaka/
   README.md
+  pyproject.toml
   docs/
     architecture.md
-    threat-model.md
-    schema.md
-  firewall/
-    batch_queue.py
-    runpod_lifecycle.py
-    transfer.py
-    inference_backend.py
+    runpod.md
+    naming.md
+  src/yomotsusaka/
+    __init__.py
     schemas.py
     redactor.py
     validator.py
     commit.py
+    batch_queue.py
+    inference_backend.py
     restoration_api.py
     search_gateway.py
     execution_gateway.py
+    runpod_lifecycle.py
+    transfer.py
+  tests/
+    test_redactor.py
+    test_restoration_api.py
+    test_schemas.py
   config/
     policy.example.yaml
     model.example.yaml
   scripts/
     run_nightly_batch.sh
-    start_runpod_job.sh
-    cleanup_remote_workspace.sh
 ```
 
 This structure keeps the conceptual boundaries visible without requiring a large framework.

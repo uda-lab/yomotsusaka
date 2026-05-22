@@ -62,8 +62,8 @@ cp config/model.example.yaml config/model.yaml
 ## Documentation
 
 - [Architecture](docs/architecture.md) — MVP philosophy and module map.
-- [RunPod notes](docs/runpod-notes.md) — recommended GPU setup for
-  self-hosted inference.
+- [RunPod notes](docs/runpod.md) — GPU setup, real costs, and vLLM startup args for self-hosted inference.
+- [Naming](docs/naming.md) — mythological component codenames (Ifuya, Kukuri, Chikaeshi, Chibiki, Kamuzumi).
 
 ---
 
@@ -88,7 +88,8 @@ tests/
   test_schemas.py
 docs/
   architecture.md
-  runpod-notes.md
+  runpod.md
+  naming.md
 config/
   policy.example.yaml
   model.example.yaml
