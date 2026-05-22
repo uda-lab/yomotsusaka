@@ -1,12 +1,14 @@
 """
-Execution gateway — mediates agent-triggered operations.
+Execution gateway — stub — deferred for the local MVP; see `docs/runpod.md`.
 
-Only agents that have been granted access to an
-:class:`~yomotsusaka.schemas.ArtifactHandle` may request execution of
-operations that touch private data.
+Mediates agent-triggered operations.  Only agents that have been granted
+access to an :class:`~yomotsusaka.schemas.ArtifactHandle` may request
+execution of operations that touch private data.
 
 Plugin boundary: real implementations add authentication, rate limiting, and
-audit logging.
+audit logging.  The local MVP exercises only the stub return value; real
+policy enforcement and operation dispatch remain out of scope until a child
+issue scopes them.  See ``docs/scaffold-status.md`` for module status.
 """
 
 from __future__ import annotations

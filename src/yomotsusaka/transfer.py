@@ -1,8 +1,13 @@
 """
-Transfer — move artifacts between vault and external destinations.
+Transfer — stub — deferred for the local MVP; see `docs/runpod.md`.
+
+Moves artifacts between vault and external destinations.
 
 Plugin boundary: real implementations support S3, GCS, SFTP, etc.
-The stub only logs the intended transfer without moving any data.
+The stub only logs the intended transfer without moving any data; real
+backends remain out of scope until a child issue scopes them.  The local
+MVP needs no remote transfer.  See ``docs/scaffold-status.md`` for module
+status.
 
 Private data must never be sent to an uncontrolled external destination.
 Implementations must enforce destination allow-lists.
