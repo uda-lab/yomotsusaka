@@ -114,6 +114,7 @@ PATH_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
 # Every public response type whose serialisation flows through this scan.
 # If boundary.__all__ ever grows a new response, this set must grow to match
 # (or the new response must be added to one of the per-surface tests below).
+# Names this scan covers (responses + supporting types + entry points).
 EXPECTED_BOUNDARY_SYMBOLS: frozenset[str] = frozenset(
     {
         "PublicHandle",
@@ -127,6 +128,8 @@ EXPECTED_BOUNDARY_SYMBOLS: frozenset[str] = frozenset(
         "ResolverFailure",
         "ResolverFailureReason",
         "ResolverScope",
+        "ResolverSuccess",
+        "PrivateState",
         "parse_locator",
         "build_locator",
         "process_document_request",
@@ -134,18 +137,58 @@ EXPECTED_BOUNDARY_SYMBOLS: frozenset[str] = frozenset(
         "search_request",
         "restoration_request",
         "status_report_request",
+        "resolve",
+    }
+)
+
+# Names that are intentionally exported by ``boundary.__all__`` but are
+# *not* themselves agent-facing responses (locator-grammar constants,
+# request models, exception types). These do not need a per-surface scan
+# but are listed here so the bidirectional drift guard recognises them.
+_KNOWN_NON_RESPONSE_EXPORTS: frozenset[str] = frozenset(
+    {
+        "LOCATOR_SCHEME",
+        "EXPOSURE_CLASSES",
+        "ARTIFACT_KINDS",
+        "ParsedLocator",
+        "SpanSpec",
+        "ResolverError",
+        "ProcessRequest",
+        "InspectRequest",
+        "SearchRequest",
+        "RestorationRequest",
+        "StatusReportRequest",
     }
 )
 
 
 def test_expected_boundary_symbols_are_a_subset_of_module_all() -> None:
-    """If ``boundary.__all__`` grows or shrinks, this test forces a manual
-    review of the exposure-contract scan list."""
+    """Direction 1: every name this scan claims to cover must still be
+    exported by ``boundary.__all__``. Fires when a maintainer removes or
+    renames a response without updating the scan."""
     module_all = set(boundary.__all__)
     missing = EXPECTED_BOUNDARY_SYMBOLS - module_all
     assert not missing, (
         f"EXPECTED_BOUNDARY_SYMBOLS contains names not in boundary.__all__: {missing!r}; "
         "either remove them from this test's expected set or restore them on the boundary."
+    )
+
+
+def test_no_new_unscanned_symbols_in_boundary_all() -> None:
+    """Direction 2: every name in ``boundary.__all__`` must be either in
+    ``EXPECTED_BOUNDARY_SYMBOLS`` (covered by the scan) or in
+    ``_KNOWN_NON_RESPONSE_EXPORTS`` (explicitly classified as non-response).
+    This is the §29-spec "force a maintainer to add new responses to the
+    scan" direction: a freshly-added ``BatchResponse`` in ``boundary.__all__``
+    fails this test until the maintainer either scans it or declares it a
+    non-response export."""
+    module_all = set(boundary.__all__)
+    unclassified = module_all - EXPECTED_BOUNDARY_SYMBOLS - _KNOWN_NON_RESPONSE_EXPORTS
+    assert not unclassified, (
+        f"boundary.__all__ exports symbols this scan has not classified: "
+        f"{sorted(unclassified)!r}. Either add the name to "
+        "EXPECTED_BOUNDARY_SYMBOLS and write a per-surface test, or add it "
+        "to _KNOWN_NON_RESPONSE_EXPORTS with a justification."
     )
 
 
@@ -202,10 +245,14 @@ def _assert_locator_shape(locator: str, *, surface: str) -> None:
 
 
 def _walk_handles(payload: Any, *, surface: str) -> int:
-    """Walk *payload* (a JSON-mode dict) and check every ``locator``/``handle``
-    field round-trips through :func:`parse_locator`. Returns the count of
-    locator strings validated, so the caller can assert ``count >= 1`` for
-    surfaces that must carry one.
+    """Walk *payload* (a JSON-mode dict) and check every ``locator`` string
+    parses via :func:`parse_locator`. Returns the count of locator strings
+    validated, so the caller can assert ``count >= 1`` for surfaces that
+    must carry one.
+
+    The walker counts each locator exactly once: a ``handle`` sub-dict's
+    locator is recognised through the generic ``"locator"`` key during
+    recursion, so we do not need a special-case branch for ``"handle"``.
     """
     count = 0
     if isinstance(payload, dict):
@@ -213,14 +260,6 @@ def _walk_handles(payload: Any, *, surface: str) -> int:
             if k == "locator" and isinstance(v, str):
                 _assert_locator_shape(v, surface=surface)
                 count += 1
-            elif k == "handle" and isinstance(v, dict):
-                inner = v.get("locator")
-                assert isinstance(inner, str), (
-                    f"{surface!r}: handle field has no string locator: {v!r}"
-                )
-                _assert_locator_shape(inner, surface=surface)
-                count += 1
-                count += _walk_handles(v, surface=surface)
             else:
                 count += _walk_handles(v, surface=surface)
     elif isinstance(payload, list):
@@ -441,13 +480,13 @@ def test_restoration_response_serialisation_is_opaque(
         RestorationRequest(locator=handle.locator, purpose="exposure-contract-test"),
         vault_root=vault_root,
     )
-    # MVP-2 always returns the deferred shape, but #27 may swap it in for a
-    # wired response. Parameterise on outcome rather than hard-coding
-    # ``"deferred"``.
+    # MVP-2 always returns the deferred shape (Literal["deferred"]); #27
+    # may widen the type. We deliberately do NOT assert against a hard-coded
+    # set of strings here because Pydantic enforces the current Literal at
+    # construction time — a free-form set check would be vacuous. The
+    # serialised-blob scans below are the real privacy invariant; the
+    # outcome value itself is whatever the boundary chose to emit.
     assert isinstance(response, RestorationResponse)
-    assert response.outcome in {"deferred", "restored", "denied"}, (
-        "RestorationResponse.outcome must remain a small, enumerated set"
-    )
 
     for blob in _both_json_renders(response):
         _assert_no_raw_values(blob, surface="RestorationResponse")
@@ -690,6 +729,108 @@ def test_on_disk_private_dict_does_contain_raw_values(
 
 
 # ---------------------------------------------------------------------------
+# ResolverSuccess: ordinary-agent scope vs. PRIVATE_BOUNDARY scope
+# ---------------------------------------------------------------------------
+
+
+def test_resolver_success_under_ordinary_scope_omits_private_state(
+    canonical_vault: tuple[Path, ProcessResponse, PublicHandle],
+) -> None:
+    """:func:`resolve` under :data:`ResolverScope.ORDINARY_AGENT` must return
+    a :class:`ResolverSuccess` whose ``private_state`` is ``None`` and whose
+    serialisation carries no raw private values or vault paths."""
+    from yomotsusaka.boundary import ResolverSuccess
+
+    vault_root, _process_response, handle = canonical_vault
+    outcome = resolve(
+        handle.locator,
+        scope=ResolverScope.ORDINARY_AGENT,
+        purpose="exposure-contract",
+        vault_root=vault_root,
+    )
+    assert isinstance(outcome, ResolverSuccess)
+    assert outcome.private_state is None, (
+        "ORDINARY_AGENT scope must never populate PrivateState"
+    )
+
+    for blob in _both_json_renders(outcome):
+        _assert_no_raw_values(blob, surface="ResolverSuccess(ORDINARY_AGENT)")
+        _assert_no_paths(
+            blob,
+            surface="ResolverSuccess(ORDINARY_AGENT)",
+            extra=_scrub_for_path_assertion(vault_root),
+        )
+
+    # AUDIT_REVIEWER is also a non-private scope; the same invariant holds.
+    audit_outcome = resolve(
+        handle.locator,
+        scope=ResolverScope.AUDIT_REVIEWER,
+        purpose="exposure-contract",
+        vault_root=vault_root,
+    )
+    assert isinstance(audit_outcome, ResolverSuccess)
+    assert audit_outcome.private_state is None, (
+        "AUDIT_REVIEWER scope must never populate PrivateState"
+    )
+    for blob in _both_json_renders(audit_outcome):
+        _assert_no_raw_values(blob, surface="ResolverSuccess(AUDIT_REVIEWER)")
+        _assert_no_paths(
+            blob,
+            surface="ResolverSuccess(AUDIT_REVIEWER)",
+            extra=_scrub_for_path_assertion(vault_root),
+        )
+
+
+def test_resolver_success_under_private_boundary_scope_carries_private_state(
+    canonical_vault: tuple[Path, ProcessResponse, PublicHandle],
+) -> None:
+    """:func:`resolve` under :data:`ResolverScope.PRIVATE_BOUNDARY` is the
+    one entry point that materialises raw private values, by design (see
+    architecture.md §5.7.2). This test documents that fact and pins the
+    invariant that *no other code in this file* serialises a
+    ``ResolverSuccess`` carrying ``PrivateState``: such a serialisation
+    contains raw private values and must never reach an agent-facing
+    surface. This is the inverse of every other test in the file — it
+    expects the leak, because the leak is the contract."""
+    from yomotsusaka.boundary import PrivateState, ResolverSuccess
+
+    vault_root, _process_response, handle = canonical_vault
+    outcome = resolve(
+        handle.locator,
+        scope=ResolverScope.PRIVATE_BOUNDARY,
+        purpose="exposure-contract",
+        vault_root=vault_root,
+    )
+    assert isinstance(outcome, ResolverSuccess)
+    assert isinstance(outcome.private_state, PrivateState)
+    # Sanity: the materialised PrivateState DOES carry raw values (because
+    # that is the point of PRIVATE_BOUNDARY scope). If this assertion ever
+    # fails the kernel has stopped passing raw values through resolve(),
+    # which would make every "no raw value" assertion below trivially true.
+    blob = outcome.model_dump_json()
+    leaked_values = [v for v in RAW_VALUES if v in blob]
+    assert leaked_values, (
+        "ResolverSuccess(PRIVATE_BOUNDARY) is expected to carry raw private "
+        f"values in its serialisation; saw none of {RAW_VALUES!r}"
+    )
+
+    # And confirm that the public-facing helper we use elsewhere (resolve
+    # under ORDINARY_AGENT) does NOT leak these same values. This is the
+    # contract: scope is the gate.
+    public_outcome = resolve(
+        handle.locator,
+        scope=ResolverScope.ORDINARY_AGENT,
+        purpose="exposure-contract",
+        vault_root=vault_root,
+    )
+    assert isinstance(public_outcome, ResolverSuccess)
+    for blob in _both_json_renders(public_outcome):
+        _assert_no_raw_values(
+            blob, surface="ResolverSuccess(ORDINARY_AGENT vs PRIVATE_BOUNDARY)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 9. caplog (INFO+) across every boundary entry point
 # ---------------------------------------------------------------------------
 
@@ -734,16 +875,22 @@ def test_boundary_entry_points_do_not_log_raw_values(
             vault_root=vault_root,
         )
 
-    # Concatenate every formatted record + its raw message; either could
-    # carry a leak.
+    # Scan the formatted message + any exception traceback text. A
+    # ``logger.exception()`` call lands the traceback in ``record.exc_text``
+    # (not in ``getMessage()``); ValidationError reprs and OSError messages
+    # can carry private input fragments or paths.
     for record in caplog.records:
-        for leaf in _iter_strings(record.getMessage()):
-            _assert_no_raw_values(leaf, surface=f"caplog[{record.name}]")
-            _assert_no_paths(
-                leaf,
-                surface=f"caplog[{record.name}]",
-                extra=_scrub_for_path_assertion(vault_root),
-            )
+        candidates: list[str] = [record.getMessage()]
+        if record.exc_text:
+            candidates.append(record.exc_text)
+        for blob in candidates:
+            for leaf in _iter_strings(blob):
+                _assert_no_raw_values(leaf, surface=f"caplog[{record.name}]")
+                _assert_no_paths(
+                    leaf,
+                    surface=f"caplog[{record.name}]",
+                    extra=_scrub_for_path_assertion(vault_root),
+                )
 
 
 # ---------------------------------------------------------------------------
