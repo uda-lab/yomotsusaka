@@ -1,0 +1,25 @@
+# Policy configuration example
+# Copy to config/policy.yaml and adjust for your deployment.
+
+# Entity kinds that should always be redacted
+always_redact:
+  - PERSON
+  - ID_NUMBER
+  - FINANCIAL
+  - HEALTH
+
+# Entity kinds that should be redacted only in high-sensitivity documents
+conditional_redact:
+  - DATE
+  - LOCATION
+  - ORG
+
+# Minimum confidence score for a detected entity to be redacted (0.0–1.0)
+min_confidence: 0.8
+
+# Destinations that manifests may be transferred to
+allowed_transfer_destinations:
+  - "s3://my-bucket/manifests/"
+
+# Whether to allow agents to trigger restoration without explicit approval
+require_restoration_approval: true
