@@ -15,7 +15,6 @@ def test_single_span_replaced():
 
     rec = records[0]
     assert rec.kind == EntityKind.PERSON
-    assert rec.original_value == "Alice"
     assert rec.redacted_key.startswith("<PERSON_")
     assert rec.redacted_key in redacted
 

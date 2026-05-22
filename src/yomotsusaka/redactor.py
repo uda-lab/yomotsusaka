@@ -89,7 +89,6 @@ def redact(
         entity_records.append(
             EntityRecord(
                 kind=span.kind,
-                original_value=original_value,
                 redacted_key=key,
                 start_char=redacted_start,
                 end_char=redacted_end,

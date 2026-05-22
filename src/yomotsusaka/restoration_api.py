@@ -35,7 +35,7 @@ def restore(
     handle:
         Artifact handle returned by :func:`~yomotsusaka.commit.commit`.
     vault_root:
-        Root directory of the local vault.
+        Legacy fallback root directory of the local vault.
 
     Returns
     -------
@@ -47,7 +47,9 @@ def restore(
     RestorationError
         If the vault file cannot be found or read.
     """
-    private_path = vault_root / "private" / f"{handle.doc_id}.json"
+    private_path = Path(handle.vault_path)
+    if not private_path.exists() and not private_path.is_absolute():
+        private_path = vault_root / "private" / f"{handle.doc_id}.json"
     if not private_path.exists():
         raise RestorationError(f"No private data found for doc {handle.doc_id}")
 

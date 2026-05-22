@@ -18,7 +18,7 @@ if [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate
 fi
 
-python - <<'EOF'
+python - "$DOC_DIR" <<'EOF'
 import sys
 from pathlib import Path
 from yomotsusaka.batch_queue import BatchQueue

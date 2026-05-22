@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ---------------------------------------------------------------------------
@@ -51,10 +51,10 @@ class BatchStatus(str, Enum):
 # ---------------------------------------------------------------------------
 
 class EntityRecord(BaseModel, frozen=True):
-    """A single detected private entity within a document."""
+    """Agent-safe metadata for a single detected private entity."""
+    model_config = ConfigDict(extra="forbid")
     entity_id: str = Field(default_factory=_new_id)
     kind: EntityKind
-    original_value: str
     redacted_key: str
     start_char: int
     end_char: int

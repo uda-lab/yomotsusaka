@@ -21,7 +21,6 @@ from yomotsusaka.schemas import (
 def test_entity_record_valid():
     rec = EntityRecord(
         kind=EntityKind.PERSON,
-        original_value="Alice",
         redacted_key="<PERSON_abc12345>",
         start_char=0,
         end_char=5,
@@ -34,7 +33,6 @@ def test_entity_record_confidence_out_of_range():
     with pytest.raises(ValidationError):
         EntityRecord(
             kind=EntityKind.PERSON,
-            original_value="Alice",
             redacted_key="<PERSON_abc12345>",
             start_char=0,
             end_char=5,
@@ -45,13 +43,23 @@ def test_entity_record_confidence_out_of_range():
 def test_entity_record_is_immutable():
     rec = EntityRecord(
         kind=EntityKind.PERSON,
-        original_value="Alice",
         redacted_key="<PERSON_abc12345>",
         start_char=0,
         end_char=5,
     )
     with pytest.raises(Exception):  # frozen model raises on assignment
-        rec.original_value = "Bob"  # type: ignore[misc]
+        rec.redacted_key = "<PERSON_other>"  # type: ignore[misc]
+
+
+def test_entity_record_rejects_original_value_field():
+    with pytest.raises(ValidationError):
+        EntityRecord(
+            kind=EntityKind.PERSON,
+            original_value="Alice",
+            redacted_key="<PERSON_abc12345>",
+            start_char=0,
+            end_char=5,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +93,6 @@ def test_document_manifest_defaults():
 def test_document_manifest_with_entities():
     rec = EntityRecord(
         kind=EntityKind.PERSON,
-        original_value="Alice",
         redacted_key="<PERSON_abc12345>",
         start_char=7,
         end_char=24,
