@@ -124,6 +124,18 @@ def test_request_requires_some_filter() -> None:
         )
 
 
+def test_request_rejects_whitespace_only_filter_keys() -> None:
+    """A whitespace-only key list is semantically vacuous and would silently
+    pass through to the kernel filter; the request layer must require at
+    least one meaningful filter element."""
+    with pytest.raises(PydanticValidationError):
+        RestorationRequest(
+            **_base_kwargs(),
+            document_id="d",
+            requested_keys=["", "   "],
+        )
+
+
 def test_request_rejects_empty_caller_label() -> None:
     with pytest.raises(PydanticValidationError):
         RestorationRequest(
@@ -804,6 +816,13 @@ def test_response_outcome_invariants_block_inconsistent_shapes() -> None:
             audit_record_id=audit_id,
             reason=RestorationFailureReason.KernelError,
             private_entries=[],
+        )
+    # accepted_but_redacted with a failure reason
+    with pytest.raises(PydanticValidationError):
+        RestorationResponse(
+            outcome="accepted_but_redacted",
+            audit_record_id=audit_id,
+            reason=RestorationFailureReason.KernelError,
         )
 
 

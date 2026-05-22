@@ -703,9 +703,16 @@ class RestorationRequest(BaseModel, frozen=True):
             raise ValueError(
                 "exactly one of target_public_handle and document_id must be set"
             )
-        if not self.requested_keys and not self.requested_entity_kinds:
+        # A list containing only whitespace/empty strings is semantically
+        # vacuous and would otherwise pass through to the kernel filter
+        # where it silently matches nothing (or worse, the empty-key check
+        # short-circuits and returns every entry). Require at least one
+        # *meaningful* filter element.
+        meaningful_keys = [k for k in self.requested_keys if k.strip()]
+        if not meaningful_keys and not self.requested_entity_kinds:
             raise ValueError(
-                "at least one of requested_keys or requested_entity_kinds must be non-empty"
+                "at least one of requested_keys (non-empty after strip) or "
+                "requested_entity_kinds must be non-empty"
             )
         return self
 
@@ -753,6 +760,10 @@ class RestorationResponse(BaseModel, frozen=True):
             if self.private_entries is not None:
                 raise ValueError(
                     "accepted_but_redacted outcome must not carry private_entries"
+                )
+            if self.reason is not None:
+                raise ValueError(
+                    "accepted_but_redacted outcome must not carry a failure reason"
                 )
         return self
 
