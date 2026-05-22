@@ -6,8 +6,9 @@ This module wires the existing primitives (:mod:`yomotsusaka.redactor`,
 point so callers can drive the canonical fixture end-to-end without
 re-implementing orchestration glue.
 
-The validator currently runs as a no-op stub; tightening its behaviour is
-tracked under issue #9.
+The validator enforces the MVP privacy invariants; on failure a
+:class:`~yomotsusaka.validator.ValidationError` propagates out and no
+public/private artifacts are written for the offending document.
 """
 
 from __future__ import annotations
@@ -96,6 +97,9 @@ def process_document(
     ValueError
         If ``doc_id`` contains characters outside the allowed charset or
         equals a path-traversal segment.
+    yomotsusaka.validator.ValidationError
+        If the redacted manifest fails any MVP privacy check.  The vault
+        is left untouched in this case (no artifacts are written).
     """
     _validate_doc_id(doc_id)
 
@@ -108,6 +112,7 @@ def process_document(
         entities=entities,
     )
 
-    Validator().validate(manifest)
+    # Run before commit so a ValidationError leaves the vault untouched.
+    Validator().validate(manifest, private_dict)
 
     return commit(manifest, private_dict, vault_root)
