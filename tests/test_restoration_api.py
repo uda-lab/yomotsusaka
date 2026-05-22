@@ -2,9 +2,11 @@
 
 from pathlib import Path
 
+import pytest
+
 from yomotsusaka.commit import commit
-from yomotsusaka.restoration_api import restore
-from yomotsusaka.schemas import DocumentManifest, EntityKind, PrivateDictEntry
+from yomotsusaka.restoration_api import RestorationError, restore
+from yomotsusaka.schemas import ArtifactHandle, DocumentManifest, EntityKind, PrivateDictEntry
 
 
 def test_restore_uses_handle_vault_path(tmp_path: Path):
@@ -19,7 +21,17 @@ def test_restore_uses_handle_vault_path(tmp_path: Path):
     ]
 
     handle = commit(manifest, private_dict, vault_root=vault_root)
-    restored = restore(handle, vault_root=tmp_path / "wrong-root")
+    restored = restore(handle, vault_root=vault_root)
 
     assert len(restored) == 1
     assert restored[0].original_value == "Alice"
+
+
+def test_restore_rejects_path_outside_vault(tmp_path: Path):
+    forged = ArtifactHandle(
+        doc_id="doc-001",
+        vault_path=str(tmp_path / "outside.json"),
+    )
+
+    with pytest.raises(RestorationError):
+        restore(forged, vault_root=tmp_path / "vault")
