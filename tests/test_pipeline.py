@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from yomotsusaka.pipeline import process_document
 from yomotsusaka.redactor import Span
 from yomotsusaka.restoration_api import restore
@@ -67,3 +69,36 @@ def test_canonical_fixture_round_trip(tmp_path: Path) -> None:
     for entry in restored:
         assert entry.key in redacted_text
         assert by_key[entry.key] == CANONICAL_ORIGINALS[entry.kind]
+
+
+@pytest.mark.parametrize(
+    "bad_doc_id",
+    [
+        "../escape",
+        "nested/path",
+        "back\\slash",
+        "..",
+        ".",
+        "",
+        "a" * 129,
+        "has space",
+        "has\x00null",
+    ],
+)
+def test_process_document_rejects_unsafe_doc_id(
+    tmp_path: Path, bad_doc_id: str
+) -> None:
+    """doc_id flows into vault paths; reject anything that could escape the vault."""
+    vault_root = tmp_path / "vault"
+
+    with pytest.raises(ValueError):
+        process_document(
+            doc_id=bad_doc_id,
+            raw_text=CANONICAL_TEXT,
+            spans=CANONICAL_SPANS,
+            vault_root=vault_root,
+        )
+
+    # Nothing must have been written to the vault for a rejected doc_id.
+    assert not (vault_root / "manifests").exists()
+    assert not (vault_root / "private").exists()
