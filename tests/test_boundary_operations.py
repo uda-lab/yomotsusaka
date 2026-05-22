@@ -8,7 +8,6 @@ Pins the agent-facing contract for:
   ``source_ref``.
 * :func:`search_request` — returns public ``SearchHit``s built from already-
   redacted manifest text.
-* :func:`restoration_request` — shape-only stub, always ``outcome="deferred"``.
 * :func:`status_report_request` — shape-only stub mapping to
   ``"committed"`` / ``"unknown"``.
 
@@ -33,8 +32,6 @@ from yomotsusaka.boundary import (
     PublicManifestView,
     ResolverFailure,
     ResolverFailureReason,
-    RestorationRequest,
-    RestorationResponse,
     SearchHit,
     SearchRequest,
     SearchResponse,
@@ -44,7 +41,6 @@ from yomotsusaka.boundary import (
     build_locator,
     inspect_request,
     process_document_request,
-    restoration_request,
     search_request,
     status_report_request,
 )
@@ -261,77 +257,6 @@ def test_search_request_raw_value_queries_return_zero_hits(tmp_path: Path) -> No
             f"search returned hits for raw private value {needle!r}; "
             "private values must not be findable through the public boundary"
         )
-
-
-# ---------------------------------------------------------------------------
-# restoration_request (shape-only stub)
-# ---------------------------------------------------------------------------
-
-
-def test_restoration_request_always_returns_deferred(tmp_path: Path) -> None:
-    vault_root = tmp_path / "vault"
-    doc_id = "restore-doc"
-
-    _process_canonical(vault_root, doc_id=doc_id)
-    response = restoration_request(
-        RestorationRequest(
-            locator=_expected_locator(doc_id),
-            purpose="legitimate-restore",
-        ),
-        vault_root=vault_root,
-    )
-    assert isinstance(response, RestorationResponse)
-    assert response.outcome == "deferred"
-    assert response.locator == _expected_locator(doc_id)
-
-    # No raw private value reaches the deferred response.
-    blob = response.model_dump_json()
-    for needle in _RAW_NEEDLES:
-        assert needle not in blob
-
-
-def test_restoration_request_rejects_malformed_locator(tmp_path: Path) -> None:
-    response = restoration_request(
-        RestorationRequest(locator="bogus", purpose="t"),
-        vault_root=tmp_path,
-    )
-    assert isinstance(response, ResolverFailure)
-    assert response.reason is ResolverFailureReason.MalformedLocator
-
-
-def test_restoration_request_rejects_empty_purpose(tmp_path: Path) -> None:
-    response = restoration_request(
-        RestorationRequest(locator=_expected_locator("x"), purpose="   "),
-        vault_root=tmp_path,
-    )
-    assert isinstance(response, ResolverFailure)
-    assert response.reason is ResolverFailureReason.PurposeNotPermitted
-
-
-def test_restoration_request_does_not_invoke_restoration_api(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """MVP-2 stub must not call restoration_api.restore; #27 wires the real flow."""
-    vault_root = tmp_path / "vault"
-    doc_id = "restore-no-call"
-    _process_canonical(vault_root, doc_id=doc_id)
-
-    calls: list[str] = []
-
-    import yomotsusaka.restoration_api as restoration_api
-
-    def boom(*args: object, **kwargs: object) -> None:
-        calls.append("restore")
-        raise AssertionError("restoration_api.restore must not be called in MVP-2")
-
-    monkeypatch.setattr(restoration_api, "restore", boom)
-
-    response = restoration_request(
-        RestorationRequest(locator=_expected_locator(doc_id), purpose="t"),
-        vault_root=vault_root,
-    )
-    assert isinstance(response, RestorationResponse)
-    assert calls == []
 
 
 # ---------------------------------------------------------------------------
