@@ -125,10 +125,14 @@ def build_locator(
             f"path traversal segment; got {opaque_id!r}"
         )
     if fragment is not None:
-        if not isinstance(fragment, str) or not _FRAGMENT_PATTERN.fullmatch(fragment):
+        if (
+            not isinstance(fragment, str)
+            or not _FRAGMENT_PATTERN.fullmatch(fragment)
+            or fragment in {".", ".."}
+        ):
             raise ValueError(
-                "fragment must match [A-Za-z0-9._-]{1,64}; "
-                f"got {fragment!r}"
+                "fragment must match [A-Za-z0-9._-]{1,64} and must not be a "
+                f"path traversal segment; got {fragment!r}"
             )
 
     base = f"{LOCATOR_SCHEME}://{exposure_class}/{artifact_kind}/{opaque_id}"
@@ -154,11 +158,14 @@ def parse_locator(locator: str) -> ParsedLocator | None:
     opaque = match.group("opaque")
     if opaque in {".", ".."}:
         return None
+    fragment = match.group("fragment")
+    if fragment in {".", ".."}:
+        return None
     return ParsedLocator(
         exposure_class=exposure,
         artifact_kind=kind,
         opaque_id=opaque,
-        fragment=match.group("fragment"),
+        fragment=fragment,
     )
 
 
@@ -420,8 +427,20 @@ def resolve(
         try:
             raw_text = private_dict_path.read_text(encoding="utf-8")
             raw_entries = json.loads(raw_text)
-            private_entries = [PrivateDictEntry(**item) for item in raw_entries]
-        except (OSError, ValueError, PydanticValidationError):
+            # The file must be a JSON array; reject every other top-level
+            # shape (null, object, scalar) explicitly so a non-iterable or
+            # mapping-keyed iteration cannot raise TypeError out of the
+            # except below. Use model_validate (Pydantic v2 idiom) so a
+            # non-mapping list item raises PydanticValidationError rather
+            # than TypeError, keeping the except tuple consistent.
+            if not isinstance(raw_entries, list):
+                raise TypeError(
+                    "private dictionary file must contain a JSON array"
+                )
+            private_entries = [
+                PrivateDictEntry.model_validate(item) for item in raw_entries
+            ]
+        except (OSError, ValueError, TypeError, PydanticValidationError):
             return ResolverFailure(
                 locator=locator,
                 reason=ResolverFailureReason.ArtifactMissing,
@@ -594,7 +613,24 @@ def process_document_request(
     The internal :class:`ArtifactHandle` returned by the kernel is mapped to
     a :class:`PublicHandle` carrying the opaque locator only; ``vault_path``
     is discarded at the boundary and never reaches the response.
+
+    The kernel's :func:`pipeline.process_document` validates *doc_id* against
+    the same opaque-id charset the locator grammar uses (including the
+    ``"."``/``".."`` exclusion), so an unsafe doc_id raises ``ValueError``
+    *before* any vault write — there is no orphan-write risk between the
+    kernel call and :func:`build_locator`. We also pre-validate the locator
+    component here so the error path is symmetric whether the rejection
+    happens kernel-side or boundary-side.
     """
+    # Boundary-side validation mirrors the kernel guard. If the kernel
+    # tightens or relaxes _validate_doc_id, this call surfaces the
+    # difference here (build_locator raises ValueError) instead of leaving
+    # a window where one side accepts and the other rejects.
+    _ = build_locator(
+        exposure_class="agent_redacted",
+        artifact_kind="manifest",
+        opaque_id=request.doc_id,
+    )
     handle: ArtifactHandle = process_document(
         doc_id=request.doc_id,
         raw_text=request.raw_text,
@@ -633,7 +669,7 @@ def inspect_request(
         manifest = DocumentManifest.model_validate_json(
             manifest_path.read_text(encoding="utf-8")
         )
-    except (OSError, ValueError, PydanticValidationError):
+    except (OSError, ValueError, TypeError, PydanticValidationError):
         return ResolverFailure(
             locator=request.locator,
             reason=ResolverFailureReason.ArtifactMissing,

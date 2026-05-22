@@ -462,6 +462,42 @@ def test_resolve_returns_failure_for_schema_mismatched_private_dict(
     assert outcome.reason is ResolverFailureReason.ArtifactMissing
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "null",  # JSON null → not a list
+        '{"alice": "tan"}',  # JSON object → not a list
+        "[42]",  # list of non-mapping scalar
+        '["alice"]',  # list of non-mapping string
+        "[null]",  # list of nulls
+        "[[1, 2, 3]]",  # list of lists
+    ],
+)
+def test_resolve_returns_failure_for_wrong_shape_private_dict(
+    tmp_path: Path, payload: str
+) -> None:
+    """Valid JSON of the wrong shape must produce ResolverFailure, not
+    propagate TypeError. Pins coverage for every shape a private-dict file
+    could plausibly drift into: JSON null, an object, a list of non-mapping
+    items."""
+    vault_root = tmp_path / "vault"
+    locator = _commit_canonical_fixture(vault_root)
+
+    private_path = vault_root / "private" / f"{_DOC_ID}.json"
+    private_path.write_text(payload, encoding="utf-8")
+
+    outcome = resolve(
+        locator,
+        scope=ResolverScope.PRIVATE_BOUNDARY,
+        purpose="restore-test",
+        vault_root=vault_root,
+    )
+    assert isinstance(outcome, ResolverFailure), (
+        f"payload {payload!r} produced {outcome!r}, expected ResolverFailure"
+    )
+    assert outcome.reason is ResolverFailureReason.ArtifactMissing
+
+
 # ---------------------------------------------------------------------------
 # PrivateState privacy invariant — never serialised to public output
 # ---------------------------------------------------------------------------

@@ -94,8 +94,10 @@ def test_locator_constants_match_metaplan() -> None:
         "private://agent_redacted/manifest/doc-001#frag/with/slash",
         "private://agent_redacted/manifest/doc-001#" + "f" * 65,  # fragment too long
         "private://agent_redacted/manifest/doc-001?query=1",  # query string not allowed
-        "private://agent_redacted/manifest/.",  # path-traversal segment
-        "private://agent_redacted/manifest/..",  # path-traversal segment
+        "private://agent_redacted/manifest/.",  # path-traversal opaque_id
+        "private://agent_redacted/manifest/..",  # path-traversal opaque_id
+        "private://agent_redacted/manifest/doc-001#.",  # path-traversal fragment
+        "private://agent_redacted/manifest/doc-001#..",  # path-traversal fragment
     ],
 )
 def test_parse_locator_rejects_invalid(bad_locator: str) -> None:
@@ -149,7 +151,9 @@ def test_build_locator_rejects_bad_opaque_id(bad_opaque_id: str) -> None:
         )
 
 
-@pytest.mark.parametrize("bad_fragment", ["", "has space", "has/slash", "x" * 65])
+@pytest.mark.parametrize(
+    "bad_fragment", ["", "has space", "has/slash", "x" * 65, ".", ".."]
+)
 def test_build_locator_rejects_bad_fragment(bad_fragment: str) -> None:
     with pytest.raises(ValueError, match="fragment"):
         build_locator(

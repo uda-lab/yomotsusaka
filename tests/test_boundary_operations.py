@@ -124,6 +124,24 @@ def test_process_document_request_writes_kernel_artifacts(tmp_path: Path) -> Non
     assert (vault_root / "private" / f"{doc_id}.json").exists()
 
 
+@pytest.mark.parametrize("bad_doc_id", [".", "..", "has space", "has/slash", ""])
+def test_process_document_request_rejects_unsafe_doc_id(
+    tmp_path: Path, bad_doc_id: str
+) -> None:
+    """A doc_id that violates the locator grammar must be rejected at the
+    boundary before any vault write — no orphaned manifest, no orphaned
+    private dict."""
+    vault_root = tmp_path / "vault"
+    with pytest.raises(ValueError):
+        process_document_request(
+            ProcessRequest(doc_id=bad_doc_id, raw_text="x", spans=[]),
+            vault_root=vault_root,
+        )
+    # Nothing must have been written for a rejected doc_id.
+    assert not (vault_root / "manifests").exists()
+    assert not (vault_root / "private").exists()
+
+
 # ---------------------------------------------------------------------------
 # inspect_request
 # ---------------------------------------------------------------------------
