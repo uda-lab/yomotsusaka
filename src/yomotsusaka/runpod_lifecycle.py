@@ -1,13 +1,14 @@
 """
-RunPod lifecycle — stub for ephemeral GPU Pod management.
+RunPod lifecycle — stub — deferred for the local MVP; see `docs/runpod.md`.
 
 RunPod (and equivalent GPU cloud providers) are ephemeral compute backends,
 not durable private storage.  Pods should be started before a batch job and
 stopped immediately after to minimise cost.
 
-NOTE: No real RunPod API calls are made here.  Fill in the RunPod SDK /
-REST calls when ready.  See docs/runpod-notes.md for hardware and image
-recommendations.
+NOTE: No real RunPod API calls are made here.  The local MVP runs CPU-only
+with ``DummyBackend``; real RunPod SDK / REST calls remain out of scope
+until a child issue scopes them.  See ``docs/runpod.md`` for hardware and
+image recommendations and ``docs/scaffold-status.md`` for module status.
 """
 
 from __future__ import annotations

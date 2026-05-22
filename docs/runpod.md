@@ -1,5 +1,17 @@
 # RunPod Usage Notes for the Private LLM MVP
 
+## Status
+
+The RunPod path described in this document is **documented but not exercised
+by the local MVP**. `src/yomotsusaka/runpod_lifecycle.py`,
+`src/yomotsusaka/execution_gateway.py`, and `src/yomotsusaka/transfer.py`
+ship as no-op stubs that log a warning and return placeholder values; the
+local MVP runs CPU-only with `DummyBackend`. Real RunPod SDK / REST calls,
+gateway policy enforcement, and remote transfer backends remain out of
+scope until a child issue scopes them. See
+[`docs/scaffold-status.md`](scaffold-status.md) for the canonical module
+classification table.
+
 ## 1. Purpose
 
 This note records the current practical RunPod setup for the private-data firewall / private LLM MVP. It is intentionally lightweight and operational. The goal is to make future agent-assisted development reproducible without over-designing the RunPod layer.
