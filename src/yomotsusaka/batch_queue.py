@@ -31,11 +31,21 @@ class BatchQueue:
 
     def start(self, batch_id: str) -> None:
         batch = self._get(batch_id)
+        if batch.status is not BatchStatus.PENDING:
+            raise ValueError(
+                f"Cannot start batch {batch_id} from status {batch.status.value}; "
+                "start requires PENDING"
+            )
         batch.status = BatchStatus.RUNNING
         batch.started_at = datetime.now(timezone.utc)
 
     def complete(self, batch_id: str, manifests: list[DocumentManifest]) -> None:
         batch = self._get(batch_id)
+        if batch.status is not BatchStatus.RUNNING:
+            raise ValueError(
+                f"Cannot complete batch {batch_id} from status {batch.status.value}; "
+                "complete requires RUNNING"
+            )
         batch.manifests = manifests
         batch.status = BatchStatus.DONE
         batch.finished_at = datetime.now(timezone.utc)
@@ -43,6 +53,11 @@ class BatchQueue:
 
     def fail(self, batch_id: str, error: str) -> None:
         batch = self._get(batch_id)
+        if batch.status is not BatchStatus.RUNNING:
+            raise ValueError(
+                f"Cannot fail batch {batch_id} from status {batch.status.value}; "
+                "fail requires RUNNING"
+            )
         batch.errors.append(error)
         batch.status = BatchStatus.FAILED
         batch.finished_at = datetime.now(timezone.utc)
