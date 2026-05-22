@@ -636,7 +636,15 @@ class RestorationRequest(BaseModel, frozen=True):
     timestamp: datetime = Field(
         description="Request timestamp, timezone-aware UTC.",
     )
-    # Reserved fields — accepted as-given, persisted unchanged, not enforced.
+    # Reserved fields — persisted unchanged into the audit record and not
+    # used as a policy gate in MVP-2. Their *types* still match the frozen
+    # lite-spec: ``authorization_decision`` is intentionally constrained to
+    # ``Literal["accept"] | None`` rather than ``str | None`` so that new
+    # decision values (``"deny"``, ``"pending"``, etc.) have to land via an
+    # explicit schema migration with paired audit-consumer changes — not by
+    # ambient string drift. ``policy_profile`` / ``approval_ticket`` /
+    # ``production_scope`` are free-form because their wire shape is not
+    # yet pinned by any audit consumer.
     authorization_decision: Literal["accept"] | None = None
     policy_profile: str | None = None
     approval_ticket: str | None = None
