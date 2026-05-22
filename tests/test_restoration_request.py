@@ -146,6 +146,31 @@ def test_request_rejects_empty_reason() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "bad_doc_id",
+    [
+        "../secret",
+        "nested/secret",
+        "..",
+        ".",
+        "with space",
+        "back\\slash",
+        "a" * 129,  # too long
+    ],
+)
+def test_request_rejects_unsafe_document_id(bad_doc_id: str) -> None:
+    """document_id must respect the opaque-id charset; path separators and
+    traversal segments must be refused at the request layer rather than at
+    the kernel's relative_to() guard. Otherwise schema-shape violations
+    would misclassify as kernel_error/artifact_missing on observation."""
+    with pytest.raises(PydanticValidationError):
+        RestorationRequest(
+            **_base_kwargs(),
+            document_id=bad_doc_id,
+            requested_keys=["k"],
+        )
+
+
 def test_request_rejects_naive_timestamp() -> None:
     naive = datetime(2026, 5, 23, 12, 0, 0)  # no tzinfo
     with pytest.raises(PydanticValidationError):

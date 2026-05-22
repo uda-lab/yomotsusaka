@@ -663,6 +663,24 @@ class RestorationRequest(BaseModel, frozen=True):
             raise ValueError("timestamp must be a timezone-aware UTC datetime")
         return v
 
+    @field_validator("document_id")
+    @classmethod
+    def _document_id_opaque_id_charset(cls, v: str | None) -> str | None:
+        # When supplied, ``document_id`` is interpolated into the vault path
+        # ``<vault_root>/private/<document_id>.json``. Require the same
+        # opaque-id charset and traversal exclusion the locator grammar
+        # enforces (architecture §5.7.1) so path separators, traversal
+        # segments, and out-of-range values are rejected at the public
+        # boundary rather than at the kernel's relative_to() guard.
+        if v is None:
+            return v
+        if not isinstance(v, str) or not _OPAQUE_ID_PATTERN.fullmatch(v) or v in {".", ".."}:
+            raise ValueError(
+                "document_id must match [A-Za-z0-9._-]{1,128} and must not be a "
+                "path traversal segment"
+            )
+        return v
+
     @model_validator(mode="after")
     def _check_targets_and_filters(self) -> "RestorationRequest":
         has_handle = self.target_public_handle is not None
