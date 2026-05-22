@@ -183,6 +183,37 @@ def test_request_rejects_naive_timestamp() -> None:
         )
 
 
+def test_request_rejects_tzinfo_with_none_utcoffset() -> None:
+    """Python treats a datetime as aware only when ``utcoffset()`` is
+    non-None. A custom ``tzinfo`` whose ``utcoffset()`` returns None still
+    passes ``tzinfo is not None`` but is naive by Python's own definition.
+    The validator must use the canonical idiom so such constructions never
+    leak into the audit log via ``astimezone()``."""
+    from datetime import tzinfo
+
+    class FakeAware(tzinfo):
+        def utcoffset(self, dt):  # type: ignore[override]
+            return None
+
+        def dst(self, dt):  # type: ignore[override]
+            return None
+
+        def tzname(self, dt):  # type: ignore[override]
+            return "FAKE"
+
+    pseudo = datetime(2026, 5, 23, 12, 0, 0, tzinfo=FakeAware())
+    assert pseudo.tzinfo is not None  # the trap
+    assert pseudo.utcoffset() is None  # but it's still naive by Python's rule
+    with pytest.raises(PydanticValidationError):
+        RestorationRequest(
+            caller_label="c",
+            reason="r",
+            timestamp=pseudo,
+            document_id="d",
+            requested_keys=["k"],
+        )
+
+
 def test_request_is_frozen() -> None:
     req = RestorationRequest(
         **_base_kwargs(),

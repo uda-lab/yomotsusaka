@@ -667,8 +667,14 @@ class RestorationRequest(BaseModel, frozen=True):
     @field_validator("timestamp")
     @classmethod
     def _timestamp_utc(cls, v: datetime) -> datetime:
-        if not isinstance(v, datetime) or v.tzinfo is None:
-            raise ValueError("timestamp must be a timezone-aware UTC datetime")
+        # Python only treats a datetime as truly aware when ``utcoffset()``
+        # is non-None. A custom ``tzinfo`` whose ``utcoffset()`` returns
+        # None still satisfies ``tzinfo is not None`` but is naive by
+        # Python's own definition (datetime docs §"aware and naive
+        # objects"). Use the canonical idiom so such constructions are
+        # rejected here rather than slipping into ``astimezone()`` later.
+        if not isinstance(v, datetime) or v.utcoffset() is None:
+            raise ValueError("timestamp must be a timezone-aware datetime")
         return v
 
     @field_validator("document_id")
