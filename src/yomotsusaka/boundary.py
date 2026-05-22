@@ -1,26 +1,56 @@
 """
 Boundary — opaque public surface for agent-facing operations.
 
-Frozen URI grammar
-(``private://<exposure_class>/<artifact_kind>/<opaque_id>[#<fragment>]``),
-:class:`PublicHandle`, :class:`SpanSpec`, plus the fail-closed local
-:func:`resolve` contract that maps a locator to private-side state.
-Request/response models for the five MVP-2 operations land in the next
-commit.
+This module is the only surface ordinary agents are intended to import from
+``yomotsusaka``. It provides:
+
+* A frozen URI grammar for public artifact locators
+  (``private://<exposure_class>/<artifact_kind>/<opaque_id>[#<fragment>]``).
+* :class:`PublicHandle` — an opaque wrapper carrying only the locator string.
+* :func:`build_locator` / :func:`parse_locator` — round-tripping helpers.
+* :func:`resolve` — the fail-closed resolver contract that maps a locator to
+  private-side state. Only callers that pass ``scope=ResolverScope.PRIVATE_BOUNDARY``
+  ever receive the materialised :class:`PrivateState`; all other scopes get a
+  :class:`ResolverSuccess` whose ``private_state`` is ``None``.
+* Five MVP-2 request/response models (process / inspect / search /
+  request-restore / report) and matching boundary entry points.
+
+Private kernel modules (``pipeline``, ``commit``, ``restoration_api``,
+``search_gateway``) remain importable at their original paths but are
+classified as **private-side internal kernel** — see ``docs/scaffold-status.md``
+and ``docs/architecture.md`` §5.7.1, §5.7.2.
+
+No agent-facing return from this module carries raw private values, raw
+file paths, or vault-side bytes. The single exception is
+:class:`PrivateState`, which is intentionally restricted to
+``scope=PRIVATE_BOUNDARY`` callers (e.g. the future #27 restoration flow);
+its serialisation must never reach an ordinary-agent surface.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from yomotsusaka.pipeline import process_document
 from yomotsusaka.redactor import Span
-from yomotsusaka.schemas import EntityKind, PrivateDictEntry
+from yomotsusaka.schemas import (
+    ArtifactHandle,
+    DocumentManifest,
+    EntityKind,
+    EntityRecord,
+    PrivateDictEntry,
+)
+from yomotsusaka.search_gateway import SearchGateway
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +416,281 @@ def resolve(
     )
 
 
+# ---------------------------------------------------------------------------
+# Public manifest projection
+# ---------------------------------------------------------------------------
+
+
+class PublicManifestView(BaseModel, frozen=True):
+    """Agent-safe projection of a :class:`DocumentManifest`.
+
+    Drops ``source_ref`` — the opaque internal correlation key that
+    intentionally aliases ``doc_id`` in MVP-1 — and keeps only the fields
+    ordinary agents should see.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    doc_id: str
+    redacted_text: str
+    entities: list[EntityRecord] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list)
+    summary: str = ""
+    created_at: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def from_manifest(cls, manifest: DocumentManifest) -> "PublicManifestView":
+        return cls(
+            doc_id=manifest.doc_id,
+            redacted_text=manifest.redacted_text,
+            entities=list(manifest.entities),
+            labels=list(manifest.labels),
+            summary=manifest.summary,
+            created_at=manifest.created_at,
+            metadata=dict(manifest.metadata),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Request / response schemas (five MVP-2 operations)
+# ---------------------------------------------------------------------------
+
+
+class ProcessRequest(BaseModel, frozen=True):
+    """Public-side request to drive raw_text through the kernel pipeline."""
+
+    model_config = ConfigDict(extra="forbid")
+    doc_id: str
+    raw_text: str
+    spans: list[SpanSpec] = Field(default_factory=list)
+
+
+class ProcessResponse(BaseModel, frozen=True):
+    """Public response carrying only the opaque handle."""
+
+    model_config = ConfigDict(extra="forbid")
+    handle: PublicHandle
+
+
+class InspectRequest(BaseModel, frozen=True):
+    model_config = ConfigDict(extra="forbid")
+    locator: str
+
+
+class InspectResponse(BaseModel, frozen=True):
+    model_config = ConfigDict(extra="forbid")
+    manifest: PublicManifestView
+
+
+class SearchRequest(BaseModel, frozen=True):
+    model_config = ConfigDict(extra="forbid")
+    query: str
+    top_k: int = Field(default=10, ge=1, le=1000)
+
+
+class SearchHit(BaseModel, frozen=True):
+    """One search result.
+
+    Carries only the public handle, a redacted snippet, and the manifest's
+    public labels. No ``DocumentManifest`` is returned to ordinary agents.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    handle: PublicHandle
+    redacted_snippet: str
+    labels: list[str] = Field(default_factory=list)
+
+
+class SearchResponse(BaseModel, frozen=True):
+    model_config = ConfigDict(extra="forbid")
+    hits: list[SearchHit] = Field(default_factory=list)
+
+
+class RestorationRequest(BaseModel, frozen=True):
+    model_config = ConfigDict(extra="forbid")
+    locator: str
+    purpose: str
+
+
+class RestorationResponse(BaseModel, frozen=True):
+    """Shape-only restoration response.
+
+    MVP-2 always emits ``outcome="deferred"`` because the real restoration
+    flow with audit logging is scoped to #27.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    outcome: Literal["deferred"] = "deferred"
+    locator: str
+    detail: str = "restoration flow deferred to issue #27"
+
+
+class StatusReportRequest(BaseModel, frozen=True):
+    model_config = ConfigDict(extra="forbid")
+    locator: str
+
+
+class StatusReportResponse(BaseModel, frozen=True):
+    model_config = ConfigDict(extra="forbid")
+    locator: str
+    status: Literal["committed", "unknown"]
+
+
+# ---------------------------------------------------------------------------
+# Boundary entry points
+# ---------------------------------------------------------------------------
+
+
+def _public_handle_for(doc_id: str) -> PublicHandle:
+    """Build the MVP-2 canonical public handle for a committed doc_id."""
+    return PublicHandle(
+        locator=build_locator(
+            exposure_class="agent_redacted",
+            artifact_kind="manifest",
+            opaque_id=doc_id,
+        )
+    )
+
+
+def process_document_request(
+    request: ProcessRequest,
+    *,
+    vault_root: Path,
+) -> ProcessResponse:
+    """Drive *request* through the kernel and return a public-only handle.
+
+    The internal :class:`ArtifactHandle` returned by the kernel is mapped to
+    a :class:`PublicHandle` carrying the opaque locator only; ``vault_path``
+    is discarded at the boundary and never reaches the response.
+    """
+    handle: ArtifactHandle = process_document(
+        doc_id=request.doc_id,
+        raw_text=request.raw_text,
+        spans=[s.to_internal() for s in request.spans],
+        vault_root=vault_root,
+    )
+    return ProcessResponse(handle=_public_handle_for(handle.doc_id))
+
+
+def inspect_request(
+    request: InspectRequest,
+    *,
+    vault_root: Path,
+) -> InspectResponse | ResolverFailure:
+    """Read a committed manifest and return its public view.
+
+    Returns :class:`ResolverFailure` (not raises) on malformed locator,
+    unknown artifact, or missing manifest. This keeps the public surface
+    homogeneous: callers branch on ``isinstance(... , ResolverFailure)``.
+    """
+    outcome = resolve(
+        request.locator,
+        scope=ResolverScope.ORDINARY_AGENT,
+        purpose="boundary.inspect_request",
+        vault_root=vault_root,
+    )
+    if isinstance(outcome, ResolverFailure):
+        return outcome
+    manifest_path, _ = _vault_paths(vault_root, outcome.opaque_id)
+    manifest = DocumentManifest.model_validate_json(
+        manifest_path.read_text(encoding="utf-8")
+    )
+    return InspectResponse(manifest=PublicManifestView.from_manifest(manifest))
+
+
+def _redacted_snippet(text: str, query: str, *, window: int = 60) -> str:
+    """Return a window of *text* around the first case-insensitive match of *query*.
+
+    The window is taken from ``text`` only — which is already redacted on
+    indexed manifests — so the result carries no raw private values.
+    """
+    if not query:
+        return text[:window]
+    haystack = text.lower()
+    needle = query.lower()
+    idx = haystack.find(needle)
+    if idx == -1:
+        return text[:window]
+    start = max(0, idx - window // 2)
+    end = min(len(text), idx + len(query) + window // 2)
+    return text[start:end]
+
+
+def search_request(
+    request: SearchRequest,
+    *,
+    gateway: SearchGateway,
+) -> SearchResponse:
+    """Search redacted manifests and return public-only hits.
+
+    The :class:`SearchGateway` only ever indexes redacted manifests, so any
+    hit is by construction public-safe. The boundary still drops the raw
+    :class:`DocumentManifest` reference and exposes only handle / snippet /
+    labels.
+    """
+    raw_hits: list[DocumentManifest] = gateway.search(request.query, top_k=request.top_k)
+    hits = [
+        SearchHit(
+            handle=_public_handle_for(m.doc_id),
+            redacted_snippet=_redacted_snippet(m.redacted_text, request.query),
+            labels=list(m.labels),
+        )
+        for m in raw_hits
+    ]
+    return SearchResponse(hits=hits)
+
+
+def restoration_request(
+    request: RestorationRequest,
+    *,
+    vault_root: Path,  # noqa: ARG001  # accepted for future #27 parity
+) -> RestorationResponse | ResolverFailure:
+    """Shape-only restoration entry point.
+
+    The real flow (audit logging, scope/purpose enforcement, raw-value
+    return to PRIVATE_BOUNDARY callers) is scoped to #27. MVP-2 validates
+    inputs and returns a structured ``RestorationResponse(outcome="deferred")``
+    without invoking :func:`restoration_api.restore`. Malformed locator
+    inputs return :class:`ResolverFailure` so callers can branch uniformly.
+    """
+    parsed = parse_locator(request.locator)
+    if parsed is None:
+        return ResolverFailure(
+            locator=request.locator,
+            reason=ResolverFailureReason.MalformedLocator,
+            detail="locator does not match the public URI grammar",
+        )
+    if not request.purpose.strip():
+        return ResolverFailure(
+            locator=request.locator,
+            reason=ResolverFailureReason.PurposeNotPermitted,
+            detail="purpose must be a non-empty string",
+        )
+    return RestorationResponse(locator=request.locator)
+
+
+def status_report_request(
+    request: StatusReportRequest,
+    *,
+    vault_root: Path,
+) -> StatusReportResponse:
+    """Report whether *locator* corresponds to a committed artifact.
+
+    Shape-only stub: returns ``"committed"`` if the manifest file exists at
+    the canonical vault path, ``"unknown"`` otherwise. Malformed locators
+    map to ``"unknown"`` because the public status response must always be
+    well-typed; for stricter failure routing use :func:`resolve` directly.
+    """
+    parsed = parse_locator(request.locator)
+    if parsed is None or parsed.artifact_kind != "manifest":
+        return StatusReportResponse(locator=request.locator, status="unknown")
+    manifest_path, _ = _vault_paths(vault_root, parsed.opaque_id)
+    status: Literal["committed", "unknown"] = (
+        "committed" if manifest_path.exists() else "unknown"
+    )
+    return StatusReportResponse(locator=request.locator, status=status)
+
+
 __all__ = [
     # Locator grammar
     "LOCATOR_SCHEME",
@@ -404,4 +709,24 @@ __all__ = [
     "ResolverFailure",
     "ResolverSuccess",
     "resolve",
+    # Public manifest projection
+    "PublicManifestView",
+    # Request / response models
+    "ProcessRequest",
+    "ProcessResponse",
+    "InspectRequest",
+    "InspectResponse",
+    "SearchRequest",
+    "SearchHit",
+    "SearchResponse",
+    "RestorationRequest",
+    "RestorationResponse",
+    "StatusReportRequest",
+    "StatusReportResponse",
+    # Boundary entry points
+    "process_document_request",
+    "inspect_request",
+    "search_request",
+    "restoration_request",
+    "status_report_request",
 ]
