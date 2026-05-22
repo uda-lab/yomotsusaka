@@ -85,10 +85,7 @@ src/yomotsusaka/
   execution_gateway.py   mediated agent-triggered operations
   runpod_lifecycle.py    ephemeral GPU pod management (stub)
   transfer.py            artifact transfer (stub)
-tests/
-  test_redactor.py
-  test_restoration_api.py
-  test_schemas.py
+tests/                   # see the `tests/` directory for the authoritative tree
 docs/
   architecture.md
   runpod.md
