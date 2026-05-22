@@ -474,6 +474,90 @@ Agents must not access:
 - batch input workspaces;
 - model-side temporary files.
 
+### 5.7.1 Public locator grammar
+
+The agent-facing surface (`yomotsusaka.boundary`) carries opaque references
+in a single frozen URI shape:
+
+```
+private://<exposure_class>/<artifact_kind>/<opaque_id>[#<fragment>]
+exposure_class : "agent_public" | "agent_redacted" | "private" | "restricted" | "never_expose"
+artifact_kind  : "manifest" | "private_dict" | "search_hit" | "restoration_request" | "status_report"
+opaque_id      : [A-Za-z0-9._-]{1,128}     # same charset as pipeline._validate_doc_id
+fragment       : [A-Za-z0-9._-]{1,64}      # optional; addresses sub-resources later
+```
+
+For MVP-2, every locator emitted by the boundary uses
+`exposure_class="agent_redacted"`, `artifact_kind="manifest"`,
+`opaque_id=<doc_id>`, no fragment. Other classes and kinds are
+grammar-reserved and validated on parse but not yet wired to any
+resolution path. The locator string is intentionally safe to log, embed
+in JSON payloads, paste into PR comments, and emit in error messages;
+the boundary is the single place that splits it back into fields.
+
+`build_locator` rejects unknown classes/kinds, out-of-range opaque IDs
+or fragments, and the path-traversal segments `.` and `..`. `parse_locator`
+never raises and never touches the filesystem — it returns `None` for any
+malformed input so the resolver can distinguish parse failure from
+filesystem failure.
+
+### 5.7.2 Resolver contract
+
+`yomotsusaka.boundary.resolve(locator, *, scope, purpose, vault_root)`
+maps an opaque public locator to private-side state. It is the single
+fail-closed function that crosses from the public surface back into the
+private kernel.
+
+Signature (authoritative):
+
+```python
+def resolve(
+    locator: str,
+    *,
+    scope: ResolverScope,
+    purpose: str,
+    vault_root: Path,
+) -> ResolverSuccess | ResolverFailure: ...
+```
+
+- `locator: str` — the public URI. Not a `PublicHandle` wrapper, so callers
+  whose locator arrived via JSON do not need to round-trip through
+  `PublicHandle`.
+- `scope: ResolverScope` — enum with values `ORDINARY_AGENT`,
+  `PRIVATE_BOUNDARY`, `AUDIT_REVIEWER`. MVP-2 enforcement is shape-only:
+  only `PRIVATE_BOUNDARY` callers see materialised `PrivateState`; all
+  other scopes see `private_state=None` even on success. The policy table
+  that actually gates the values is scoped to #27.
+- `purpose: str` — free-form, required, non-empty after `.strip()`.
+  Recorded on `ResolverSuccess.purpose` for audit. Empty/whitespace ⇒
+  `ResolverFailure(reason=PurposeNotPermitted)`.
+- `vault_root: Path` — explicit dependency injection. No environment
+  defaults.
+
+The resolver returns a tagged-union of two Pydantic models with a
+discriminator field (`outcome="success" | "failure"`). Expected failure
+categories are returned as `ResolverFailure` values, never raised. The
+enumerated reasons are:
+
+- `MalformedLocator` — locator does not match the grammar (returned
+  before any filesystem call);
+- `UnknownArtifact` — locator parses but its target is not committed in
+  the local vault (or its artifact_kind is not wired in MVP-2);
+- `ArtifactMissing` — the private-side file backing a `PRIVATE_BOUNDARY`
+  request has gone missing;
+- `ScopeDenied` — reserved for the #27 policy table;
+- `PurposeNotPermitted` — empty/whitespace `purpose`, or (post-#27) a
+  purpose that does not match the scope's allow-list.
+
+`ResolverFailure.detail` MUST NOT include raw private values, absolute
+paths, environment variable contents, or credentials. The resolver's
+fail-closed contract also forbids any filesystem call before the locator
+parses successfully — a malformed locator never reaches `Path.exists()`,
+`Path.read_text()`, or `os.listdir()`.
+
+`ResolverError` is reserved for programmer errors only (e.g. passing
+`scope=None` or `vault_root=str`).
+
 ## 6. Storage Model
 
 ### 6.1 Private vault

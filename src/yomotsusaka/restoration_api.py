@@ -1,4 +1,5 @@
-"""
+"""Private-side internal kernel. Ordinary agents should use ``yomotsusaka.boundary`` instead.
+
 Restoration API — controlled re-hydration of private values.
 
 Agents must request restoration through this API; they never receive raw
