@@ -66,7 +66,11 @@ def test_canonical_fixture_round_trip(tmp_path: Path) -> None:
     # The handle is a real one produced by commit (not a stand-in).
     assert isinstance(handle, ArtifactHandle)
     assert handle.doc_id == doc_id
-    assert handle.vault_path.endswith(f"private/{doc_id}.json")
+    # commit() stores vault_path via str(Path(...)), whose native form uses
+    # backslashes on Windows.  Compare via Path.parts so the assertion is
+    # OS-neutral.
+    vault_path_parts = Path(handle.vault_path).parts
+    assert vault_path_parts[-2:] == ("private", f"{doc_id}.json")
 
     # Inspect the committed manifest from disk.
     manifest_path = vault_root / "manifests" / f"{doc_id}.json"
