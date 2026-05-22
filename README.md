@@ -62,6 +62,7 @@ cp config/model.example.yaml config/model.yaml
 ## Documentation
 
 - [Architecture](docs/architecture.md) — MVP philosophy and module map.
+- Source-of-truth precedence — see [`docs/architecture.md#source-of-truth-precedence`](docs/architecture.md#source-of-truth-precedence).
 - [RunPod notes](docs/runpod.md) — GPU setup, real costs, and vLLM startup args for self-hosted inference.
 - [Naming](docs/naming.md) — mythological component codenames (Ifuya, Kukuri, Chikaeshi, Chibiki, Kamuzumi).
 
@@ -85,6 +86,7 @@ src/yomotsusaka/
   transfer.py            artifact transfer (stub)
 tests/
   test_redactor.py
+  test_restoration_api.py
   test_schemas.py
 docs/
   architecture.md

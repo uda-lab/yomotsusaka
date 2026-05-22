@@ -8,6 +8,18 @@ The core idea is to interpose a controlled preprocessing layer between raw priva
 
 This is not a perfect confidentiality system. It is a best-effort private data firewall for practical research and engineering workflows.
 
+## Source of truth precedence
+
+When guidance disagrees, follow this order:
+
+1. Explicit user instruction on the active task.
+2. The open umbrella issue and its linked child issue.
+3. `docs/architecture.md` (this document).
+4. `README.md`.
+5. Module docstrings and existing tests.
+
+If these sources conflict on privacy-boundary decisions, follow `docs/architecture.md` and record the conflict in the active child issue or PR.
+
 ## 2. Design Philosophy
 
 ### 2.1 Best-effort privacy, not absolute isolation
