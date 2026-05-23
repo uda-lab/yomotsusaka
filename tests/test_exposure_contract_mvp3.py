@@ -468,23 +468,32 @@ class ContractExecutionRequest:
         # Constructor expectations as of #42 (the only landed shape so far):
         # frozen pydantic model with ``job_name``, ``purpose``, ``scope``,
         # and optional ``inputs`` dict. Walk a known-safe fixture through
-        # it; ``ExecutionScope`` is co-resident in the same module. The
-        # ``inputs`` dict deliberately carries an opaque locator so the
-        # locator round-trip assertion has something to validate.
-        try:
-            from yomotsusaka.execution_gateway import ExecutionScope
-        except ImportError:
-            ExecutionScope = None  # type: ignore[assignment]
+        # it.
+        #
+        # ``ExecutionScope`` is co-resident in the same module by contract:
+        # if ``ExecutionRequest`` activates (i.e., is non-stub), then
+        # ``ExecutionScope`` MUST be importable from the same module — any
+        # ImportError here propagates as a hard failure rather than masking
+        # a real fixture bug as a vacuous skip. Same rule for
+        # ``pydantic.ValidationError``: only narrow expected exception types
+        # are converted to skip, so an unrelated regression in the model
+        # cannot disappear into a silent pass.
+        #
+        # The ``inputs`` dict deliberately carries an opaque locator so the
+        # locator round-trip assertion in ``test_locator_round_trip`` has
+        # something non-vacuous to validate.
+        from pydantic import ValidationError as PydanticValidationError
+
+        from yomotsusaka.execution_gateway import ExecutionScope
 
         kwargs: dict[str, Any] = {
             "job_name": "exposure-contract-fixture-job",
             "purpose": "exposure-contract-fixture-purpose",
+            "scope": ExecutionScope.ORDINARY_AGENT,
             "inputs": {
                 "target_handle": "private://agent_redacted/manifest/fixture-doc-001",
             },
         }
-        if ExecutionScope is not None:
-            kwargs["scope"] = ExecutionScope.ORDINARY_AGENT
 
         try:
             return request_cls(**kwargs)
@@ -495,14 +504,16 @@ class ContractExecutionRequest:
                 "ExecutionRequest candidate constructor signature differs "
                 "from the #42 shape; backend PR must supply a richer fixture"
             )
-        except Exception:  # noqa: BLE001 — Pydantic ValidationError or similar
-            # The known-safe fixture failed validation. The contract cannot
-            # be exercised without backend-supplied fixtures; skip rather
-            # than fail so the contract surfaces "candidate-provider issue"
-            # rather than "leak".
+        except PydanticValidationError:
+            # The known-safe fixture failed model validation. The contract
+            # cannot be exercised without a backend-supplied fixture; skip
+            # with citation rather than surface as a leak. An unrelated
+            # exception (AttributeError, RuntimeError, etc.) deliberately
+            # propagates so the regression is visible.
             pytest.skip(
-                "ExecutionRequest fixture failed validation against the "
-                "current model shape; backend PR must supply a richer fixture"
+                "ExecutionRequest fixture failed pydantic validation "
+                "against the current model shape; backend PR must supply "
+                "a richer fixture"
             )
 
     def test_no_raw_values(
