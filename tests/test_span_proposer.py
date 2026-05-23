@@ -252,6 +252,13 @@ def test_inference_backed_proposer_rejects_template_without_document_placeholder
         '[{"start": 0, "end": "9", "kind": "PERSON"}]',  # end not int
         '[{"start": 0, "end": 9, "kind": 1}]',  # kind not str
         "[42]",  # element not dict
+        # Offset semantics (review feedback): negative offsets and
+        # zero-length / inverted ranges must be rejected at parse time
+        # because the redactor's slice semantics would otherwise accept
+        # them silently and commit a misleading manifest.
+        '[{"start": -1, "end": 9, "kind": "PERSON"}]',
+        '[{"start": 5, "end": 5, "kind": "PERSON"}]',
+        '[{"start": 9, "end": 0, "kind": "PERSON"}]',
     ],
 )
 def test_inference_backed_proposer_unparseable_response_raises_generic_error(
@@ -268,6 +275,52 @@ def test_inference_backed_proposer_unparseable_response_raises_generic_error(
     assert str(excinfo.value) == "backend returned unparseable response"
     assert bad_response not in str(excinfo.value)
     assert bad_response not in repr(excinfo.value)
+
+
+def test_inference_backed_proposer_rejects_offset_past_document_end() -> None:
+    """A backend returning ``end > len(raw_text)`` is a parse failure.
+
+    The ``raw_text`` argument is needed to make this check; the parse
+    helper alone cannot know the document length. Surfacing it here
+    prevents a misbehaving model from committing a manifest whose spans
+    reference offsets outside the document body.
+    """
+    raw_text = "short doc"  # len == 9
+    backend = _ScriptedBackend(
+        '[{"start": 0, "end": 100, "kind": "PERSON"}]'
+    )
+    proposer = InferenceBackedSpanProposer(backend)
+    with pytest.raises(SpanProposerError) as excinfo:
+        proposer.propose(raw_text)
+    assert str(excinfo.value) == "backend returned unparseable response"
+
+
+def test_inference_backed_proposer_suppresses_exception_chain_on_parse_failure() -> None:
+    """Privacy invariant: parse failures MUST NOT chain the underlying
+    exception (which could carry attacker-controlled response fragments
+    in its ``args``). The fixed-message ``SpanProposerError`` is the only
+    privacy-bearing surface; ``__cause__`` must be ``None``.
+    """
+    # JSON decode failure path: ``json.loads`` raises ValueError whose
+    # ``args[0]`` typically includes the offending character. We need to
+    # be sure that does not propagate via ``raise ... from exc``.
+    backend = _ScriptedBackend("not json at all")
+    proposer = InferenceBackedSpanProposer(backend)
+    with pytest.raises(SpanProposerError) as excinfo:
+        proposer.propose("Alice Tan works at Acme Corp. Patient ID: 12345.")
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+
+    # EntityKind coercion path: ``EntityKind('NOT_A_KIND')`` raises
+    # ValueError whose ``args[0]`` echoes the (untrusted) input value.
+    backend2 = _ScriptedBackend(
+        '[{"start": 0, "end": 9, "kind": "NOT_A_KIND"}]'
+    )
+    proposer2 = InferenceBackedSpanProposer(backend2)
+    with pytest.raises(SpanProposerError) as excinfo2:
+        proposer2.propose("Alice Tan works at Acme Corp.")
+    assert excinfo2.value.__cause__ is None
+    assert excinfo2.value.__suppress_context__ is True
 
 
 def test_inference_backed_proposer_propagates_vllm_generation_error() -> None:

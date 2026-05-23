@@ -145,9 +145,13 @@ _DEFAULT_RULES: tuple[_Rule, ...] = (
         pattern=re.compile(r"\b[A-Z][a-z]+\s[A-Z][a-z]+\b"),
         kind=EntityKind.PERSON,
     ),
-    # ID_NUMBER: a bare numeric run, 4-12 digits, NOT prefixed by a word
-    # character (avoids matching the digits inside addresses like
-    # "Suite 12345"). Tuned for the canonical fixture's "ID: 12345".
+    # ID_NUMBER: a bare numeric run, 4-12 digits, not adjacent to
+    # alphanumeric/underscore word characters. Tuned for the canonical
+    # fixture's "ID: 12345". Note that the lookarounds reject only word
+    # characters; whitespace-adjacent digits (e.g. "Suite 12345") still
+    # match. Real corpora typically need a tighter, corpus-specific rule
+    # set supplied via the constructor; the default is the canonical
+    # fixture floor.
     _Rule(
         pattern=re.compile(r"(?<!\w)\d{4,12}(?!\w)"),
         kind=EntityKind.ID_NUMBER,
@@ -283,6 +287,17 @@ class InferenceBackedSpanProposer(SpanProposer):
         # InferenceBackendError (or subclasses) intentionally propagates.
         response = self._backend.generate(prompt, max_tokens=self._max_tokens)
         spans = _parse_backend_response(response)
+        # Out-of-range offset check (defence-in-depth). The redactor itself
+        # silently drops spans with ``end > len(text)``, but a backend that
+        # returns a span past the document end is a parse failure we want
+        # to surface — committing a manifest with phantom entities would
+        # leave a misleading audit trail.
+        text_len = len(raw_text)
+        for span in spans:
+            if span.end > text_len:
+                # Fixed message — never echo span values, which derive
+                # from a response that may contain raw text fragments.
+                raise SpanProposerError("backend returned unparseable response") from None
         logger.debug(
             "InferenceBackedSpanProposer parsed %d candidate span(s)", len(spans)
         )
@@ -295,39 +310,50 @@ def _parse_backend_response(response: str) -> list[Span]:
     On any parse failure raise :class:`SpanProposerError` with a fixed
     message. NEVER include *response* in the error — it may echo the
     raw text the model was asked to extract.
+
+    Exception chaining is suppressed (``from None``) on every parse
+    branch: the underlying exception's ``args`` may contain attacker-
+    controlled response fragments (notably :class:`ValueError` from
+    :class:`json.loads` and :class:`EntityKind`-from-str coercion), and a
+    chained traceback could surface those fragments in operator logs.
+    The fixed top-level message is the only privacy-bearing surface.
     """
     try:
         payload = json.loads(response)
-    except (TypeError, ValueError) as exc:
-        raise SpanProposerError(
-            "backend returned unparseable response"
-        ) from exc
+    except (TypeError, ValueError):
+        raise SpanProposerError("backend returned unparseable response") from None
 
     if not isinstance(payload, list):
-        raise SpanProposerError("backend returned unparseable response")
+        raise SpanProposerError("backend returned unparseable response") from None
 
     spans: list[Span] = []
     for element in payload:
         if not isinstance(element, dict):
-            raise SpanProposerError("backend returned unparseable response")
+            raise SpanProposerError("backend returned unparseable response") from None
         try:
             start = element["start"]
             end = element["end"]
             kind_raw = element["kind"]
-        except KeyError as exc:
-            raise SpanProposerError(
-                "backend returned unparseable response"
-            ) from exc
+        except KeyError:
+            raise SpanProposerError("backend returned unparseable response") from None
         if not isinstance(start, int) or not isinstance(end, int):
-            raise SpanProposerError("backend returned unparseable response")
+            raise SpanProposerError("backend returned unparseable response") from None
         if not isinstance(kind_raw, str):
-            raise SpanProposerError("backend returned unparseable response")
+            raise SpanProposerError("backend returned unparseable response") from None
         try:
             kind = EntityKind(kind_raw)
-        except ValueError as exc:
-            raise SpanProposerError(
-                "backend returned unparseable response"
-            ) from exc
+        except ValueError:
+            raise SpanProposerError("backend returned unparseable response") from None
+        # Offset semantics. ``redactor.redact`` silently drops overlapping
+        # or out-of-range spans, but accepts negative offsets and ``end
+        # <= start`` (Python slice semantics may treat them as no-ops or,
+        # for negative values, wrap around). A backend returning such
+        # offsets is a parse failure — surface it here so a misbehaving
+        # model cannot smuggle a phantom span into the manifest. (The
+        # ``end <= len(raw_text)`` check is deferred to ``propose`` where
+        # the raw text is in scope.)
+        if start < 0 or end <= start:
+            raise SpanProposerError("backend returned unparseable response") from None
         spans.append(Span(start=start, end=end, kind=kind))
     return spans
 
