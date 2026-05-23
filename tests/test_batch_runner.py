@@ -228,6 +228,49 @@ def test_batch_runner_rejects_missing_inbox(tmp_path: Path) -> None:
         runner.run_directory(tmp_path / "no-such-dir")
 
 
+def test_batch_runner_excludes_symlinks_from_inbox_traversal(
+    tmp_path: Path,
+) -> None:
+    """A symlink under the inbox must not be ingested.
+
+    The inbox walk uses ``rglob('*')`` and historically called
+    ``p.is_file()`` only; ``is_file`` follows symlinks, so a symlink
+    placed under ``inbox`` could reference a file outside the inbox
+    tree and let the runner ingest unintended private data, breaking
+    the documented "regular file in inbox" contract. The fix filters
+    on ``p.is_symlink()`` before ``p.is_file()``; this regression test
+    pins that behaviour.
+    """
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    vault = tmp_path / "vault"
+
+    # One legitimate regular file.
+    legit = inbox / "legit.txt"
+    legit.write_text("Alice met Bob at Acme Corp.", encoding="utf-8")
+
+    # A target outside the inbox tree.
+    outside = tmp_path / "outside.txt"
+    outside.write_text(
+        "Carol joined Initech Ltd. — must not be ingested.", encoding="utf-8"
+    )
+
+    # A symlink under the inbox pointing at the outside file.
+    symlink = inbox / "symlink.txt"
+    symlink.symlink_to(outside)
+
+    facade = LocalFacade(vault)
+    runner = BatchRunner(facade=facade, proposer=DeterministicSpanProposer())
+    summary = runner.run_directory(inbox)
+
+    # Only the regular file is processed.
+    assert summary.submitted_count == 1
+    assert summary.committed_count == 1
+    assert summary.failed_count == 0
+    # The symlink target's content must not have produced a manifest.
+    assert len(list((vault / "manifests").glob("*.json"))) == 1
+
+
 # ---------------------------------------------------------------------------
 # CLI integration
 # ---------------------------------------------------------------------------

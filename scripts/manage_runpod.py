@@ -386,9 +386,22 @@ def run_lifecycle(
         )
         return EXIT_PREFLIGHT_FAILED
 
-    # Construct lifecycle — the constructor reads RUNPOD_API_KEY itself,
-    # so the helper never touches the value directly.
-    factory = lifecycle_factory or (lambda: ManageRunPodLifecycle(pod_config=pod_config))
+    # Construct lifecycle. When the caller does not inject a factory,
+    # build the default one from the resolved ``env_dict`` so the helper
+    # honours the documented ``env`` override path. Reading
+    # ``os.environ`` again inside ``ManageRunPodLifecycle.__init__``
+    # would cause preflight to pass on a caller-supplied ``env`` while
+    # the constructor then raised ``RunPodConfigError`` because the
+    # process-level env lacks ``RUNPOD_API_KEY`` — an unreachable
+    # branch from the L2 test path. Pass the resolved key explicitly so
+    # ``env=`` is the single source of truth for both preflight and
+    # construction.
+    resolved_api_key = env_dict.get("RUNPOD_API_KEY") or None
+    factory = lifecycle_factory or (
+        lambda: ManageRunPodLifecycle(
+            api_key=resolved_api_key, pod_config=pod_config
+        )
+    )
     lifecycle = factory()
     # The smoke subprocess wants the vLLM bearer (VLLM_API_KEY), NOT the
     # RunPod account API key (RUNPOD_API_KEY). They are different

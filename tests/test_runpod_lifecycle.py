@@ -740,6 +740,65 @@ def test_manage_helper_api_key_missing_exits_two(
     _assert_no_helper_secret(out.out + "\n" + out.err)
 
 
+def test_manage_helper_default_factory_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """``run_lifecycle`` must build the default lifecycle from ``env``.
+
+    Regression for the PR #88 codex P2 finding: previously the default
+    factory called ``ManageRunPodLifecycle(pod_config=pod_config)``,
+    which read ``RUNPOD_API_KEY`` from ``os.environ``. If the caller
+    passed an ``env`` override (the advertised programmatic path) and
+    the process-level env lacked ``RUNPOD_API_KEY``, preflight passed
+    on ``env`` and the constructor then raised ``RunPodConfigError``.
+    The fix routes the env-resolved key into the default factory so
+    preflight and construction share a single source of truth.
+    """
+    # Process env explicitly lacks RUNPOD_API_KEY.
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+
+    # Capture the api_key the lifecycle was constructed with by stubbing
+    # the class the helper imports at module level.
+    captured: dict[str, str | None] = {}
+
+    class _StubLifecycle:
+        def __init__(self, *, api_key=None, pod_config=None, **_kw):  # noqa: ANN001
+            captured["api_key"] = api_key
+            self._pod_config = pod_config
+
+        def start_pod(self, _pc):  # noqa: ANN001
+            from yomotsusaka.runpod_lifecycle import PodHandle
+
+            return PodHandle(pod_id="pod-x", endpoint="https://x.example/v1")
+
+        def is_ready(self, _h):  # noqa: ANN001
+            return True
+
+        def stop_pod(self, _h, *, terminate: bool = True):  # noqa: ANN001
+            return None
+
+    monkeypatch.setattr(manage_runpod, "ManageRunPodLifecycle", _StubLifecycle)
+
+    runner, _capt = _make_fake_smoke_runner(success=True)
+    rc = manage_runpod.run_lifecycle(
+        keep_pod=False,
+        pod_config=PodConfig(),
+        smoke_runner=runner,
+        lifecycle_log=tmp_path / "lifecycle.jsonl",
+        env={"RUNPOD_API_KEY": "sk-from-env-override"},
+        runpodctl_check=lambda: True,
+    )
+    out = capsys.readouterr()
+    assert rc == manage_runpod.EXIT_OK, (
+        f"helper failed with rc={rc}; stdout={out.out!r} stderr={out.err!r}"
+    )
+    # The default factory must have received the key from env_dict, not
+    # tried to re-read os.environ.
+    assert captured["api_key"] == "sk-from-env-override"
+
+
 def test_manage_helper_create_then_delete_default(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

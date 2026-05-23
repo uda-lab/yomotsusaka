@@ -291,7 +291,11 @@ class BatchRunner:
 
         Recursive glob is used so a caller may organise documents under
         subdirectories. Non-regular entries (directories, symlinks to
-        directories, special files) are skipped. The result order is
+        directories, special files) are skipped. Symlinks to regular
+        files are also skipped: a symlink under ``inbox`` could otherwise
+        point at a file outside the inbox tree and cause the runner to
+        ingest unintended private data, violating the documented
+        "regular file in inbox" contract. The result order is
         deterministic (sorted by relative path) so failed_doc_refs is
         stable across reruns of the same corpus.
         """
@@ -302,8 +306,14 @@ class BatchRunner:
         if not inbox.is_dir():
             raise NotADirectoryError(f"inbox is not a directory: {inbox}")
 
+        # ``is_symlink()`` is checked before ``is_file()`` because
+        # ``is_file()`` follows symlinks. A symlink-to-regular-file under
+        # the inbox would otherwise satisfy ``is_file()`` and let the
+        # runner read content from outside the inbox tree.
         doc_refs = sorted(
-            str(p) for p in inbox.rglob("*") if p.is_file()
+            str(p)
+            for p in inbox.rglob("*")
+            if not p.is_symlink() and p.is_file()
         )
 
         batch = self._queue.submit(doc_refs)
