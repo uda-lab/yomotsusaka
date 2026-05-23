@@ -30,10 +30,13 @@ should inspect. The agent **must not** echo the underlying exception message,
 absolute filesystem paths, vault root substrings, raw private values, endpoint
 URLs, pod ids, or tenant identifiers into PR/issue comments. When an example
 locator or key appears in this doc, it uses the canonical-fixture placeholder
-shape — for example `<PERSON_xxxxxxxx>` for a redacted person key, or
-`private://<opaque-id>` for an opaque manifest locator. These shapes intentionally
-contain no decodable raw value. The same discipline `docs/runpod-agent-smoke.md`
-§7 imposes on the smoke script applies to every agent action this doc suggests.
+shape — for example `<PERSON_xxxxxxxx>` for a redacted person key, or the full
+public locator grammar
+`private://<exposure_class>/<artifact_kind>/<opaque_id>[#<fragment>]` (see
+`build_locator` / `parse_locator` in `yomotsusaka.boundary`). These shapes
+intentionally contain no decodable raw value. The same discipline
+`docs/runpod-agent-smoke.md` §7 imposes on the smoke script applies to every
+agent action this doc suggests.
 
 ---
 
@@ -41,14 +44,18 @@ contain no decodable raw value. The same discipline `docs/runpod-agent-smoke.md`
 
 Returned by `yomotsusaka.boundary.resolve()` inside a `ResolverFailure`. Wire
 identifiers are stable; do not infer behaviour from the symbolic name alone.
+The MVP-2 emission map below reflects the **current** `resolve()` contract; the
+two reserved values (`scope_denied`, and the future-policy expansion of
+`purpose_not_permitted`) are documented here so callers that exhaustively match
+the enum behave correctly when they start being emitted.
 
-| Reason                    | Surface                          | Trigger                                                                                   | Owner action / agent response                                                                                                       |
-| ------------------------- | -------------------------------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `malformed_locator`       | `resolve()`                      | Locator string does not parse as a `private://<opaque-id>[#fragment]` URI.                | Report category `malformed_locator`. Agent re-derives the locator from the redacted manifest; never paste the raw input into a PR.  |
-| `unknown_artifact`        | `resolve()`                      | Locator parses but its `artifact_kind` is not committed (e.g. unknown manifest kind).     | Report `unknown_artifact`. Agent treats the locator as not-yet-committed; do not retry until commit lands.                          |
-| `artifact_missing`        | `resolve()`                      | Locator and kind are known, but the manifest or private dict file is absent on disk.      | Report `artifact_missing`. Owner inspects the vault directory listing (vault-side, not via the agent) to confirm commit state.      |
-| `scope_denied`            | `resolve()`                      | Caller scope is not authorised for the artifact's exposure class.                         | Report `scope_denied`. Agent does not retry with a different scope; scope-elevation is owner-only.                                  |
-| `purpose_not_permitted`   | `resolve()`                      | Caller's declared purpose is not in the artifact's `allowed_purposes`.                    | Report `purpose_not_permitted`. Agent reports the redacted purpose label; owner updates the artifact's policy if appropriate.       |
+| Reason                    | Surface                          | Trigger (MVP-2 contract)                                                                                                                                                                | Owner action / agent response                                                                                                                                  |
+| ------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `malformed_locator`       | `resolve()`                      | Locator string does not parse against the public URI grammar `private://<exposure_class>/<artifact_kind>/<opaque_id>[#<fragment>]`.                                                     | Report `malformed_locator`. Agent re-derives the locator from the redacted manifest; never paste the raw input into a PR.                                      |
+| `unknown_artifact`        | `resolve()`                      | Locator parses but addresses an artifact that is not committed under the caller's tenant — covers (a) `artifact_kind` other than `manifest`, (b) no manifest file on disk for the given `opaque_id`, and (c) cross-tenant misses (Fork 9 fail-closed). | Report `unknown_artifact`. Agent treats the locator as not-yet-committed (or belonging to another tenant) and does not retry until commit lands.               |
+| `artifact_missing`        | `resolve()`                      | The manifest exists but the **private-dict** file is missing or unparseable under `scope=PRIVATE_BOUNDARY`. Ordinary-agent / audit-reviewer scopes never reach this code path.          | Report `artifact_missing`. Owner inspects the vault-side `private/<opaque_id>.json` (vault-side, not via the agent) to confirm commit state.                   |
+| `scope_denied`            | `resolve()` (reserved)           | **Reserved for #27 policy gating; not emitted by MVP-2 `resolve()`.** Exhaustive-match callers must still handle it as an inert future value.                                            | Treat as an inert future value; if it ever fires, report `scope_denied` without retry — scope-elevation is owner-only.                                         |
+| `purpose_not_permitted`   | `resolve()`                      | The required `purpose` argument is empty or whitespace-only after `strip()`. (Per-artifact `allowed_purposes` policy is **not** in MVP-2; that path is reserved for #27 / #44.)          | Report `purpose_not_permitted`. Agent supplies a non-empty redacted purpose label on the retry; do not paste the original raw `purpose` value into a PR.       |
 
 ## RestorationFailureReason
 
@@ -88,8 +95,8 @@ The original `ResolverFailureReason` is preserved in the audit record's
 
 | Reason                  | Surface                       | Trigger                                                                                                | Owner action / agent response                                                                                                                                  |
 | ----------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scope_denied`          | `execute_request()`           | Caller's `ExecutionScope` is below the template's `min_scope`.                                         | Report `scope_denied`. Agent does not retry with elevated scope; escalation is owner-only.                                                                     |
-| `purpose_not_permitted` | `execute_request()`           | Caller purpose is not in the template's `allowed_purposes`.                                            | Report `purpose_not_permitted`. Agent reports the redacted purpose label; owner updates the template registry if appropriate.                                  |
+| `scope_denied`          | `execute_request()`           | Caller's `ExecutionScope` is below the template's `min_scope` (MVP: any non-`PRIVATE_BOUNDARY` caller of a `min_scope=PRIVATE_BOUNDARY` template).      | Report `scope_denied`. Agent does not retry with elevated scope; escalation is owner-only.                                                                     |
+| `purpose_not_permitted` | `execute_request()`           | Mapped from `ResolverFailureReason.PurposeNotPermitted` when the internal `resolve()` call rejects an empty/whitespace `purpose`. **Per-template `allowed_purposes` is not enforced in MVP-2** — the dispatcher's Step 4 is a no-op reserved for #44. | Report `purpose_not_permitted`. Agent supplies a non-empty redacted purpose label on the retry; never paste the original raw value into a PR.                  |
 | `template_not_found`    | `execute_request()`           | `job_name` does not match any registered Chikaeshi template.                                           | Report `template_not_found`. Agent re-checks the redacted job name against the template registry; never paste the raw `inputs` payload into a PR.              |
 | `schema_invalid`        | `execute_request()`           | `inputs` does not satisfy the template's declared input schema.                                        | Report `schema_invalid`. Agent reconstructs the input shape from the template registry; never echo `inputs` values into a PR.                                  |
 | `scrub_failed`          | `execute_request()`           | The pre-dispatch scrubber refused the payload (private-value leak risk).                               | Report `scrub_failed`. Agent reports the redacted category and stops; do not retry with a modified payload before owner review.                                |
@@ -123,8 +130,11 @@ table to recover the precise reason value.
 | Symptom                                                                  | Reason value                  | Surface                       |
 | ------------------------------------------------------------------------ | ----------------------------- | ----------------------------- |
 | Audit row missing on a failed call.                                      | `audit_write_failed`          | `restoration_request()` / `execute_request()` |
-| Locator does not parse as `private://<opaque-id>`.                       | `malformed_locator`           | `resolve()`                   |
-| No manifest at the addressed locator.                                    | `artifact_missing`            | `resolve()` / `restoration_request()` / `execute_request()` |
+| Locator does not parse against `private://<exposure_class>/<artifact_kind>/<opaque_id>[#<fragment>]`. | `malformed_locator`           | `resolve()`                   |
+| No manifest at the addressed locator (uncommitted, or cross-tenant miss). | `unknown_artifact`           | `resolve()`                   |
+| Internal `resolve()` from the dispatcher returned `malformed_locator` / `unknown_artifact` / `artifact_missing`. | `artifact_missing`            | `execute_request()`           |
+| Private-dict file missing or unparseable under `PRIVATE_BOUNDARY` scope. | `artifact_missing`            | `resolve()`                   |
+| Kernel reported "No private data found" for the addressed artifact.      | `artifact_missing`            | `restoration_request()`       |
 | `RestorationRequest` rejected with both handle and `document_id` set.    | `request_schema_invalid`      | `restoration_request()`       |
 | Restoration policy explicitly denied the request.                        | `policy_denied`               | `restoration_request()`       |
 | Execution scrubber refused the payload (private-value leak risk).        | `scrub_failed`                | `execute_request()`           |
@@ -135,8 +145,9 @@ table to recover the precise reason value.
 | vLLM OOM marker in the response.                                         | `vllm_oom`                    | RunPod/vLLM backend           |
 | vLLM returned HTTP 429.                                                  | `vllm_rate_limited`           | RunPod/vLLM backend           |
 | Any other non-200 vLLM HTTP response or malformed body.                  | `vllm_http_error`             | RunPod/vLLM backend           |
-| Caller scope below required for the artifact / template / restoration.  | `scope_denied`                | `resolve()` / `restoration_request()` / `execute_request()` |
-| Purpose not in the artifact/template `allowed_purposes`.                 | `purpose_not_permitted`       | `resolve()` / `execute_request()` |
+| Restoration caller scope is not `PRIVATE_BOUNDARY`.                      | `scope_denied`                | `restoration_request()`       |
+| Execution caller scope below the template's `min_scope`.                 | `scope_denied`                | `execute_request()`           |
+| Empty/whitespace `purpose` on `resolve()` (or its dispatcher-internal call). | `purpose_not_permitted`   | `resolve()` / `execute_request()` (via resolver mapping) |
 
 ## When to escalate to the owner
 
@@ -156,9 +167,12 @@ intervention** and the agent should escalate rather than retry indefinitely:
    owner-only per `docs/runpod.md` §3.
 
 3. **`policy_denied` with no matching profile** — if the restoration policy
-   table denies the request and the agent cannot identify a profile whose
-   `allowed_purposes` covers the call, the policy table itself needs an
-   owner-side update. The agent reports the redacted policy name and stops.
+   table denies the request and the agent cannot identify a `RestorationPolicyRow`
+   whose `caller_label` / `target` matchers cover the call (or the named
+   `policy_profile` is absent from the table altogether), the policy table
+   itself needs an owner-side update. The agent reports the redacted policy
+   name and the `deny_reason` category (already stripped of `vault_root`) and
+   stops.
 
 For all three, the agent's escalation message is the category literal plus the
 suggested action text from the table above — **never** the underlying exception
