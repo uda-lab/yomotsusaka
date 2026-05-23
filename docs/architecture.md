@@ -558,6 +558,39 @@ parses successfully — a malformed locator never reaches `Path.exists()`,
 `ResolverError` is reserved for programmer errors only (e.g. passing
 `scope=None` or `vault_root=str`).
 
+### 5.7.3 Restoration policy table
+
+`yomotsusaka.policy.RestorationPolicyTable` (issue #44) is a declarative
+layer that consumes the four reserved fields on `RestorationRequest`
+documented in §5.7.2 (`policy_profile`, `production_scope`,
+`authorization_decision`, `approval_ticket`) and turns them into a
+`PolicyDecision` consulted by `boundary.restoration_request` immediately
+after the §5.7.2 scope gate and before the intent audit record is written.
+
+The table is the only place the four reserved fields are interpreted as
+a policy gate. It is *not* a replacement for the scope gate: scope is
+still the load-bearing fail-closed guard; the policy table refines what
+a `PRIVATE_BOUNDARY` caller may do, never widens it.
+
+Each row carries `production_scopes` (or `["*"]` for any),
+`require_authorization_decision`, `approval_ticket_pattern` (or `null`),
+and a `default: true` marker. Exactly one row must mark itself default;
+zero or more than one default rows raise at table-load time. An unknown
+`policy_profile` against a loaded table is a deny, not a silent
+fallback — the only exception is the built-in
+`RestorationPolicyTable.default_local()` returned when no table is
+supplied, which routes unknown profiles to its single permissive row to
+preserve the MVP-2 contract.
+
+On the deny path the boundary writes one `outcome="failed"` audit
+record with `failure_reason="policy_denied"`, `policy_verdict="deny"`,
+and `policy_matched_profile=<row>` **before** returning the
+`RestorationResponse(reason=PolicyDenied)`. The `detail` field is
+scrubbed through `_strip_vault_root`. The kernel is not called. On the
+permit path, the existing intent + result audit records gain
+`policy_verdict="permit"` and the matched profile name; the kernel call
+proceeds unchanged. See `config/policy.example.yaml` for the YAML shape.
+
 ## 6. Storage Model
 
 ### 6.1 Private vault
