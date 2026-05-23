@@ -44,7 +44,6 @@ from yomotsusaka.boundary import (
 )
 from yomotsusaka.execution_gateway import ExecutionRequest, ExecutionScope
 from yomotsusaka.pipeline import process_document
-from yomotsusaka.redactor import Span
 from yomotsusaka.schemas import DocumentManifest, EntityKind
 from yomotsusaka.scrubber import scrub_stream
 
@@ -284,26 +283,6 @@ def _generate_letter_from_private_template(
 
     # Commit the redacted letter as a fresh public artifact.
     letter_doc_id = _new_artifact_id("letter", parsed.opaque_id)
-
-    # We pre-detect spans of every key that survived the scrub so the
-    # manifest's ``entities`` list reflects the rendered letter's
-    # placeholders. Use simple linear scan: keys are short and the
-    # template body is bounded.
-    spans: list[Span] = []
-    for entry in private_state.private_entries:
-        idx = 0
-        while True:
-            found = redacted_letter.find(entry.key, idx)
-            if found == -1:
-                break
-            spans.append(
-                Span(
-                    start=found,
-                    end=found + len(entry.key),
-                    kind=entry.kind,
-                )
-            )
-            idx = found + len(entry.key)
 
     # The pipeline expects the raw text to be the un-redacted form and
     # spans pointing into it. We pass the redacted letter (which the

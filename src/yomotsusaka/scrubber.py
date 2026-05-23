@@ -22,23 +22,26 @@ remaining non-empty ``original_value``: if any are still present a
 ``ExecutionFailureReason.ScrubFailed`` outcome and writes an audit record
 before returning.
 
-Reuse rule
-----------
+Relationship to :mod:`yomotsusaka.validator`
+--------------------------------------------
 
-This module imports :data:`yomotsusaka.validator._PLACEHOLDER_PATTERN` for
-shape recognition only. It does NOT call :meth:`Validator.validate`, which
-requires a :class:`DocumentManifest` and is structured around manifest-shaped
-data; template stdout/stderr is free-form.
+This module does NOT call :meth:`Validator.validate` even though that
+class also enforces a no-raw-leak invariant: :class:`Validator` is
+structured around :class:`DocumentManifest` shape and requires a paired
+private dictionary. Template stdout/stderr is free-form text. The
+canonical key shape (``<KIND_<8 hex>>``) used by both modules is
+maintained at the redactor; the scrubber only consumes the
+``(original_value, key)`` pairs from :class:`PrivateDictEntry` objects.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 
 from yomotsusaka.schemas import PrivateDictEntry
-from yomotsusaka.validator import _PLACEHOLDER_PATTERN  # noqa: F401 — reused for shape recognition
 
-logger = __import__("logging").getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 # Vault-layout path detector. Mirrors the patterns used by
