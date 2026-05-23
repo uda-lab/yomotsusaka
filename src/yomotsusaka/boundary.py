@@ -941,7 +941,10 @@ def search_request(
         # MUST NOT be used as a needle (it would defeat the whole point
         # of the resolver). The branch above already enforces this by
         # only falling back to ``(request.query,)`` when both translated
-        # terms and residual are empty.
+        # terms are empty AND the residual is empty/whitespace-only — in
+        # which case the raw query carries no registered private value
+        # (it is by construction the residual itself) and is safe to use
+        # as the snippet needle.
     hits = [
         SearchHit(
             handle=_public_handle_for(m.doc_id),
