@@ -63,11 +63,19 @@ The annotation policy is:
 - `[severity: error]` is used **only** for rules whose effective backend
   is fully deterministic (`file_exists`, `file_absent`, `text_required`,
   `text_forbidden`, `changed_file_policy`, or any `github_*` predicate),
-  that pass on `origin/main` today, and that would not false-positive on
-  the canonical fixture from issue #4.
+  that pass on `origin/main` once the PR introducing the rule lands,
+  and that would not false-positive on the canonical fixture from issue
+  #4.
 - `[severity: advisory]` is used for any rule that depends on semantic
   or LLM-rubric evaluation, or that intentionally references content
   currently present in the repository for forward-looking review.
+
+The "passes on `origin/main`" criterion is evaluated **post-merge**:
+a rule that asserts `docs/gate-keeper.md must exist` is legitimately
+`severity: error` even though it cannot pass against the pre-merge
+`origin/main` (where the file does not yet exist). The pre-merge gate
+for such rules is the PR that introduces them; the post-merge gate is
+`origin/main` itself.
 
 The LLM-rubric backend is opt-in via host dotenv and fails closed when
 unconfigured. Semantic rules therefore stay advisory in the first MVP of

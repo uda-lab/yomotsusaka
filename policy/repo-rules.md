@@ -26,9 +26,9 @@ rules are minimal file-presence checks; later rules under the same
 heading can extend coverage as the policy matures.
 ```
 
-- `docs/scaffold-status.md` must exist in the repository root. [severity: error]
-- `docs/architecture.md` must exist in the repository root. [severity: error]
-- `docs/gate-keeper.md` must exist in the repository root. [severity: error]
+- `docs/scaffold-status.md` must exist at the documented path. [severity: error]
+- `docs/architecture.md` must exist at the documented path. [severity: error]
+- `docs/gate-keeper.md` must exist at the documented path. [severity: error]
 - `README.md` must exist in the repository root. [severity: error]
 
 ## Stale path references
@@ -78,6 +78,7 @@ reviewer (human or LLM) can flag drift.
 
 - The README should describe the private/public boundary in plain language so a new contributor understands the firewall stance before reading `docs/architecture.md`. [severity: advisory]
 - The scaffold-status table should classify every module under `src/yomotsusaka/` (excluding `__init__.py`) consistently with the module's current behavior, so a `deferred` classification never appears next to a module that already implements its MVP responsibility. [severity: advisory]
+- Sources under `src/yomotsusaka/` should never contain a top-level `import gate_keeper` or `from gate_keeper` statement, so the runtime guards stay independent of the repository-process guards. [severity: advisory]
 
 ## Validation modes
 
@@ -89,21 +90,30 @@ text. See docs/gate-keeper.md (Per-rule target binding) for the full
 explanation.
 
 For local preflight, the intended pattern is one invocation per
-target — for example:
+target. Caveat: each invocation evaluates every filesystem rule
+against the supplied target, so rules whose intent matches the
+target's expected state report pass, and rules that target a
+different path report fail or pass incidentally. The examples below
+therefore each pass a subset of rules and fail others by design.
 
+    # exercises must-exist rules (passes 4 of them); must-not-exist
+    # rules report incidental fail against this present target.
     gate-keeper validate policy/repo-rules.md \
         --target docs/scaffold-status.md \
         --backend filesystem --format text
+
+    # exercises the docs/runpod-notes.md must-not-exist rule (passes);
+    # must-exist rules report fail because the target is absent.
     gate-keeper validate policy/repo-rules.md \
         --target docs/runpod-notes.md \
         --backend filesystem --format text
+
+    # exercises the .vault/ must-not-exist rule (passes); must-exist
+    # rules report fail because the target is absent.
     gate-keeper validate policy/repo-rules.md \
         --target .vault \
         --backend filesystem --format text
 
-Each invocation evaluates every filesystem rule against the supplied
-target; rules that match the target's expected state report pass, and
-rules that target a different path report fail or pass incidentally.
 The PR body for the issue that introduced this file records the
 combined per-target run.
 
