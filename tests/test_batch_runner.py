@@ -452,6 +452,106 @@ def test_batch_runner_disambiguates_stems_normalising_to_same_token(
     assert len(list((vault / "manifests").glob("*.json"))) == 2
 
 
+# ---------------------------------------------------------------------------
+# JSONL index persistence (issue #78)
+# ---------------------------------------------------------------------------
+
+
+def test_batch_runner_persists_search_index(tmp_path: Path) -> None:
+    """At the tail of ``run_directory`` the runner snapshots the gateway's
+    index to ``<vault>/index/manifests.jsonl``; ``BatchSummary`` reports
+    ``index_persisted=True``."""
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    _write_corpus(inbox, _canonical_corpus())
+
+    facade = LocalFacade(vault)
+    runner = BatchRunner(facade=facade, proposer=DeterministicSpanProposer())
+    summary = runner.run_directory(inbox)
+
+    assert summary.index_persisted is True
+    final_path = vault / "index" / "manifests.jsonl"
+    assert final_path.is_file()
+    lines = final_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3
+
+
+def test_batch_runner_records_snapshot_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A snapshot ``OSError`` does NOT fail the batch; ``index_persisted``
+    flips to False and the manifests/private dictionaries the pipeline
+    already committed remain on disk."""
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    _write_corpus(inbox, _canonical_corpus())
+
+    facade = LocalFacade(vault)
+    runner = BatchRunner(facade=facade, proposer=DeterministicSpanProposer())
+
+    def _boom(self, vault_root):  # noqa: ANN001 - test shim
+        raise OSError("simulated snapshot failure")
+
+    from yomotsusaka.search_gateway import SearchGateway as _SG
+
+    monkeypatch.setattr(_SG, "snapshot", _boom)
+
+    summary = runner.run_directory(inbox)
+
+    # Snapshot failure is recorded but does not change committed_count.
+    assert summary.index_persisted is False
+    assert summary.committed_count == 3
+    # No JSONL on disk (the snapshot raised before any rename happened).
+    assert not (vault / "index" / "manifests.jsonl").exists()
+    # Manifests + private dictionaries are still committed.
+    assert len(list((vault / "manifests").glob("*.json"))) == 3
+
+
+def test_batch_runner_index_loadable_from_separate_process(
+    tmp_path: Path,
+) -> None:
+    """Multi-process integration: run the batch, then spawn a fresh Python
+    process that constructs a brand-new :class:`SearchGateway`, calls
+    ``load``, and searches. A non-zero hit count proves the snapshot
+    round-trips across the process boundary."""
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    _write_corpus(inbox, _canonical_corpus())
+
+    facade = LocalFacade(vault)
+    runner = BatchRunner(facade=facade, proposer=DeterministicSpanProposer())
+    summary = runner.run_directory(inbox)
+    assert summary.committed_count == 3
+    assert summary.index_persisted is True
+
+    # Subprocess script: fresh interpreter, fresh gateway, no shared
+    # in-process state with the runner above. Asserts that the JSONL is
+    # the only thing required to recover a searchable index.
+    script = (
+        "from pathlib import Path\n"
+        "from yomotsusaka.search_gateway import SearchGateway\n"
+        "g = SearchGateway()\n"
+        f"loaded = g.load(Path({str(vault)!r}))\n"
+        "hits = g.search('<PERSON_', top_k=10)\n"
+        "print(f'LOADED={loaded} HITS={len(hits)}')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"subprocess failed; stderr={result.stderr!r}"
+    )
+    assert "LOADED=3" in result.stdout
+    # At least one hit — all three canonical-corpus documents contain a
+    # PERSON redaction so the prefix matches each.
+    match = re.search(r"HITS=(\d+)", result.stdout)
+    assert match is not None
+    assert int(match.group(1)) >= 1
+
+
 def test_batch_runner_isolates_unicode_decode_failure(
     tmp_path: Path,
 ) -> None:

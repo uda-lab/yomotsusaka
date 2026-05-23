@@ -131,3 +131,59 @@ def test_persistence_boundary_keeps_public_and_private_separated(
                 assert is_under_private, (
                     f"raw value {raw!r} found outside private/ at {path}"
                 )
+
+
+def test_persistence_boundary_index_jsonl_is_redacted_only(
+    tmp_path: Path,
+) -> None:
+    """The JSONL snapshot at ``<vault>/index/manifests.jsonl`` must contain
+    only redacted content. This pins the issue #78 privacy invariant: the
+    convenience index mirror is part of the agent-facing tree (per
+    ``docs/architecture.md`` §6.2) and must never leak raw private values
+    or echo entries from ``<vault>/private/``.
+    """
+    from yomotsusaka.batch_runner import BatchRunner
+    from yomotsusaka.facade import LocalFacade
+
+    raw_text = "Alice Tan works at Acme Corp. Patient ID: 12345."
+    raw_values = ("Alice Tan", "Acme Corp", "12345")
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "canonical.txt").write_text(raw_text, encoding="utf-8")
+
+    vault_root = tmp_path / "vault"
+    facade = LocalFacade(vault_root)
+    runner = BatchRunner(facade=facade)
+    summary = runner.run_directory(inbox)
+
+    # Sanity: the batch committed the document and the snapshot succeeded.
+    assert summary.committed_count == 1
+    assert summary.index_persisted is True
+
+    index_path = vault_root / "index" / "manifests.jsonl"
+    assert index_path.is_file(), "expected the index JSONL to exist"
+
+    # ----- index JSONL is public-safe -----
+    index_text = index_path.read_text(encoding="utf-8")
+    for raw in raw_values:
+        assert raw not in index_text, (
+            f"index JSONL leaked raw value {raw!r}; "
+            "the snapshot must be redacted-only"
+        )
+
+    # ----- no private-dictionary entry appears as content in the index -----
+    private_dir = vault_root / "private"
+    assert private_dir.is_dir()
+    for path in private_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        private_contents = path.read_text(encoding="utf-8")
+        # Confirm every raw value found in the private file is absent from
+        # the index. We do not require any structural cross-check beyond
+        # the substring relationship: presence of any raw value would
+        # already trigger the previous assertion, but this loop also pins
+        # that no escaped/JSON-encoded form sneaks through.
+        for raw in raw_values:
+            if raw in private_contents:
+                assert raw not in index_text

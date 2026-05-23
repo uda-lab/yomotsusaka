@@ -308,3 +308,184 @@ def test_search_gateway_index_ignores_private_entries_without_resolver() -> None
 
     # Raw queries still produce zero hits (no resolver to translate them).
     assert gateway.search("Alice Tan") == []
+
+
+# ---------------------------------------------------------------------------
+# JSONL snapshot / load (issue #78)
+# ---------------------------------------------------------------------------
+
+
+def _make_manifest(doc_id: str, redacted_text: str) -> DocumentManifest:
+    """Build a minimally valid :class:`DocumentManifest` for snapshot tests."""
+    return DocumentManifest(
+        doc_id=doc_id,
+        source_ref=doc_id,
+        redacted_text=redacted_text,
+    )
+
+
+def test_snapshot_writes_jsonl(tmp_path: Path) -> None:
+    """``snapshot`` writes one JSON-decodable line per indexed manifest at
+    ``<vault_root>/index/manifests.jsonl``."""
+    vault_root = tmp_path / "vault"
+    gateway = SearchGateway()
+    m1 = _make_manifest("doc-1", "<PERSON_aaaaaaaa> works at <ORG_bbbbbbbb>.")
+    m2 = _make_manifest("doc-2", "<PERSON_cccccccc> joined <ORG_dddddddd>.")
+    gateway.index(m1)
+    gateway.index(m2)
+
+    final_path = gateway.snapshot(vault_root)
+
+    assert final_path == vault_root / "index" / "manifests.jsonl"
+    assert final_path.is_file()
+    lines = final_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    parsed = [DocumentManifest.model_validate_json(line) for line in lines]
+    assert {p.doc_id for p in parsed} == {"doc-1", "doc-2"}
+
+
+def test_snapshot_atomic_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On rename failure the temp file is cleaned up and the final file is
+    not partially written."""
+    import os as _os
+
+    vault_root = tmp_path / "vault"
+    gateway = SearchGateway()
+    gateway.index(_make_manifest("doc-x", "<PERSON_x>"))
+
+    final_path = vault_root / "index" / "manifests.jsonl"
+    tmp_marker = vault_root / "index" / "manifests.jsonl.tmp"
+
+    def _boom(src, dst):  # noqa: ANN001 - test shim mirrors os.replace shape
+        raise OSError("simulated rename failure")
+
+    monkeypatch.setattr(_os, "replace", _boom)
+
+    with pytest.raises(OSError, match="simulated rename failure"):
+        gateway.snapshot(vault_root)
+
+    # Final file must NOT exist — the rename was the commit step and it
+    # failed; the on-disk state is the pre-snapshot state.
+    assert not final_path.exists()
+    # Temp file must be cleaned up so a retry does not see stale bytes.
+    assert not tmp_marker.exists()
+
+
+def test_load_repopulates_index(tmp_path: Path) -> None:
+    """Snapshot from one gateway, ``load`` into a fresh one, then search."""
+    vault_root = tmp_path / "vault"
+    src = SearchGateway()
+    src.index(_make_manifest("doc-α", "<PERSON_aaaaaaaa> story line"))
+    src.index(_make_manifest("doc-β", "<ORG_bbbbbbbb> joined the team"))
+    src.snapshot(vault_root)
+
+    dst = SearchGateway()
+    loaded = dst.load(vault_root)
+
+    assert loaded == 2
+    hits = dst.search("<PERSON_")
+    assert len(hits) == 1
+    assert hits[0].doc_id == "doc-α"
+
+
+def test_load_skips_malformed_lines(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A malformed JSONL line is skipped; ``load`` continues with the rest
+    and logs a count-only warning."""
+    vault_root = tmp_path / "vault"
+    index_dir = vault_root / "index"
+    index_dir.mkdir(parents=True)
+    final_path = index_dir / "manifests.jsonl"
+    # One valid line, one malformed JSON line.
+    valid = _make_manifest("doc-ok", "<PERSON_ok>").model_dump_json()
+    final_path.write_text(
+        valid + "\n" + "{this is not json}\n", encoding="utf-8"
+    )
+
+    gateway = SearchGateway()
+    with caplog.at_level("WARNING", logger="yomotsusaka.search_gateway"):
+        loaded = gateway.load(vault_root)
+
+    assert loaded == 1
+    # The valid manifest is in the index.
+    assert len(gateway.search("<PERSON_")) == 1
+    # Warning logged. Privacy invariant: no raw line content echoed.
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("skipped malformed index line" in r.getMessage() for r in warnings)
+    for record in warnings:
+        msg = record.getMessage()
+        assert "{this is not json}" not in msg
+
+
+def test_load_no_file_is_noop(tmp_path: Path) -> None:
+    """``load`` on a vault with no index file returns 0 and leaves the
+    gateway untouched."""
+    vault_root = tmp_path / "vault"
+    gateway = SearchGateway()
+    pre = _make_manifest("doc-pre", "<PERSON_pre> existing")
+    gateway.index(pre)
+
+    loaded = gateway.load(vault_root)
+
+    assert loaded == 0
+    # Existing manifest still searchable; gateway state unchanged.
+    assert gateway.search("<PERSON_") == [pre]
+
+
+def test_snapshot_does_not_touch_query_resolver(tmp_path: Path) -> None:
+    """``snapshot`` MUST NOT serialise the resolver's raw→key map.
+
+    Index a manifest with private entries on a resolver-backed gateway,
+    snapshot, then load into a fresh gateway with a fresh resolver. The
+    new resolver must have an empty map: persistence is redacted-only.
+    """
+    raw_text = "Alice Tan works at Acme Corp. Patient ID: 12345."
+    manifest, private_dict = _canonical_private_entries(raw_text)
+    vault_root = tmp_path / "vault"
+
+    src_resolver = QueryResolver()
+    src = SearchGateway(query_resolver=src_resolver)
+    src.index(manifest, private_entries=private_dict)
+    assert src_resolver._map  # sanity: resolver populated
+
+    src.snapshot(vault_root)
+
+    # Fresh gateway with a fresh resolver — load only repopulates manifests.
+    new_resolver = QueryResolver()
+    dst = SearchGateway(query_resolver=new_resolver)
+    dst.load(vault_root)
+
+    # Resolver remained empty — no persistence of private-side state.
+    assert new_resolver._map == {}
+    # A raw private query produces zero hits because translation has no
+    # registered mappings to consult.
+    assert dst.search("Alice Tan") == []
+
+
+def test_snapshot_uses_redacted_text_only(tmp_path: Path) -> None:
+    """Drive the pipeline end-to-end, snapshot, and assert no raw private
+    value appears anywhere in the on-disk JSONL."""
+    raw_text = "Alice Tan works at Acme Corp. Patient ID: 12345."
+    doc_id = "snapshot-redacted-001"
+    vault_root = tmp_path / "vault"
+
+    process_document(
+        doc_id=doc_id,
+        raw_text=raw_text,
+        spans=_canonical_spans(),
+        vault_root=vault_root,
+    )
+    manifest = _load_manifest(vault_root, doc_id)
+
+    gateway = SearchGateway()
+    gateway.index(manifest)
+    final_path = gateway.snapshot(vault_root)
+
+    on_disk = final_path.read_text(encoding="utf-8")
+    for needle in ("Alice Tan", "Acme Corp", "12345"):
+        assert needle not in on_disk, (
+            f"snapshot leaked raw private value {needle!r} into JSONL"
+        )
