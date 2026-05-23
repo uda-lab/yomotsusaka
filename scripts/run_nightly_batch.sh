@@ -18,22 +18,6 @@ if [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate
 fi
 
-python - "$DOC_DIR" <<'EOF'
-import sys
-from pathlib import Path
-from yomotsusaka.batch_queue import BatchQueue
-
-doc_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./inbox")
-doc_refs = [str(p) for p in doc_dir.glob("**/*") if p.is_file()]
-
-if not doc_refs:
-    print("No documents found — nothing to do.")
-    sys.exit(0)
-
-queue = BatchQueue()
-batch = queue.submit(doc_refs)
-print(f"Submitted batch {batch.batch_id} with {len(doc_refs)} documents.")
-print("Batch processing is not yet automated — implement pipeline wiring here.")
-EOF
+python -m yomotsusaka.cli.run_batch "$DOC_DIR" --vault-root "${VAULT_ROOT:-./vault}"
 
 echo "[$(date -u +%FT%TZ)] Nightly batch script finished."
