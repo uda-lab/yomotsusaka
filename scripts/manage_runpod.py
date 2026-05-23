@@ -104,18 +104,37 @@ def _emit_category(category: str, *, stream: Any = None) -> None:
     print(f"lifecycle: {category}", file=out)
 
 
-def _emit_urgent(request_id: str, *, stream: Any = None) -> None:
-    """S4 — emit ONE fixed urgent stderr line on cleanup failure.
+def _emit_urgent(
+    request_id: str,
+    *,
+    log_path: Path | None = None,
+    stream: Any = None,
+) -> None:
+    """S4 — emit ONE urgent stderr line on cleanup failure.
 
-    The ``request_id`` is the only non-fixed substring; it is a UUID4
-    that carries no information about the Pod itself (no Pod ID,
-    endpoint, or API key). The owner uses it to locate the matching
-    ``lifecycle.jsonl`` row and run ``runpodctl pod list`` themselves.
+    The ``request_id`` is the per-run UUID4 correlation token; it carries
+    no information about the Pod itself (no Pod ID, endpoint, or API
+    key). The owner uses it to locate the matching ``lifecycle.jsonl``
+    row and run ``runpodctl pod list`` themselves.
+
+    ``log_path`` is the effective JSONL path the helper wrote to — by
+    default ``~/.cache/yomotsusaka/lifecycle.jsonl``, but tests pass a
+    ``tmp_path`` override; the urgent message must always point at the
+    file actually written so the request_id correlation is reliable
+    (per copilot review on PR #84).
     """
     err = stream if stream is not None else sys.stderr
+    effective = log_path or _DEFAULT_LIFECYCLE_LOG
+    # Render ``~/.cache/...`` style for the default to keep the existing
+    # owner-facing wording; for non-default paths (tests / explicit
+    # overrides), use the literal path string.
+    if effective == _DEFAULT_LIFECYCLE_LOG:
+        rendered = "~/.cache/yomotsusaka/lifecycle.jsonl"
+    else:
+        rendered = str(effective)
     print(
         "URGENT: manual Pod cleanup required; "
-        f"see ~/.cache/yomotsusaka/lifecycle.jsonl for request_id={request_id}",
+        f"see {rendered} for request_id={request_id}",
         file=err,
     )
 
@@ -204,7 +223,7 @@ _SMOKE_SCRIPT_REL_PATH = Path("scripts") / "smoke_runpod.py"
 def _run_smoke_subprocess(
     handle: PodHandle,
     *,
-    api_key: str | None,
+    vllm_api_key: str | None,
     repo_root: Path,
     runner: Any = None,
 ) -> tuple[bool, str | None]:
@@ -220,11 +239,21 @@ def _run_smoke_subprocess(
     compatible with :func:`subprocess.run` (default).
 
     The smoke is invoked with ``env`` carrying ONLY the variables it
-    needs (``RUNPOD_LIVE_SMOKE=1``, ``VLLM_ENDPOINT``, ``VLLM_API_KEY``,
-    ``RUNPOD_POD_ID``). ``VLLM_ENDPOINT`` / ``RUNPOD_POD_ID`` come from
-    the freshly-created Pod's handle (Seam S6); ``VLLM_API_KEY`` is the
-    same bearer the manage flow uses, propagated only via the child
-    process environment — never into a log record.
+    needs (``RUNPOD_LIVE_SMOKE=1``, ``VLLM_ENDPOINT``, optionally
+    ``VLLM_API_KEY``, ``RUNPOD_POD_ID``). ``VLLM_ENDPOINT`` /
+    ``RUNPOD_POD_ID`` come from the freshly-created Pod's handle
+    (Seam S6).
+
+    Per ``docs/runpod-agent-smoke.md`` §9 and ``docs/runpod.md`` §6, the
+    **vLLM bearer key** (``VLLM_API_KEY``) is a different secret from
+    the **RunPod account API key** (``RUNPOD_API_KEY``). The owner
+    injects ``VLLM_API_KEY`` separately when they want to override the
+    smoke's default; if absent, the smoke synthesises
+    ``sk-<RUNPOD_POD_ID>`` itself. The helper therefore passes
+    ``VLLM_API_KEY`` through ONLY when the parent process already has
+    it; otherwise it omits the variable and lets the smoke take the
+    documented fallback. The helper NEVER passes ``RUNPOD_API_KEY`` as
+    a vLLM bearer.
     """
     if runner is None:
         runner = subprocess.run
@@ -238,8 +267,8 @@ def _run_smoke_subprocess(
         "VLLM_ENDPOINT": handle.endpoint,
         "RUNPOD_POD_ID": handle.pod_id,
     }
-    if api_key:
-        child_env["VLLM_API_KEY"] = api_key
+    if vllm_api_key:
+        child_env["VLLM_API_KEY"] = vllm_api_key
     # Propagate PYTHONPATH so the smoke can import yomotsusaka.vllm_backend
     # when invoked from an editable install.
     if "PYTHONPATH" in os.environ:
@@ -361,7 +390,13 @@ def run_lifecycle(
     # so the helper never touches the value directly.
     factory = lifecycle_factory or (lambda: ManageRunPodLifecycle(pod_config=pod_config))
     lifecycle = factory()
-    api_key_for_smoke = env_dict.get("RUNPOD_API_KEY")
+    # The smoke subprocess wants the vLLM bearer (VLLM_API_KEY), NOT the
+    # RunPod account API key (RUNPOD_API_KEY). They are different
+    # secrets (docs/runpod-agent-smoke.md §9). If the owner has not
+    # injected VLLM_API_KEY, the smoke synthesises ``sk-<pod_id>``
+    # itself — so we omit the variable and let the documented fallback
+    # take over.
+    vllm_api_key_for_smoke = env_dict.get("VLLM_API_KEY") or None
 
     # ---- create / wait ----
     try:
@@ -401,7 +436,7 @@ def run_lifecycle(
     # ---- smoke ----
     smoke_passed, smoke_category = _run_smoke_subprocess(
         handle,
-        api_key=api_key_for_smoke,
+        vllm_api_key=vllm_api_key_for_smoke,
         repo_root=repo_root or Path(__file__).resolve().parent.parent,
         runner=smoke_runner,
     )
@@ -435,7 +470,7 @@ def run_lifecycle(
             lifecycle.stop_pod(handle, terminate=True)
         except PodUnavailableError:
             _emit_category(_CATEGORY_CLEANUP_FAILED)
-            _emit_urgent(request_id)
+            _emit_urgent(request_id, log_path=lifecycle_log)
             _append_lifecycle_row(
                 request_id=request_id,
                 category=_CATEGORY_CLEANUP_FAILED,

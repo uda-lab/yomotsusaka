@@ -181,10 +181,16 @@ The helper enforces this by:
 - Writing `lifecycle.jsonl` rows with **exactly three keys** —
   `timestamp`, `request_id`, `category` — and no others.
 
-A scrub-scan unit test
-(`tests/test_runpod_lifecycle.py::test_manage_lifecycle_no_secret_leak_in_any_surface`)
-exercises every public-safe surface with sentinel values and asserts
-none leak. If you extend the helper, you **must** extend that test.
+Two scrub-scan unit tests exercise every public-safe surface with
+sentinel values and assert none leak:
+
+- `tests/test_runpod_lifecycle.py::test_manage_lifecycle_no_secret_leak_in_logs`
+  — covers the library (`ManageRunPodLifecycle`) log records.
+- `tests/test_runpod_lifecycle.py::test_manage_helper_no_secret_leak_in_any_surface`
+  — covers the helper script's stdout, stderr, log records, and
+  `lifecycle.jsonl` rows simultaneously.
+
+If you extend the helper or library, you **must** extend these tests.
 
 ## 7. Cleanup-failure surface
 

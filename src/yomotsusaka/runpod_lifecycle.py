@@ -425,7 +425,24 @@ class ManageRunPodLifecycle(RunPodLifecycle):
         storage, so the agent-managed flow deletes by default. Set
         ``terminate=False`` only when the caller explicitly wants to
         retain ``/workspace`` (rare; documented in the runbook).
+
+        Bypass-mode (``pod_id`` / ``endpoint`` supplied at construction
+        with no API key) is a no-op: the bypass seam exists only for
+        the exposure-contract test (see Decision 2 in
+        ``/tmp/mvp4_tightened_76.md``); there is no REST account on
+        behalf of which to issue ``DELETE``. Without this short-circuit,
+        ``_auth_headers`` would build ``Authorization: Bearer None`` and
+        surface a misleading ``cleanup_failed`` (copilot review on PR
+        #84).
         """
+        if self._bypass_pod_id is not None and self._bypass_endpoint is not None:
+            # Bypass mode — the test seam supplied the handle; no REST
+            # account is configured, so nothing to delete on the wire.
+            return
+        if not self._api_key:
+            # Defensive: the non-bypass path requires an API key.
+            raise RunPodConfigError("RUNPOD_API_KEY required for stop_pod")
+
         path = (
             f"/pods/{handle.pod_id}"
             if terminate

@@ -835,6 +835,12 @@ def test_manage_helper_cleanup_failure_surfaces_urgent(
     # Urgent stderr line carries a UUID4 request_id and no Pod id.
     assert "URGENT: manual Pod cleanup required" in out.err
     assert "request_id=" in out.err
+    # Copilot review on PR #84: the urgent message must point at the
+    # effective log path the helper actually wrote to (not the default)
+    # so the request_id correlation is reliable.
+    assert str(log_path) in out.err, (
+        f"urgent line must cite the effective log path; got: {out.err!r}"
+    )
     # Extract request_id and verify it is a UUID.
     req_id_token = out.err.split("request_id=", 1)[1].strip().split()[0]
     uuid.UUID(req_id_token)
@@ -843,6 +849,58 @@ def test_manage_helper_cleanup_failure_surfaces_urgent(
     cleanup_rows = [r for r in rows if r["category"] == "cleanup_failed"]
     assert cleanup_rows and cleanup_rows[0]["request_id"] == req_id_token
     _assert_no_helper_secret(out.out + "\n" + out.err)
+
+
+def test_manage_helper_urgent_line_uses_default_path_when_unspecified(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """When the helper is invoked without an explicit ``lifecycle_log``,
+    the urgent stderr line uses the documented ``~/.cache/...`` wording.
+    Tests the default-path branch of :func:`_emit_urgent`."""
+    fake = _make_fake_lifecycle(cleanup_should_fail=True)
+    runner, _captured = _make_fake_smoke_runner(success=True)
+    # Redirect the default lifecycle log to tmp_path so the test does
+    # not write to the real ~/.cache while still leaving lifecycle_log
+    # at its default (None) for run_lifecycle.
+    monkeypatch.setattr(
+        manage_runpod,
+        "_DEFAULT_LIFECYCLE_LOG",
+        tmp_path / "default-lifecycle.jsonl",
+    )
+    manage_runpod.run_lifecycle(
+        keep_pod=False,
+        pod_config=PodConfig(),
+        lifecycle_factory=lambda: fake,
+        smoke_runner=runner,
+        env={"RUNPOD_API_KEY": "sk-test"},
+        runpodctl_check=lambda: True,
+    )
+    out = capsys.readouterr()
+    assert "~/.cache/yomotsusaka/lifecycle.jsonl" in out.err
+
+
+def test_manage_helper_bypass_mode_stop_pod_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copilot review on PR #84: ``stop_pod`` in bypass mode (no API key)
+    must not issue a REST request with ``Bearer None`` — it should be
+    a no-op since the bypass seam is for the exposure-contract test."""
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+
+    def _refuse(request: httpx.Request) -> httpx.Response:
+        pytest.fail("REST stop_pod must not happen in bypass mode")
+
+    lifecycle = ManageRunPodLifecycle(
+        pod_id="pod-bypass",
+        endpoint="http://bypass.invalid",
+        transport=httpx.MockTransport(_refuse),
+    )
+    handle = lifecycle.start_pod(PodConfig())
+    # No exception — stop_pod is a no-op in bypass mode.
+    lifecycle.stop_pod(handle, terminate=True)
+    lifecycle.stop_pod(handle, terminate=False)
 
 
 def test_manage_helper_create_failure_no_cleanup_attempted(
@@ -917,8 +975,10 @@ def test_manage_helper_smoke_subprocess_invokes_with_correct_env(
     tmp_path: Path,
 ) -> None:
     """L2 — verify the helper invokes ``scripts/smoke_runpod.py --mode
-    diagnose`` with VLLM_ENDPOINT / VLLM_API_KEY / RUNPOD_POD_ID set in
-    the child env. The real smoke is never executed."""
+    diagnose`` with VLLM_ENDPOINT / RUNPOD_POD_ID set in the child env,
+    and that RUNPOD_API_KEY is NEVER passed through as VLLM_API_KEY
+    (copilot review on PR #84: they are different secrets per
+    docs/runpod-agent-smoke.md §9). The real smoke is never executed."""
     fake = _make_fake_lifecycle(
         pod_id="pod-LEAK-SENTINEL-AAA",
         endpoint="http://leak-sentinel.example:8000",
@@ -940,16 +1000,60 @@ def test_manage_helper_smoke_subprocess_invokes_with_correct_env(
 
     child_env = captured_call.get("env")
     assert isinstance(child_env, dict)
-    # The child receives the Pod's endpoint + id, the live-smoke gate,
-    # and the bearer token only via env (NOT as command-line args).
+    # The child receives the Pod's endpoint + id and the live-smoke
+    # gate; VLLM_API_KEY is NOT set because the parent had no
+    # VLLM_API_KEY in env — the smoke must take its documented
+    # ``sk-<RUNPOD_POD_ID>`` fallback (docs/runpod.md §6).
     assert child_env.get("RUNPOD_LIVE_SMOKE") == "1"
     assert child_env.get("VLLM_ENDPOINT") == "http://leak-sentinel.example:8000"
     assert child_env.get("RUNPOD_POD_ID") == "pod-LEAK-SENTINEL-AAA"
-    assert child_env.get("VLLM_API_KEY") == "sk-LEAK-API-KEY-SENTINEL"
+    assert "VLLM_API_KEY" not in child_env, (
+        "RUNPOD_API_KEY must NOT be passed through as VLLM_API_KEY; they "
+        "are different secrets (RunPod account API key vs vLLM bearer)."
+    )
+    # And specifically the RunPod account key must never reach the
+    # child env under any name.
+    for value in child_env.values():
+        assert "LEAK-API-KEY-SENTINEL" not in str(value), child_env
 
     # stdout/stderr from this in-process driver must still be sanitised.
     out = capsys.readouterr()
     _assert_no_helper_secret(out.out + "\n" + out.err)
+
+
+def test_manage_helper_passes_vllm_api_key_when_parent_has_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """When the parent env explicitly carries ``VLLM_API_KEY``, the
+    helper propagates that exact value to the smoke subprocess (not
+    ``RUNPOD_API_KEY``). The RunPod account key remains absent from
+    the child env."""
+    fake = _make_fake_lifecycle(
+        pod_id="pod-LEAK-SENTINEL-AAA",
+        endpoint="http://leak-sentinel.example:8000",
+    )
+    runner, captured_call = _make_fake_smoke_runner(success=True)
+    manage_runpod.run_lifecycle(
+        keep_pod=False,
+        pod_config=PodConfig(),
+        lifecycle_factory=lambda: fake,
+        smoke_runner=runner,
+        lifecycle_log=tmp_path / "lifecycle.jsonl",
+        env={
+            "RUNPOD_API_KEY": "sk-LEAK-API-KEY-SENTINEL",
+            "VLLM_API_KEY": "sk-LEAK-VLLM-KEY-SENTINEL",
+        },
+        runpodctl_check=lambda: True,
+    )
+    child_env = captured_call.get("env")
+    assert isinstance(child_env, dict)
+    assert child_env.get("VLLM_API_KEY") == "sk-LEAK-VLLM-KEY-SENTINEL"
+    # The RunPod account key must never leak as VLLM_API_KEY or under
+    # any other key.
+    for value in child_env.values():
+        assert "LEAK-API-KEY-SENTINEL" not in str(value), child_env
 
 
 def test_manage_helper_select_exit_code_precedence() -> None:
