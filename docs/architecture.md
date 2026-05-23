@@ -558,6 +558,33 @@ parses successfully — a malformed locator never reaches `Path.exists()`,
 `ResolverError` is reserved for programmer errors only (e.g. passing
 `scope=None` or `vault_root=str`).
 
+#### Tenant scoping (issue #45)
+
+`yomotsusaka.tenant.TenantScope` is the runtime carrier that binds an
+opaque `tenant_id` to a resolved on-disk `vault_root` for every boundary
+entry point. The line "`vault_root: Path` — explicit dependency injection.
+No environment defaults." above remains the invariant; tenant scoping
+threads the same `Path` through a structured wrapper, it does not relax
+the explicit-DI rule.
+
+Every `boundary.*_request` function accepts either `vault_root: Path`
+(legacy) or `tenant: TenantScope` (new); passing both raises
+`ResolverError`. The legacy `vault_root` kwarg is internally wrapped as
+`TenantScope.local(vault_root)` (reserved `tenant_id="_local"`) so the
+kernel below this wrapper sees only `TenantScope`. The kernel never
+resolves `tenant_id → vault_root` itself — that mapping is caller-side
+("operator code"), explicitly out of scope for #45.
+
+The tenant id is a runtime label only: it is never persisted into a
+manifest, locator, audit record, or private dictionary, and the on-disk
+layout is unchanged from the single-vault layout (the path *is* the
+tenant scope). Cross-tenant locator misses fail-closed and return the
+existing `UnknownArtifact` reason; no new `ResolverFailureReason` or
+`RestorationFailureReason` values are introduced (information-leak-free).
+The restoration audit log lives per-tenant at
+`<tenant.vault_root>/audit/restoration.jsonl` and gains no `tenant_id`
+record field; the file path is the tenant scope.
+
 ### 5.7.3 Restoration policy table
 
 `yomotsusaka.policy.RestorationPolicyTable` (issue #44) is a declarative

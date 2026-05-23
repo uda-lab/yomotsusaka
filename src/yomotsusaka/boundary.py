@@ -59,6 +59,7 @@ from yomotsusaka.schemas import (
     PrivateDictEntry,
 )
 from yomotsusaka.search_gateway import SearchGateway
+from yomotsusaka.tenant import TenantScope
 
 logger = logging.getLogger(__name__)
 
@@ -327,12 +328,53 @@ def _vault_paths(vault_root: Path, opaque_id: str) -> tuple[Path, Path]:
     )
 
 
+def _resolve_tenant(
+    tenant: TenantScope | None,
+    vault_root: Path | None,
+) -> TenantScope:
+    """Return the effective :class:`TenantScope` for a boundary call.
+
+    Exactly one of *tenant* / *vault_root* must be supplied. Passing both
+    raises :class:`ResolverError` so a caller cannot ambiguously pin the
+    kernel onto two different roots. Passing neither also raises — every
+    boundary call is required to carry an explicit scope.
+
+    The legacy ``vault_root: Path`` kwarg on every public ``*_request``
+    function is wrapped here as :meth:`TenantScope.local`; the kernel below
+    this helper sees only :class:`TenantScope`.
+    """
+    if tenant is not None and vault_root is not None:
+        raise ResolverError(
+            "pass either tenant=TenantScope(...) or vault_root=Path(...), not both"
+        )
+    if tenant is None and vault_root is None:
+        raise ResolverError(
+            "boundary call requires either tenant=TenantScope(...) or "
+            "vault_root=Path(...)"
+        )
+    if tenant is not None:
+        if not isinstance(tenant, TenantScope):
+            raise ResolverError(
+                f"tenant must be a TenantScope; got {type(tenant).__name__}"
+            )
+        return tenant
+    # vault_root path: programmer-error guardrail mirrors the pre-tenant
+    # behaviour at the call sites (``isinstance(vault_root, Path)`` checks
+    # remained at the resolver / restoration_request entry points).
+    if not isinstance(vault_root, Path):
+        raise ResolverError(
+            f"vault_root must be a pathlib.Path; got {type(vault_root).__name__}"
+        )
+    return TenantScope.local(vault_root)
+
+
 def resolve(
     locator: str,
     *,
     scope: ResolverScope,
     purpose: str,
-    vault_root: Path,
+    vault_root: Path | None = None,
+    tenant: TenantScope | None = None,
 ) -> ResolverSuccess | ResolverFailure:
     """
     Resolve *locator* to a structured success or failure report.
@@ -359,18 +401,26 @@ def resolve(
         :attr:`ResolverSuccess.purpose` for audit. Empty/whitespace ⇒
         :class:`ResolverFailure(reason=PurposeNotPermitted)`.
     vault_root:
-        Local vault root. Explicit dependency injection; no environment
-        defaults.
+        Legacy back-compat alias for ``tenant=TenantScope.local(vault_root)``.
+        Exactly one of ``vault_root`` or ``tenant`` must be supplied. Passing
+        both is a programmer error and raises :class:`ResolverError`.
+        Explicit dependency injection; no environment defaults.
+    tenant:
+        :class:`~yomotsusaka.tenant.TenantScope` carrying the resolved
+        ``vault_root`` for the calling tenant. The kernel never resolves
+        ``tenant_id → vault_root`` itself; that mapping is caller-side. A
+        cross-tenant locator (one whose backing manifest lives under a
+        different ``vault_root``) is fail-closed and returns
+        :data:`ResolverFailureReason.UnknownArtifact` — no leakage of the
+        other tenant's existence (Fork 9).
     """
     # ---- programmer-error guardrails (these raise, never return) ----
     if not isinstance(scope, ResolverScope):
         raise ResolverError(
             f"scope must be a ResolverScope; got {type(scope).__name__}"
         )
-    if not isinstance(vault_root, Path):
-        raise ResolverError(
-            f"vault_root must be a pathlib.Path; got {type(vault_root).__name__}"
-        )
+    effective_tenant = _resolve_tenant(tenant, vault_root)
+    effective_vault_root = effective_tenant.vault_root
     if not isinstance(locator, str):
         raise ResolverError(
             f"locator must be a str; got {type(locator).__name__}"
@@ -411,7 +461,15 @@ def resolve(
     # materialise private state. It still checks the artifact exists so
     # callers that ask for a missing locator under a non-private scope get
     # UnknownArtifact rather than an empty "success".
-    manifest_path, private_dict_path = _vault_paths(vault_root, parsed.opaque_id)
+    #
+    # Cross-tenant misses also land here: a locator forged from another
+    # tenant's opaque_id will not have a backing manifest under *this*
+    # tenant's vault_root, so the existence check returns the same
+    # information-leak-free UnknownArtifact failure as a never-committed
+    # locator (Fork 9).
+    manifest_path, private_dict_path = _vault_paths(
+        effective_vault_root, parsed.opaque_id
+    )
     if not manifest_path.exists():
         return ResolverFailure(
             locator=locator,
@@ -800,7 +858,8 @@ def _public_handle_for(doc_id: str) -> PublicHandle:
 def process_document_request(
     request: ProcessRequest,
     *,
-    vault_root: Path,
+    vault_root: Path | None = None,
+    tenant: TenantScope | None = None,
 ) -> ProcessResponse:
     """Drive *request* through the kernel and return a public-only handle.
 
@@ -815,7 +874,11 @@ def process_document_request(
     kernel call and :func:`build_locator`. We also pre-validate the locator
     component here so the error path is symmetric whether the rejection
     happens kernel-side or boundary-side.
+
+    Either ``tenant`` or ``vault_root`` must be supplied (Fork 5 back-compat):
+    ``vault_root`` is internally wrapped as :meth:`TenantScope.local`.
     """
+    effective_tenant = _resolve_tenant(tenant, vault_root)
     # Boundary-side validation mirrors the kernel guard. If the kernel
     # tightens or relaxes _validate_doc_id, this call surfaces the
     # difference here (build_locator raises ValueError) instead of leaving
@@ -829,7 +892,7 @@ def process_document_request(
         doc_id=request.doc_id,
         raw_text=request.raw_text,
         spans=[s.to_internal() for s in request.spans],
-        vault_root=vault_root,
+        vault_root=effective_tenant.vault_root,
     )
     return ProcessResponse(handle=_public_handle_for(handle.doc_id))
 
@@ -837,23 +900,27 @@ def process_document_request(
 def inspect_request(
     request: InspectRequest,
     *,
-    vault_root: Path,
+    vault_root: Path | None = None,
+    tenant: TenantScope | None = None,
 ) -> InspectResponse | ResolverFailure:
     """Read a committed manifest and return its public view.
 
     Returns :class:`ResolverFailure` (not raises) on malformed locator,
     unknown artifact, or missing manifest. This keeps the public surface
     homogeneous: callers branch on ``isinstance(... , ResolverFailure)``.
+
+    Either ``tenant`` or ``vault_root`` must be supplied (Fork 5 back-compat).
     """
+    effective_tenant = _resolve_tenant(tenant, vault_root)
     outcome = resolve(
         request.locator,
         scope=ResolverScope.ORDINARY_AGENT,
         purpose=request.purpose,
-        vault_root=vault_root,
+        tenant=effective_tenant,
     )
     if isinstance(outcome, ResolverFailure):
         return outcome
-    manifest_path, _ = _vault_paths(vault_root, outcome.opaque_id)
+    manifest_path, _ = _vault_paths(effective_tenant.vault_root, outcome.opaque_id)
     # The exists() check inside resolve() can race against a concurrent
     # delete, and a manifest file with schema drift would otherwise raise
     # pydantic.ValidationError. Both are operational failures, not
@@ -1046,7 +1113,8 @@ def restoration_request(
     request: RestorationRequest,
     *,
     scope: ResolverScope,
-    vault_root: Path,
+    vault_root: Path | None = None,
+    tenant: TenantScope | None = None,
     policy_table: RestorationPolicyTable | None = None,
 ) -> RestorationResponse:
     """Audit-logged, scope-gated, policy-checked restoration entry point.
@@ -1087,10 +1155,8 @@ def restoration_request(
         raise ResolverError(
             f"scope must be a ResolverScope; got {type(scope).__name__}"
         )
-    if not isinstance(vault_root, Path):
-        raise ResolverError(
-            f"vault_root must be a pathlib.Path; got {type(vault_root).__name__}"
-        )
+    effective_tenant = _resolve_tenant(tenant, vault_root)
+    effective_vault_root = effective_tenant.vault_root
 
     # ---- step (a): Pydantic validation already happened by virtue of the
     # caller constructing a RestorationRequest. If they wanted to handle the
@@ -1100,7 +1166,7 @@ def restoration_request(
         audit_id = _new_audit_id()
         try:
             _append_restoration_audit(
-                vault_root,
+                effective_vault_root,
                 audit_record_id=audit_id,
                 scope=scope,
                 request=request if isinstance(request, dict) else {},
@@ -1133,7 +1199,7 @@ def restoration_request(
             audit_id = _new_audit_id()
             try:
                 _append_restoration_audit(
-                    vault_root,
+                    effective_vault_root,
                     audit_record_id=audit_id,
                     scope=scope,
                     request=request,
@@ -1166,7 +1232,7 @@ def restoration_request(
         audit_id = _new_audit_id()
         try:
             _append_restoration_audit(
-                vault_root,
+                effective_vault_root,
                 audit_record_id=audit_id,
                 scope=scope,
                 request=request,
@@ -1203,7 +1269,7 @@ def restoration_request(
         audit_id = _new_audit_id()
         try:
             _append_restoration_audit(
-                vault_root,
+                effective_vault_root,
                 audit_record_id=audit_id,
                 scope=scope,
                 request=request,
@@ -1227,7 +1293,7 @@ def restoration_request(
             audit_record_id=audit_id,
             document_id=document_id,
             reason=RestorationFailureReason.PolicyDenied,
-            detail=_strip_vault_root(deny_detail, vault_root),
+            detail=_strip_vault_root(deny_detail, effective_vault_root),
         )
 
     # ---- step (d): intent audit BEFORE kernel call. Failure here is a hard
@@ -1235,7 +1301,7 @@ def restoration_request(
     audit_id = _new_audit_id()
     try:
         _append_restoration_audit(
-            vault_root,
+            effective_vault_root,
             audit_record_id=audit_id,
             scope=scope,
             request=request,
@@ -1265,13 +1331,13 @@ def restoration_request(
     # map to KernelError with a generic detail string so the underlying
     # message (which may contain raw bytes from a malformed file) is not
     # propagated through the public surface.
-    private_path = (vault_root / "private" / f"{document_id}.json").resolve()
+    private_path = (effective_vault_root / "private" / f"{document_id}.json").resolve()
     handle = ArtifactHandle(doc_id=document_id, vault_path=str(private_path))
     reason_code: RestorationFailureReason | None = None
     detail: str | None = None
     entries: list[PrivateDictEntry] | None = None
     try:
-        entries = restoration_api.restore(handle, vault_root=vault_root)
+        entries = restoration_api.restore(handle, vault_root=effective_vault_root)
     except restoration_api.RestorationError as exc:
         msg = str(exc)
         if "No private data found" in msg:
@@ -1279,7 +1345,7 @@ def restoration_request(
             detail = "no private data is committed for this document_id"
         else:
             reason_code = RestorationFailureReason.KernelError
-            detail = _strip_vault_root(msg, vault_root)
+            detail = _strip_vault_root(msg, effective_vault_root)
     except Exception:
         # Any non-RestorationError leak (corrupt JSON, schema drift,
         # OSError mid-read, etc.) is a kernel-side failure. Intentionally
@@ -1292,7 +1358,7 @@ def restoration_request(
         # Corrective audit record for the failure.
         try:
             _append_restoration_audit(
-                vault_root,
+                effective_vault_root,
                 audit_record_id=audit_id,
                 scope=scope,
                 request=request,
@@ -1334,7 +1400,7 @@ def restoration_request(
     # ---- result audit record (sharing the intent's audit_record_id). ----
     try:
         _append_restoration_audit(
-            vault_root,
+            effective_vault_root,
             audit_record_id=audit_id,
             scope=scope,
             request=request,
@@ -1364,7 +1430,8 @@ def restoration_request(
 def status_report_request(
     request: StatusReportRequest,
     *,
-    vault_root: Path,
+    vault_root: Path | None = None,
+    tenant: TenantScope | None = None,
 ) -> StatusReportResponse:
     """Report whether *locator* corresponds to a committed artifact.
 
@@ -1372,11 +1439,14 @@ def status_report_request(
     the canonical vault path, ``"unknown"`` otherwise. Malformed locators
     map to ``"unknown"`` because the public status response must always be
     well-typed; for stricter failure routing use :func:`resolve` directly.
+
+    Either ``tenant`` or ``vault_root`` must be supplied (Fork 5 back-compat).
     """
+    effective_tenant = _resolve_tenant(tenant, vault_root)
     parsed = parse_locator(request.locator)
     if parsed is None or parsed.artifact_kind != "manifest":
         return StatusReportResponse(locator=request.locator, status="unknown")
-    manifest_path, _ = _vault_paths(vault_root, parsed.opaque_id)
+    manifest_path, _ = _vault_paths(effective_tenant.vault_root, parsed.opaque_id)
     status: Literal["committed", "unknown"] = (
         "committed" if manifest_path.exists() else "unknown"
     )
