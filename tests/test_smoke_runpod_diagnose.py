@@ -575,6 +575,163 @@ def test_diagnostic_result_is_immutable() -> None:
         result.category = "auth_failure"  # type: ignore[misc]
 
 
+def test_chat_omits_authorization_header_for_explicitly_empty_api_key() -> None:
+    """Codex review P2 on PR #69: an explicitly empty ``VLLM_API_KEY`` ("")
+    must be treated as "no key supplied" by the diagnostic, matching
+    ``VLLMBackend.__init__`` constructor-arg semantics (``is not None``).
+    Previously the diagnostic used ``if api_key`` (truthy), which would
+    have fallen back to ``sk-<pod_id>`` — diverging from the generate
+    path and masking a real auth misconfiguration.
+    """
+    seen_headers: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            for k, v in request.headers.items():
+                seen_headers[k.lower()] = v
+            return httpx.Response(200, text="ok")
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "ok"}}]
+        })
+
+    transport = httpx.MockTransport(handler)
+    result = smoke_runpod.run_diagnostics(
+        endpoint=_SECRET_ENDPOINT,
+        api_key="",  # explicitly empty — must NOT fall back to sk-<pod_id>
+        pod_id="podxyz",
+        transport=transport,
+    )
+    assert result.category == "success"
+    # No Authorization header should be sent: VLLMBackend's _headers()
+    # uses ``if self._api_key:`` (truthy), so an empty key string omits
+    # the header. The diagnostic's _build_headers() does the same.
+    assert "authorization" not in seen_headers
+
+
+def test_probe_endpoint_reachable_skips_unusable_address_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex review P1 on PR #69: when ``getaddrinfo`` returns multiple
+    candidates and the first one fails with an unrecognized errno (e.g.
+    ``EAFNOSUPPORT`` on an IPv6 address when only IPv4 is usable), the
+    probe must continue to the next candidate rather than returning
+    False immediately.
+    """
+    import socket as _socket
+
+    af_inet6 = getattr(_socket, "AF_INET6", 10)
+    af_inet = getattr(_socket, "AF_INET", 2)
+    fake_infos = [
+        (af_inet6, _socket.SOCK_STREAM, 6, "", ("::1", 443)),
+        (af_inet, _socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)),
+    ]
+    monkeypatch.setattr(
+        smoke_runpod.socket, "getaddrinfo", lambda *_a, **_k: fake_infos
+    )
+
+    EAFNOSUPPORT = 97  # Linux errno for "Address family not supported"
+    attempts: list[int] = []
+
+    class _FakeSocket:
+        def __init__(self, family, *_a, **_kw) -> None:
+            self._family = family
+
+        def settimeout(self, _t: float) -> None:
+            pass
+
+        def connect(self, _addr) -> None:
+            attempts.append(self._family)
+            if self._family == af_inet6:
+                exc = OSError("Address family not supported")
+                exc.errno = EAFNOSUPPORT
+                raise exc
+            return None  # IPv4 succeeds
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(smoke_runpod.socket, "socket", _FakeSocket)
+
+    ok = smoke_runpod._probe_endpoint_reachable("https://example.invalid/")
+    assert ok is True
+    assert attempts == [af_inet6, af_inet], (
+        "loop must fall through to the IPv4 candidate, not short-circuit"
+    )
+
+
+def test_probe_endpoint_reachable_returns_true_on_econnrefused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ECONNREFUSED indicates the host is routable (SYN+RST round-trip),
+    so the probe returns True and lets the higher-layer probe classify
+    the real failure.
+    """
+    import socket as _socket
+
+    af_inet = getattr(_socket, "AF_INET", 2)
+    fake_infos = [(af_inet, _socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+    monkeypatch.setattr(
+        smoke_runpod.socket, "getaddrinfo", lambda *_a, **_k: fake_infos
+    )
+
+    class _FakeSocket:
+        def __init__(self, *_a, **_kw) -> None:
+            pass
+
+        def settimeout(self, _t: float) -> None:
+            pass
+
+        def connect(self, _addr) -> None:
+            exc = OSError("Connection refused")
+            exc.errno = 111
+            raise exc
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(smoke_runpod.socket, "socket", _FakeSocket)
+    assert smoke_runpod._probe_endpoint_reachable("https://example.invalid/") is True
+
+
+def test_probe_endpoint_reachable_returns_false_when_all_candidates_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If every resolved address fails to connect (none reachable, none
+    refused), the probe returns False and the main flow classifies the
+    endpoint as ``endpoint_unreachable``.
+    """
+    import socket as _socket
+
+    af_inet = getattr(_socket, "AF_INET", 2)
+    fake_infos = [
+        (af_inet, _socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)),
+        (af_inet, _socket.SOCK_STREAM, 6, "", ("127.0.0.2", 443)),
+    ]
+    monkeypatch.setattr(
+        smoke_runpod.socket, "getaddrinfo", lambda *_a, **_k: fake_infos
+    )
+
+    class _FakeSocket:
+        def __init__(self, *_a, **_kw) -> None:
+            pass
+
+        def settimeout(self, _t: float) -> None:
+            pass
+
+        def connect(self, _addr) -> None:
+            exc = OSError("Host unreachable")
+            exc.errno = 113  # EHOSTUNREACH
+            raise exc
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(smoke_runpod.socket, "socket", _FakeSocket)
+    assert (
+        smoke_runpod._probe_endpoint_reachable("https://example.invalid/") is False
+    )
+
+
 def test_canonical_payload_shape_matches_runtime() -> None:
     """Smoke-test that the payload the diagnostic probe sends matches the
     shape the production VLLMBackend uses (model, messages with role/content,

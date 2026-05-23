@@ -127,15 +127,36 @@ def _classify_status(status: int) -> DiagnosticCategory | None:
     return "model_mismatch_or_bad_request"
 
 
+_ERRNO_HOST_REACHABLE = frozenset(
+    {
+        111,  # ECONNREFUSED — port closed, but host is routable
+        104,  # ECONNRESET   — peer reset, host responded
+    }
+)
+"""Connect-time errnos that indicate the host is reachable.
+
+When ``connect()`` returns one of these, the host responded at the
+network layer (e.g. ECONNREFUSED means a SYN+RST round-trip), so we
+treat the endpoint as reachable and let the higher-layer HTTP probe
+surface the real failure category.
+"""
+
+
 def _probe_endpoint_reachable(endpoint: str) -> bool:
     """Best-effort DNS + TCP reachability check against the endpoint host.
 
-    Returns ``True`` when the hostname resolves and a TCP connect attempt
-    succeeds (or the kernel returns a non-network error such as
-    "connection refused", which still indicates the host is routable).
-    Returns ``False`` only when DNS fails or the kernel reports
-    ``EHOSTUNREACH``/``ENETUNREACH``/timeout — the conditions we classify
-    as ``endpoint_unreachable``.
+    Returns ``True`` when the hostname resolves and at least one TCP
+    connect attempt succeeds (or returns ``ECONNREFUSED`` /
+    ``ECONNRESET``, both of which indicate the host is routable).
+    Returns ``False`` only when DNS fails outright or every resolved
+    address fails to connect.
+
+    Per-address connect errors (timeout, ``EHOSTUNREACH``,
+    ``ENETUNREACH``, ``EAFNOSUPPORT`` from a missing IPv6 stack, etc.)
+    cause the loop to fall through to the next address rather than
+    short-circuiting — so a dual-stack host where IPv6 is listed first
+    but only IPv4 is usable still gets classified as reachable. This
+    addresses codex review P1 on PR #69.
 
     Any exception raised here is swallowed; only the boolean reaches the
     caller, so a stringified ``socket`` error cannot leak into the output.
@@ -152,7 +173,7 @@ def _probe_endpoint_reachable(endpoint: str) -> bool:
         port = 443 if parts.scheme == "https" else 80
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except socket.gaierror:
+    except (socket.gaierror, OSError):
         return False
     except Exception:
         return False
@@ -166,19 +187,15 @@ def _probe_endpoint_reachable(endpoint: str) -> bool:
         except (socket.timeout, TimeoutError):
             continue
         except OSError as exc:
-            # ECONNREFUSED / similar — host is reachable, port closed.
-            # Treat as reachable so we surface the higher-layer error.
             errno = getattr(exc, "errno", None)
-            if errno in (
-                111,  # ECONNREFUSED
-                104,  # ECONNRESET
-                113,  # EHOSTUNREACH
-                101,  # ENETUNREACH
-            ):
-                if errno in (111, 104):
-                    return True
-                continue
-            return False
+            if errno in _ERRNO_HOST_REACHABLE:
+                return True
+            # Anything else (EHOSTUNREACH, ENETUNREACH, EAFNOSUPPORT,
+            # EACCES from a sandbox, etc.) is treated as "this address
+            # didn't work" — fall through to the next candidate rather
+            # than declaring the whole endpoint unreachable. Only the
+            # full loop exhausting all addresses yields False.
+            continue
         finally:
             if sock is not None:
                 try:
@@ -317,10 +334,17 @@ def run_diagnostics(
     if transport is None and not _probe_endpoint_reachable(endpoint):
         return DiagnosticResult(category="endpoint_unreachable")
 
-    # Resolve the effective API key the same way VLLMBackend does, so the
-    # diagnostic probe authenticates identically to the real generate call.
+    # Resolve the effective API key the same way VLLMBackend.__init__
+    # does, so the diagnostic probe authenticates identically to the
+    # real generate call. In particular, an explicitly empty string
+    # (``VLLM_API_KEY=""``) is treated as "no key supplied" by both
+    # paths — the env-var lookup at the call site rejects "" before it
+    # reaches here. ``is not None`` (rather than truthiness) is the
+    # exact gate VLLMBackend uses; aligning closes codex review P2 on
+    # PR #69 (otherwise diagnose could succeed while generate fails
+    # auth in the same environment).
     resolved_api_key: str | None
-    if api_key:
+    if api_key is not None:
         resolved_api_key = api_key
     elif pod_id:
         resolved_api_key = f"sk-{pod_id}"
