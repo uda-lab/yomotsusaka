@@ -47,11 +47,14 @@ Each document is redacted, validated, committed to the vault, and indexed in
 the facade's search gateway.
 
 ```bash
-python -m yomotsusaka.cli.run_batch ./inbox \
+uv run python -m yomotsusaka.cli.run_batch ./inbox \
     --vault-root ./vault \
     [--tenant-id <your-tenant-id>] \
     [--fail-on-error | --no-fail-on-error]
 ```
+
+`uv run` resolves the interpreter against the `.venv` created above, so the
+`yomotsusaka` package is importable without a separate activation step.
 
 On success the CLI prints exactly one redacted-only summary line of the shape
 `batch <batch_id> committed=<N> failed=<M>`. Exit codes: `0` on success, `1`
