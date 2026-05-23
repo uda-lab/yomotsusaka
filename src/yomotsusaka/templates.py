@@ -46,6 +46,7 @@ from yomotsusaka.execution_gateway import ExecutionRequest, ExecutionScope
 from yomotsusaka.pipeline import process_document
 from yomotsusaka.schemas import DocumentManifest, EntityKind
 from yomotsusaka.scrubber import scrub_stream
+from yomotsusaka.span_proposer import NoOpSpanProposer
 
 logger = logging.getLogger(__name__)
 
@@ -197,14 +198,19 @@ def _summarise_private_minutes(
     keys = sorted({entry.key for entry in private_state.private_entries})
     summary_text = snippet + "\n\nentities: " + ", ".join(keys)
 
-    # Commit the summary as a new public artifact. No spans (the summary
-    # is already redacted-only by construction).
+    # Commit the summary as a new public artifact. The summary is built
+    # from redacted text and entity keys only, so it carries no raw
+    # private values that need a fresh redaction pass. Use
+    # :class:`NoOpSpanProposer` to declare "zero spans by design" — this
+    # satisfies ``process_document``'s single-source-of-spans invariant
+    # without re-redacting an already-redacted string.
     summary_doc_id = _new_artifact_id("summarise-private-minutes", parsed.opaque_id)
     handle = process_document(
         doc_id=summary_doc_id,
         raw_text=summary_text,
         spans=[],
         vault_root=vault_root,
+        proposer=NoOpSpanProposer(),
     )
 
     public = PublicHandle(
@@ -286,16 +292,19 @@ def _generate_letter_from_private_template(
 
     # The pipeline expects the raw text to be the un-redacted form and
     # spans pointing into it. We pass the redacted letter (which the
-    # caller supplied as a template that is already redacted) and an
-    # empty spans list — the manifest will carry the same redacted text
-    # without re-redacting. This keeps the artifact contents identical
-    # to ``redacted_letter`` and avoids round-tripping through the
-    # redactor (which would attempt to re-key already-redacted text).
+    # caller supplied as a template that is already redacted) and a
+    # :class:`NoOpSpanProposer` to declare zero spans by design — the
+    # manifest will carry the same redacted text without re-redacting.
+    # This keeps the artifact contents identical to ``redacted_letter``
+    # and avoids round-tripping through the redactor (which would attempt
+    # to re-key already-redacted text), while still satisfying
+    # ``process_document``'s single-source-of-spans invariant.
     handle = process_document(
         doc_id=letter_doc_id,
         raw_text=redacted_letter,
         spans=[],
         vault_root=vault_root,
+        proposer=NoOpSpanProposer(),
     )
 
     public = PublicHandle(
