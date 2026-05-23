@@ -26,6 +26,11 @@ _FORBIDDEN_MODULES: tuple[str, ...] = (
     "yomotsusaka.runpod_lifecycle",
     "yomotsusaka.inference_backend",
     "yomotsusaka.vllm_backend",
+    # Issue #72: SpanProposer is a private-side kernel module that wires
+    # InferenceBackend into the redaction pipeline; importing it from the
+    # boundary would transitively pull yomotsusaka.inference_backend back
+    # into the boundary's import graph.
+    "yomotsusaka.span_proposer",
 )
 
 
