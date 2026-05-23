@@ -21,6 +21,12 @@ env/
 # Vault (local dev only — never commit private data)
 .vault/
 
+# RunPod lifecycle log written by scripts/manage_runpod.py
+# (the per-user file under ~/.cache/yomotsusaka/lifecycle.jsonl is
+# already outside the repo, but a test or a misconfigured run could
+# write a copy to the working directory — ensure it stays untracked).
+lifecycle.jsonl
+
 # Environment files (never commit credentials; see .env.example)
 .env
 .env.local

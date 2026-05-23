@@ -759,3 +759,32 @@ def test_canonical_payload_shape_matches_runtime() -> None:
     assert isinstance(seen_payload["messages"], list)
     assert seen_payload["messages"][0]["role"] == "user"
     assert "max_tokens" in seen_payload
+
+
+# ---------------------------------------------------------------------------
+# Cross-script sanitisation invariant — extended by issue #76
+# ---------------------------------------------------------------------------
+#
+# When ``scripts/manage_runpod.py`` shells out to ``scripts/smoke_runpod.py
+# --mode diagnose``, the helper propagates the smoke's stdout ``diagnostic:
+# <category>`` line and discards stderr. This test pins the cross-script
+# contract: the smoke's stdout shape must not change in a way that would
+# break the helper's category extractor, and stderr from the smoke must not
+# accrue sensitive bytes that the helper would have to scrub.
+
+
+def test_smoke_stdout_shape_is_helper_compatible() -> None:
+    """The helper extracts the smoke's category by splitting the line
+    ``diagnostic: <category>[ snippet=<…>]`` on the first space after the
+    prefix. Verify the format-line shape directly so a future refactor of
+    :class:`smoke_runpod.DiagnosticResult.format_line` does not silently
+    break ``scripts/manage_runpod.py``'s extractor.
+    """
+    success = smoke_runpod.DiagnosticResult(category="success", snippet="ok")
+    assert success.format_line().startswith("diagnostic: success")
+    # Confirm the bare-category extractor strips snippet content cleanly.
+    bare = success.format_line()[len("diagnostic:"):].strip().split(" ", 1)[0]
+    assert bare == "success"
+
+    failure = smoke_runpod.DiagnosticResult(category="auth_failure")
+    assert failure.format_line() == "diagnostic: auth_failure"
