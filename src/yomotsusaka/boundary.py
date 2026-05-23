@@ -1583,8 +1583,10 @@ def execute_request(
 
     # Shared helper closure: build + write an audit record, then return a
     # matching ExecutionResponse. If the audit write fails (OSError or
-    # AuditError), we still return a structured failure so the caller
-    # never sees an unhandled exception.
+    # AuditError), the Chikaeshi audit contract requires we DO NOT echo
+    # the original failure classification — the caller instead sees a
+    # dedicated :data:`ExecutionFailureReason.AuditWriteFailed` so they
+    # can distinguish a real outcome from an audit-pipeline failure.
     def _emit_failure(
         *,
         outcome: str,
@@ -1629,18 +1631,30 @@ def execute_request(
         try:
             write_record(record, effective_vault_root, private_dict=private_dict or [])
         except (AuditError, OSError):
-            # Audit write itself failed. Per the §D-5 contract we still
-            # return the original failure to the caller — there is no
-            # second tier of failure encoding for this case, and surfacing
-            # the audit error would leak filesystem detail. The detail
-            # string is replaced so the caller knows the audit pipeline
-            # itself had trouble.
-            logger.warning(
+            # Audit write itself failed. The Chikaeshi audit contract
+            # requires one durable row per call; if we cannot durably
+            # write one, we MUST NOT return the original failure
+            # classification as if the audit row had landed. Surface
+            # :data:`AuditWriteFailed` instead. The detail is a generic
+            # phrase that names the original outcome category (already
+            # an enum value, never a raw input) so the caller can
+            # correlate, but never echoes a filesystem path, raw value,
+            # endpoint URL, pod id, or tenant identifier.
+            logger.error(
                 "execute_request: audit write failed for request_id=%s "
                 "(original outcome=%s, reason=%s)",
                 request_id,
                 outcome,
                 reason.value,
+            )
+            return ExecutionResponse(
+                audit_record_id=request_id,
+                status="failed",
+                artifacts=[],
+                scrubbed_stdout="",
+                scrubbed_stderr="",
+                reason=ExecutionFailureReason.AuditWriteFailed,
+                detail=f"audit write failed for outcome {reason.value!r}",
             )
         return ExecutionResponse(
             audit_record_id=request_id,
@@ -1880,15 +1894,30 @@ def execute_request(
             private_dict=list(private_state.private_entries),
         )
     except (AuditError, OSError):
-        # Audit-write failure on the success path. Per §D-5 we still
-        # return the success response — the artifacts have already been
-        # committed by the template and rolling them back is out of
-        # scope for MVP. Log loudly so the inconsistency is visible.
+        # Audit-write failure on the success path. The Chikaeshi audit
+        # contract requires one durable row per call: if the success
+        # row never landed, we MUST NOT report ``status="accepted"`` —
+        # the caller would treat the call as audited when it isn't.
+        # Surface :data:`AuditWriteFailed` instead and drop the public
+        # artifact list (the artifacts may still be on disk under the
+        # vault, but acknowledging them here would imply the audit
+        # pipeline saw the call). Detail is a generic phrase that never
+        # echoes a filesystem path, raw value, endpoint URL, pod id,
+        # or tenant identifier.
         logger.error(
             "execute_request: success-path audit write failed for "
             "request_id=%s template=%s",
             request_id,
             template_name,
+        )
+        return ExecutionResponse(
+            audit_record_id=request_id,
+            status="failed",
+            artifacts=[],
+            scrubbed_stdout="",
+            scrubbed_stderr="",
+            reason=ExecutionFailureReason.AuditWriteFailed,
+            detail="audit write failed for outcome 'success'",
         )
 
     return ExecutionResponse(

@@ -82,6 +82,22 @@ class ExecutionFailureReason(str, Enum):
     ScrubFailed = "scrub_failed"
     TemplateRaised = "template_raised"
     ArtifactMissing = "artifact_missing"
+    AuditWriteFailed = "audit_write_failed"
+    """The required audit row could not be durably written.
+
+    Returned by :func:`yomotsusaka.boundary.execute_request` when the
+    pre-write scrubber re-check (``AuditError``) or the underlying file
+    system (``OSError``) refuses the audit append. The Chikaeshi audit
+    contract requires one durable row per call (including denials and
+    schema-invalid requests); if the row cannot be written, the call
+    MUST NOT report ``status="accepted"`` or echo the original failure
+    classification — the caller instead sees this dedicated reason so
+    they can distinguish a real outcome from an audit-pipeline failure.
+
+    Detail is a generic ``"audit write failed"`` style string; it never
+    echoes a filesystem path, vault root, raw private value, endpoint
+    URL, pod id, or tenant identifier.
+    """
 
 logger = logging.getLogger(__name__)
 

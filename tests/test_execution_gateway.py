@@ -773,6 +773,308 @@ def test_failure_scrub_failed(
 
 
 # ---------------------------------------------------------------------------
+# AuditWriteFailed — explicit failure when ``write_record`` cannot durably
+# persist the required audit row (#59). Five deterministic scenarios that
+# monkeypatch :func:`yomotsusaka.audit.write_record` to fail and assert:
+# (a) the call returns ``status="failed"`` with
+#     ``reason=ExecutionFailureReason.AuditWriteFailed``,
+# (b) no path returns ``status="accepted"`` after its audit write fails,
+# (c) the failure ``detail`` is public-safe (no paths / private values /
+#     endpoints / pod ids / tenant identifiers),
+# (d) no audit row is written for the request (the write failed).
+# ---------------------------------------------------------------------------
+
+
+_AUDIT_FAILURE_FORBIDDEN_SUBSTRINGS = (
+    "/tmp/",
+    "/private/",
+    "/vault/",
+    "vault_root",
+    "tenant",
+    "pod",
+    "endpoint",
+)
+
+
+def _assert_audit_write_failed_contract(
+    response: ExecutionResponse,
+    vault: Path,
+    caplog_records: list[logging.LogRecord],
+    *,
+    surface: str,
+    extra_path_strings: tuple[str, ...] = (),
+) -> None:
+    # (a) failure returned with the dedicated AuditWriteFailed reason.
+    assert isinstance(response, ExecutionResponse), surface
+    assert response.status == "failed", (
+        f"{surface}: expected status='failed' on audit-write failure, "
+        f"got {response.status!r}"
+    )
+    assert response.reason is ExecutionFailureReason.AuditWriteFailed, (
+        f"{surface}: expected reason=AuditWriteFailed, got "
+        f"{response.reason!r}"
+    )
+
+    # (b) the response carries no artifacts (success path that failed
+    #     after template output must NOT echo handles as if accepted).
+    assert response.artifacts == [], (
+        f"{surface}: AuditWriteFailed response must drop artifacts"
+    )
+    assert response.scrubbed_stdout == "", surface
+    assert response.scrubbed_stderr == "", surface
+
+    # (c) the failure detail is public-safe. Never echo filesystem paths,
+    #     raw private values, endpoint URLs, pod ids, tenant identifiers.
+    detail = response.detail or ""
+    response_blob = response.model_dump_json()
+    for needle in RAW_VALUES:
+        assert needle not in response_blob, (
+            f"{surface}: response leaked raw value {needle!r}"
+        )
+    for needle in _AUDIT_FAILURE_FORBIDDEN_SUBSTRINGS:
+        assert needle not in detail.lower(), (
+            f"{surface}: detail leaked forbidden substring {needle!r}: "
+            f"{detail!r}"
+        )
+    for needle in extra_path_strings:
+        if needle:
+            assert needle not in response_blob, (
+                f"{surface}: response leaked filesystem path {needle!r}"
+            )
+
+    # (d) no audit row landed for this request_id (the write was forced
+    #     to fail). The append-only file may not even exist yet.
+    rows = _audit_lines_for_request(vault, response.audit_record_id)
+    assert rows == [], (
+        f"{surface}: expected zero audit rows for failed write, got "
+        f"{len(rows)}"
+    )
+
+    # (e) logs are public-safe — no raw values in the failure log.
+    for record in caplog_records:
+        message = record.getMessage()
+        _assert_no_raw_values(message, surface=f"{surface}.caplog.{record.name}")
+
+
+def _force_audit_write_failure(
+    monkeypatch: pytest.MonkeyPatch, *, kind: str = "audit_error"
+) -> None:
+    """Monkeypatch :func:`yomotsusaka.audit.write_record` to fail.
+
+    The dispatcher imports ``write_record`` lazily *inside*
+    :func:`execute_request`. Patch the module-level binding so the lazy
+    import resolves to the failing stub.
+    """
+    from yomotsusaka import audit as audit_mod
+
+    def _raise_audit(record, vault_root, *, private_dict=()):  # noqa: ARG001
+        if kind == "audit_error":
+            raise audit_mod.AuditError(
+                "audit record failed pre-write scrubber re-check (forced "
+                "by test)"
+            )
+        if kind == "oserror":
+            raise OSError(28, "No space left on device (forced by test)")
+        raise AssertionError(f"unknown kind: {kind!r}")
+
+    monkeypatch.setattr(audit_mod, "write_record", _raise_audit)
+
+
+@pytest.mark.parametrize("kind", ["audit_error", "oserror"])
+def test_audit_write_failure_on_schema_invalid_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """SchemaInvalid path: when the request shape is rejected AND the
+    audit write fails, the caller sees AuditWriteFailed (not
+    SchemaInvalid as if the audit had landed)."""
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True)
+    _force_audit_write_failure(monkeypatch, kind=kind)
+
+    with caplog.at_level(logging.INFO, logger="yomotsusaka"):
+        response = execute_request({"not_a_request": True}, vault_root=vault)
+
+    _assert_audit_write_failed_contract(
+        response,
+        vault,
+        caplog.records,
+        surface=f"AuditWriteFailed(schema_invalid, {kind})",
+        extra_path_strings=(str(vault), str(vault.resolve())),
+    )
+
+
+@pytest.mark.parametrize("kind", ["audit_error", "oserror"])
+def test_audit_write_failure_on_scope_denied_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """ScopeDenied path: an ordinary-agent caller targeting a
+    PRIVATE_BOUNDARY-only template is denied. When the denial audit
+    cannot be persisted, the caller sees AuditWriteFailed."""
+    vault, handle = _setup_canonical_vault(tmp_path, "exec-aw-scope-001")
+    _force_audit_write_failure(monkeypatch, kind=kind)
+
+    with caplog.at_level(logging.INFO, logger="yomotsusaka"):
+        response = execute_request(
+            ExecutionRequest(
+                job_name="summarise_private_minutes",
+                purpose="scope-test",
+                scope=ExecutionScope.ORDINARY_AGENT,
+                inputs={"target_handle": handle.locator},
+            ),
+            vault_root=vault,
+        )
+
+    _assert_audit_write_failed_contract(
+        response,
+        vault,
+        caplog.records,
+        surface=f"AuditWriteFailed(scope_denied, {kind})",
+        extra_path_strings=(str(vault), str(vault.resolve())),
+    )
+
+
+@pytest.mark.parametrize("kind", ["audit_error", "oserror"])
+def test_audit_write_failure_on_template_not_found(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """TemplateNotFound path: an unknown template name is rejected. When
+    that denial cannot be audited, the caller sees AuditWriteFailed."""
+    vault, handle = _setup_canonical_vault(tmp_path, "exec-aw-tnf-001")
+    _force_audit_write_failure(monkeypatch, kind=kind)
+
+    with caplog.at_level(logging.INFO, logger="yomotsusaka"):
+        response = execute_request(
+            ExecutionRequest(
+                job_name="no_such_template",
+                purpose="lookup-test",
+                scope=ExecutionScope.PRIVATE_BOUNDARY,
+                inputs={"target_handle": handle.locator},
+            ),
+            vault_root=vault,
+        )
+
+    _assert_audit_write_failed_contract(
+        response,
+        vault,
+        caplog.records,
+        surface=f"AuditWriteFailed(template_not_found, {kind})",
+        extra_path_strings=(str(vault), str(vault.resolve())),
+    )
+
+
+@pytest.mark.parametrize("kind", ["audit_error", "oserror"])
+def test_audit_write_failure_on_template_raised(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """TemplateRaised path: the template body raises. When the
+    TemplateRaised audit cannot be persisted, the caller sees
+    AuditWriteFailed (NOT TemplateRaised, which would imply the audit
+    landed)."""
+    vault, handle = _setup_canonical_vault(tmp_path, "exec-aw-raise-001")
+
+    from yomotsusaka import templates as templates_mod
+
+    def _boom(request, private_state, vault_root):  # noqa: ARG001
+        raise RuntimeError("intentional boom from test")
+
+    original_spec = templates_mod.TEMPLATES["summarise_private_minutes"]
+    monkeypatch.setitem(
+        templates_mod.TEMPLATES,
+        "summarise_private_minutes",
+        templates_mod.TemplateSpec(
+            name="summarise_private_minutes",
+            fn=_boom,
+            min_scope=original_spec.min_scope,
+            description=original_spec.description,
+        ),
+    )
+    _force_audit_write_failure(monkeypatch, kind=kind)
+
+    with caplog.at_level(logging.INFO, logger="yomotsusaka"):
+        response = execute_request(
+            ExecutionRequest(
+                job_name="summarise_private_minutes",
+                purpose="raise-test",
+                scope=ExecutionScope.PRIVATE_BOUNDARY,
+                inputs={"target_handle": handle.locator},
+            ),
+            vault_root=vault,
+        )
+
+    _assert_audit_write_failed_contract(
+        response,
+        vault,
+        caplog.records,
+        surface=f"AuditWriteFailed(template_raised, {kind})",
+        extra_path_strings=(str(vault), str(vault.resolve())),
+    )
+    # The original exception message must not survive into the response.
+    assert "intentional boom from test" not in (response.detail or "")
+
+
+@pytest.mark.parametrize("kind", ["audit_error", "oserror"])
+def test_audit_write_failure_on_success_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """Success path: the template ran to completion AND its output was
+    scrubbed successfully, but the success audit row cannot be written.
+    The Chikaeshi audit contract forbids returning ``status="accepted"``
+    in this case — the caller would treat the call as durably audited
+    when it isn't. Surface AuditWriteFailed instead.
+
+    This is the critical regression target for issue #59: the previous
+    implementation logged-and-continued, returning ``status="accepted"``
+    even though the audit row never landed.
+    """
+    vault, handle = _setup_canonical_vault(tmp_path, "exec-aw-success-001")
+    _force_audit_write_failure(monkeypatch, kind=kind)
+
+    with caplog.at_level(logging.INFO, logger="yomotsusaka"):
+        response = execute_request(
+            ExecutionRequest(
+                job_name="summarise_private_minutes",
+                purpose="success-audit-fail-test",
+                scope=ExecutionScope.PRIVATE_BOUNDARY,
+                inputs={"target_handle": handle.locator},
+            ),
+            vault_root=vault,
+        )
+
+    _assert_audit_write_failed_contract(
+        response,
+        vault,
+        caplog.records,
+        surface=f"AuditWriteFailed(success_path, {kind})",
+        extra_path_strings=(str(vault), str(vault.resolve())),
+    )
+
+
+def test_audit_write_failure_reason_is_in_enum() -> None:
+    """Structural pin: the new enum value must be present so #60's
+    fixture (which widens the exposure-contract test to call
+    :func:`execute_request` non-vacuously) can match it cleanly."""
+    assert ExecutionFailureReason.AuditWriteFailed.value == "audit_write_failed"
+    assert ExecutionFailureReason("audit_write_failed") is (
+        ExecutionFailureReason.AuditWriteFailed
+    )
+
+
+# ---------------------------------------------------------------------------
 # Restoration legacy path is unchanged (acceptance criterion 7)
 # ---------------------------------------------------------------------------
 
