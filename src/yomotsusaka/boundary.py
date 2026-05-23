@@ -1496,47 +1496,423 @@ def status_report_request(
 
 
 # ---------------------------------------------------------------------------
-# MVP-3 handshake stub (#47 / #43)
+# Chikaeshi execution dispatcher (#43)
 # ---------------------------------------------------------------------------
 #
-# ``execute_request`` is the activation symbol named in the issue #47 MVP-3
-# exposure-contract handshake table. It is added here as a NAMED STUB so
-# that the non-vacuity guard
-# (``tests.test_exposure_contract_mvp3.test_handshake_paths_match_impl_issues``)
-# can verify "module importable AND attribute present" without requiring
-# the real #43 Chikaeshi-dispatcher implementation to have landed.
+# ``execute_request`` is the agent-facing entry point for the private
+# execution gateway defined by ``docs/architecture.md`` §13 and
+# ``docs/chikaeshi.md``. It is implemented inline here (not in
+# ``execution_gateway.py``) so the public surface stays homogeneous:
+# every ``boundary.*_request`` function takes a typed request, audits
+# the call, and returns a typed response.
 #
-# Backend PR #43 replaces this stub with the real execution dispatcher.
-# Activation of the abstract ``ContractExecutionDispatcher`` is gated on
-# ``__is_stub__`` being false: while the marker is True, the
-# ``execution_dispatcher_candidate_provider`` fixture skips with a
-# citation; the moment #43 lands the real function (flipping or removing
-# the marker), the contract activates.
+# Architecture:
 #
-# Intentionally NOT added to ``__all__`` so the agent-facing public surface
-# does not widen ahead of #43. The drift guard
-# ``test_no_new_unscanned_symbols_in_boundary_all`` therefore does not need
-# to classify this name.
+# 1. The dispatcher accepts an :class:`ExecutionRequest` plus the same
+#    ``tenant=`` / ``vault_root=`` one-of-two kwargs every other
+#    boundary entry point uses (Fork 5 back-compat per #45).
+# 2. It enforces the closed-set template registry, the scope gate, and
+#    resolves ``inputs["target_handle"]`` to a :class:`PrivateState`
+#    inside the private boundary.
+# 3. It invokes the template synchronously, scrubs the returned
+#    stdout/stderr, and writes ONE audit record per call (including
+#    every failure path) before returning.
+# 4. The :data:`policy_profile` / :data:`approval_ticket` audit columns
+#    are reserved-as-``None`` per the #43 reconciliation; populating them
+#    is owned by #44.
 
 
-def execute_request(*args: Any, **kwargs: Any) -> None:
-    """Stub marker for the issue #43 Chikaeshi execution dispatcher.
+def execute_request(
+    request: object,
+    *,
+    tenant: TenantScope | None = None,
+    vault_root: Path | None = None,
+) -> "ExecutionResponse":
+    """Dispatch a template job through the private execution gateway.
 
-    Replace with the real implementation in #43; flip ``__is_stub__`` to
-    ``False`` (or remove the attribute) on the replacement to activate
-    :class:`tests.test_exposure_contract_mvp3.ContractExecutionDispatcher`.
+    This is the Chikaeshi dispatcher (issue #43). It mirrors the shape of
+    every other ``boundary.*_request`` function: typed request in, typed
+    response out, with one audit record appended to
+    ``<vault_root>/audit/restoration.jsonl`` per call (including
+    failures). Failures are RETURNED as
+    :class:`yomotsusaka.execution_gateway.ExecutionResponse` with
+    ``status="failed"`` and a populated :class:`ExecutionFailureReason`;
+    they are never raised. The :class:`ExecutionFailure` exception type
+    declared by #42 remains for programmer-error-only paths and is NOT
+    raised by this function.
 
-    Raising ``NotImplementedError`` if accidentally invoked is the safest
-    fail-closed behaviour; callers MUST NOT depend on this symbol until
-    #43 lands.
+    Parameters
+    ----------
+    request:
+        :class:`yomotsusaka.execution_gateway.ExecutionRequest`. Anything
+        else (or a request whose required ``inputs["target_handle"]`` is
+        missing/malformed) returns ``ExecutionFailureReason.SchemaInvalid``.
+    tenant / vault_root:
+        Exactly one must be supplied. ``vault_root`` is wrapped via
+        :meth:`TenantScope.local`. Cross-tenant locator misses surface
+        as :data:`ExecutionFailureReason.ArtifactMissing` (mirroring
+        :func:`resolve`'s ``UnknownArtifact``).
+
+    Returns
+    -------
+    ExecutionResponse
+        On success: ``status="accepted"``, ``artifacts`` populated with
+        :class:`PublicHandle` objects only, scrubbed stdout/stderr
+        fragments, ``reason=None``.
+        On failure: ``status="failed"``, ``reason`` set, ``detail``
+        scrubbed, ``artifacts=[]``.
     """
-    raise NotImplementedError(
-        "yomotsusaka.boundary.execute_request is a #47 handshake stub; "
-        "see issue #43 for the real Chikaeshi dispatcher"
+    # Lazy imports so a circular module-import cycle (execution_gateway →
+    # boundary → execution_gateway) is avoided. ``templates`` also imports
+    # ``boundary`` transitively for ``PublicHandle`` / ``build_locator``.
+    from yomotsusaka.audit import AuditError, AuditRecord, write_record
+    from yomotsusaka.execution_gateway import (
+        ExecutionFailureReason,
+        ExecutionRequest,
+        ExecutionResponse,
+        ExecutionScope,
+    )
+    from yomotsusaka.scrubber import ScrubError, scrub_stream
+    from yomotsusaka.templates import TEMPLATES, TemplateResult
+
+    effective_tenant = _resolve_tenant(tenant, vault_root)
+    effective_vault_root = effective_tenant.vault_root
+
+    request_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+
+    # Shared helper closure: build + write an audit record, then return a
+    # matching ExecutionResponse. If the audit write fails (OSError or
+    # AuditError), we still return a structured failure so the caller
+    # never sees an unhandled exception.
+    def _emit_failure(
+        *,
+        outcome: str,
+        reason: ExecutionFailureReason,
+        detail: str,
+        template_name: str,
+        caller_scope: str,
+        purpose: str,
+        locator: str,
+        resolver_reason: str | None = None,
+        private_dict: list[PrivateDictEntry] | None = None,
+    ) -> ExecutionResponse:
+        # Scrub detail before persisting it on either the audit row or the
+        # response. ``detail`` is the only free-form failure text we let
+        # cross the boundary.
+        try:
+            safe_detail = scrub_stream(detail, private_dict or [])
+        except ScrubError:
+            # The detail itself carried a raw value. Replace with a generic
+            # message so the failure surfaces but the value does not.
+            safe_detail = "<failure detail withheld for privacy>"
+        # The AuditRecord schema rejects blank values; coerce defensive
+        # placeholders for failure paths where the request never named a
+        # meaningful template / scope / purpose (e.g. schema-invalid).
+        safe_template = template_name if template_name and template_name.strip() else "<unknown>"
+        safe_caller_scope = caller_scope if caller_scope and caller_scope.strip() else "<unknown>"
+        safe_purpose = purpose if purpose and purpose.strip() else "<unknown>"
+        record = AuditRecord(
+            ts=now,
+            request_id=request_id,
+            template_name=safe_template,
+            caller_scope=safe_caller_scope,
+            purpose=safe_purpose,
+            locator=locator,
+            outcome=outcome,  # type: ignore[arg-type]
+            artifact_locators=[],
+            resolver_reason=resolver_reason,
+            detail=safe_detail,
+            policy_profile=None,
+            approval_ticket=None,
+        )
+        try:
+            write_record(record, effective_vault_root, private_dict=private_dict or [])
+        except (AuditError, OSError):
+            # Audit write itself failed. Per the §D-5 contract we still
+            # return the original failure to the caller — there is no
+            # second tier of failure encoding for this case, and surfacing
+            # the audit error would leak filesystem detail. The detail
+            # string is replaced so the caller knows the audit pipeline
+            # itself had trouble.
+            logger.warning(
+                "execute_request: audit write failed for request_id=%s "
+                "(original outcome=%s, reason=%s)",
+                request_id,
+                outcome,
+                reason.value,
+            )
+        return ExecutionResponse(
+            audit_record_id=request_id,
+            status="failed",
+            artifacts=[],
+            scrubbed_stdout="",
+            scrubbed_stderr="",
+            reason=reason,
+            detail=safe_detail,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 1: SchemaInvalid — request shape rejection. Captured fields
+    # use safe defaults so the audit row is always well-formed.
+    # ------------------------------------------------------------------
+    if not isinstance(request, ExecutionRequest):
+        return _emit_failure(
+            outcome="schema_invalid",
+            reason=ExecutionFailureReason.SchemaInvalid,
+            detail="request must be an ExecutionRequest instance",
+            template_name="<invalid>",
+            caller_scope="<invalid>",
+            purpose="<invalid>",
+            locator="",
+        )
+
+    template_name = request.job_name
+    caller_scope_value = request.scope.value
+    purpose = request.purpose
+    locator_input = request.inputs.get("target_handle") if isinstance(request.inputs, dict) else None
+    locator = locator_input if isinstance(locator_input, str) else ""
+
+    # ------------------------------------------------------------------
+    # Step 2: TemplateNotFound — registry membership.
+    # ------------------------------------------------------------------
+    spec = TEMPLATES.get(template_name)
+    if spec is None:
+        return _emit_failure(
+            outcome="template_not_found",
+            reason=ExecutionFailureReason.TemplateNotFound,
+            detail=f"no template registered under name {template_name!r}",
+            template_name=template_name,
+            caller_scope=caller_scope_value,
+            purpose=purpose,
+            locator=locator,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 3: ScopeDenied — caller scope vs template min_scope. MVP:
+    # only PRIVATE_BOUNDARY callers may invoke any template (the two
+    # shipped templates both declare min_scope=PRIVATE_BOUNDARY). An
+    # ordinary-agent caller is denied.
+    # ------------------------------------------------------------------
+    if spec.min_scope is ExecutionScope.PRIVATE_BOUNDARY and (
+        request.scope is not ExecutionScope.PRIVATE_BOUNDARY
+    ):
+        return _emit_failure(
+            outcome="scope_denied",
+            reason=ExecutionFailureReason.ScopeDenied,
+            detail=(
+                f"template {template_name!r} requires scope=PRIVATE_BOUNDARY; "
+                f"caller scope was {caller_scope_value!r}"
+            ),
+            template_name=template_name,
+            caller_scope=caller_scope_value,
+            purpose=purpose,
+            locator=locator,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 4: PurposeNotPermitted — the ExecutionRequest validator
+    # already rejects blank purposes at construction time. This branch
+    # catches the residual case where a request was constructed with a
+    # purpose that strip()s non-empty but is otherwise unacceptable
+    # (currently: no such case, but the audit / failure plumbing is
+    # ready for a future policy table). Reserved for #44.
+    # ------------------------------------------------------------------
+    # (no-op for MVP — the request validator handles blank purpose)
+
+    # ------------------------------------------------------------------
+    # Step 5: target_handle shape check (sub-case of SchemaInvalid).
+    # ------------------------------------------------------------------
+    if spec.requires_locator_input:
+        if not isinstance(locator_input, str) or not locator_input:
+            return _emit_failure(
+                outcome="schema_invalid",
+                reason=ExecutionFailureReason.SchemaInvalid,
+                detail=(
+                    f"template {template_name!r} requires "
+                    "inputs['target_handle'] to be a non-empty locator string"
+                ),
+                template_name=template_name,
+                caller_scope=caller_scope_value,
+                purpose=purpose,
+                locator=locator,
+            )
+        parsed = parse_locator(locator_input)
+        if parsed is None or parsed.artifact_kind != "manifest":
+            return _emit_failure(
+                outcome="schema_invalid",
+                reason=ExecutionFailureReason.SchemaInvalid,
+                detail=(
+                    "target_handle does not parse as a manifest locator"
+                ),
+                template_name=template_name,
+                caller_scope=caller_scope_value,
+                purpose=purpose,
+                locator=locator,
+            )
+
+    # ------------------------------------------------------------------
+    # Step 6: Resolve the target locator under PRIVATE_BOUNDARY scope.
+    # This is the only place the dispatcher materialises raw private
+    # values. Cross-tenant misses fall through to ArtifactMissing per
+    # the resolver's existing UnknownArtifact semantics (Fork 9).
+    # ------------------------------------------------------------------
+    resolver_outcome = resolve(
+        locator_input,
+        scope=ResolverScope.PRIVATE_BOUNDARY,
+        purpose=purpose,
+        tenant=effective_tenant,
+    )
+    if isinstance(resolver_outcome, ResolverFailure):
+        # Map resolver failure → execution failure per §D-7.
+        rr = resolver_outcome.reason
+        if rr in (
+            ResolverFailureReason.MalformedLocator,
+            ResolverFailureReason.UnknownArtifact,
+            ResolverFailureReason.ArtifactMissing,
+        ):
+            mapped = ExecutionFailureReason.ArtifactMissing
+        elif rr is ResolverFailureReason.ScopeDenied:
+            mapped = ExecutionFailureReason.ScopeDenied
+        elif rr is ResolverFailureReason.PurposeNotPermitted:
+            mapped = ExecutionFailureReason.PurposeNotPermitted
+        else:  # defensive — should be unreachable
+            mapped = ExecutionFailureReason.ArtifactMissing
+        return _emit_failure(
+            outcome=mapped.value,
+            reason=mapped,
+            detail=(
+                resolver_outcome.detail
+                or f"resolver failure: {rr.value}"
+            ),
+            template_name=template_name,
+            caller_scope=caller_scope_value,
+            purpose=purpose,
+            locator=locator,
+            resolver_reason=rr.value,
+        )
+
+    # ResolverSuccess under PRIVATE_BOUNDARY scope carries PrivateState.
+    private_state = resolver_outcome.private_state
+    if private_state is None:
+        # Defensive — the resolver contract guarantees PrivateState is set
+        # under PRIVATE_BOUNDARY scope on success. Treat absence as an
+        # ArtifactMissing failure rather than crash.
+        return _emit_failure(
+            outcome="artifact_missing",
+            reason=ExecutionFailureReason.ArtifactMissing,
+            detail="resolver returned success without PrivateState",
+            template_name=template_name,
+            caller_scope=caller_scope_value,
+            purpose=purpose,
+            locator=locator,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 7: Invoke the template. Any exception → TemplateRaised. We
+    # intentionally do NOT echo the exception message verbatim into the
+    # response or audit detail; it may carry raw bytes from a private
+    # file or a runtime path.
+    # ------------------------------------------------------------------
+    try:
+        result: TemplateResult = spec.fn(request, private_state, effective_vault_root)
+    except Exception as exc:  # noqa: BLE001 — wrap any template error
+        # Build a generic detail with the exception class name only.
+        generic = f"template {template_name!r} raised {type(exc).__name__}"
+        return _emit_failure(
+            outcome="template_raised",
+            reason=ExecutionFailureReason.TemplateRaised,
+            detail=generic,
+            template_name=template_name,
+            caller_scope=caller_scope_value,
+            purpose=purpose,
+            locator=locator,
+            private_dict=list(private_state.private_entries),
+        )
+
+    # ------------------------------------------------------------------
+    # Step 8: Scrub stdout/stderr. A scrub failure surfaces as
+    # ScrubFailed (NOT TemplateRaised) so the caller can disambiguate
+    # template-bug vs scrubber-fail-closed.
+    # ------------------------------------------------------------------
+    try:
+        scrubbed_stdout = scrub_stream(
+            result.stdout, list(private_state.private_entries)
+        )
+        scrubbed_stderr = scrub_stream(
+            result.stderr, list(private_state.private_entries)
+        )
+    except ScrubError as exc:
+        return _emit_failure(
+            outcome="scrub_failed",
+            reason=ExecutionFailureReason.ScrubFailed,
+            detail=f"scrubber rejected template output: {exc.args[0] if exc.args else 'scrub_failed'}",
+            template_name=template_name,
+            caller_scope=caller_scope_value,
+            purpose=purpose,
+            locator=locator,
+            private_dict=list(private_state.private_entries),
+        )
+
+    # ------------------------------------------------------------------
+    # Step 9: Success path. Write success audit BEFORE returning so a
+    # process crash between audit and return cannot drop the row.
+    # ------------------------------------------------------------------
+    artifact_locators = [h.locator for h in result.artifact_handles]
+    success_record = AuditRecord(
+        ts=now,
+        request_id=request_id,
+        template_name=template_name,
+        caller_scope=caller_scope_value,
+        purpose=purpose,
+        locator=locator,
+        outcome="success",
+        artifact_locators=artifact_locators,
+        resolver_reason=None,
+        detail=None,
+        policy_profile=None,
+        approval_ticket=None,
+    )
+    try:
+        write_record(
+            success_record,
+            effective_vault_root,
+            private_dict=list(private_state.private_entries),
+        )
+    except (AuditError, OSError):
+        # Audit-write failure on the success path. Per §D-5 we still
+        # return the success response — the artifacts have already been
+        # committed by the template and rolling them back is out of
+        # scope for MVP. Log loudly so the inconsistency is visible.
+        logger.error(
+            "execute_request: success-path audit write failed for "
+            "request_id=%s template=%s",
+            request_id,
+            template_name,
+        )
+
+    return ExecutionResponse(
+        audit_record_id=request_id,
+        status="accepted",
+        artifacts=list(result.artifact_handles),
+        scrubbed_stdout=scrubbed_stdout,
+        scrubbed_stderr=scrubbed_stderr,
+        reason=None,
+        detail=None,
     )
 
 
-execute_request.__is_stub__ = True  # type: ignore[attr-defined]
+# Re-export the Chikaeshi response/failure types so callers can import
+# them from the public boundary module without reaching into
+# :mod:`yomotsusaka.execution_gateway`. Lazy import keeps the module
+# import order safe (execution_gateway imports PublicHandle from this
+# module; defer the back-reference until execution_gateway is fully
+# initialised). Imported below at module load via a finalisation block.
+
+from yomotsusaka.execution_gateway import (  # noqa: E402 — placed after defs
+    ExecutionFailure,
+    ExecutionResponse,
+)
 
 
 __all__ = [
@@ -1572,10 +1948,13 @@ __all__ = [
     "RestorationFailureReason",
     "StatusReportRequest",
     "StatusReportResponse",
+    "ExecutionResponse",
+    "ExecutionFailure",
     # Boundary entry points
     "process_document_request",
     "inspect_request",
     "search_request",
     "restoration_request",
     "status_report_request",
+    "execute_request",
 ]

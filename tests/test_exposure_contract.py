@@ -117,6 +117,7 @@ EXPECTED_BOUNDARY_SYMBOLS: frozenset[str] = frozenset(
         "ResolverScope",
         "ResolverSuccess",
         "PrivateState",
+        "ExecutionResponse",
         "parse_locator",
         "build_locator",
         "process_document_request",
@@ -124,6 +125,7 @@ EXPECTED_BOUNDARY_SYMBOLS: frozenset[str] = frozenset(
         "search_request",
         "restoration_request",
         "status_report_request",
+        "execute_request",
         "resolve",
     }
 )
@@ -146,6 +148,11 @@ _KNOWN_NON_RESPONSE_EXPORTS: frozenset[str] = frozenset(
         "RestorationRequest",
         "RestorationFailureReason",
         "StatusReportRequest",
+        # ExecutionFailure is the Chikaeshi exception type (#42) — reserved
+        # for programmer-error paths, not raised by execute_request. Not
+        # a response shape; classified here so the drift guard recognises
+        # the boundary re-export added by #43.
+        "ExecutionFailure",
     }
 )
 
