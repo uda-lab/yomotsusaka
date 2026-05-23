@@ -286,10 +286,22 @@ class SearchGateway:
     def snapshot(self, vault_root: Path) -> Path:
         """Persist every indexed manifest to ``<vault_root>/index/manifests.jsonl``.
 
-        Writes one ``DocumentManifest.model_dump_json()`` line per indexed
-        manifest. The write is atomic: contents are flushed and ``fsync``'d
-        on a sibling ``manifests.jsonl.tmp`` and then ``os.replace``'d into
-        place, so a partial write never leaves a corrupted final file.
+        Writes one ``DocumentManifest.model_dump_json()`` line per unique
+        indexed ``doc_id`` (last-write-wins on duplicates). The write is
+        atomic: contents are flushed and ``fsync``'d on a sibling
+        ``manifests.jsonl.tmp`` and then ``os.replace``'d into place, so
+        a partial write never leaves a corrupted final file.
+
+        Duplicate-``doc_id`` semantics
+        ------------------------------
+        The in-memory index is append-only — both :meth:`index` and
+        :meth:`load` push onto the same list — so the same ``doc_id``
+        may appear more than once after a re-index / reload cycle. The
+        snapshot persists only the most recently indexed manifest per
+        ``doc_id``; this mirrors the vault commit semantics
+        (``<vault>/manifests/<doc_id>.json`` is overwritten on re-commit)
+        and prevents stale rows from resurfacing in a second process via
+        :meth:`load`.
 
         The on-disk artifact is **redacted-only**. The :class:`QueryResolver`
         state, if any, is private-side and is NEVER serialised here.
@@ -321,13 +333,38 @@ class SearchGateway:
         final_path = index_dir / _INDEX_FILENAME
         tmp_path = index_dir / f"{_INDEX_FILENAME}.tmp"
 
+        # Deduplicate by ``doc_id``, keeping the LAST indexed manifest per
+        # id (codex review on PR #86, comment 3293061028 — P2). The
+        # in-memory ``_manifests`` list is append-only: both ``index()``
+        # and ``load()`` append, so the same doc_id may legitimately
+        # appear more than once after a re-index / reload cycle.
+        # Persisting every occurrence would let stale rows resurface
+        # across processes via ``load()`` even though the vault manifest
+        # file at ``<vault>/manifests/<doc_id>.json`` is overwritten in
+        # place on re-commit. The last-write-wins projection here mirrors
+        # the vault commit semantics and keeps the JSONL bounded by the
+        # number of unique indexed documents rather than the cumulative
+        # index-call count.
+        seen: set[str] = set()
+        # Walk back-to-front so the most recent occurrence of each
+        # doc_id is the one retained; reverse the survivors so the
+        # on-disk order is the chronological first-seen order of each
+        # surviving doc_id's *latest* version.
+        latest: list[DocumentManifest] = []
+        for manifest in reversed(self._manifests):
+            if manifest.doc_id in seen:
+                continue
+            seen.add(manifest.doc_id)
+            latest.append(manifest)
+        latest.reverse()
+
         try:
             # Open with ``"w"`` (truncate) so a prior snapshot is replaced
             # cleanly. JSONL is append-shaped on the wire but the file is
             # rewritten in full each snapshot — this keeps the read path a
             # one-shot ``readlines`` and avoids any need for compaction.
             with tmp_path.open("w", encoding="utf-8", newline="\n") as fh:
-                for manifest in self._manifests:
+                for manifest in latest:
                     line = manifest.model_dump_json()
                     fh.write(line)
                     fh.write("\n")
@@ -346,8 +383,10 @@ class SearchGateway:
             raise
 
         # Count-only log line per privacy discipline (no content echo).
+        # Report the number of unique manifests actually persisted (post-
+        # dedupe), not the size of the cumulative ``_manifests`` list.
         logger.debug(
-            "SearchGateway.snapshot wrote %d manifest(s)", len(self._manifests)
+            "SearchGateway.snapshot wrote %d manifest(s)", len(latest)
         )
         return final_path
 

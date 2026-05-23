@@ -465,6 +465,55 @@ def test_snapshot_does_not_touch_query_resolver(tmp_path: Path) -> None:
     assert dst.search("Alice Tan") == []
 
 
+def test_snapshot_dedupes_by_doc_id_keeping_latest(tmp_path: Path) -> None:
+    """Codex review on PR #86 (comment 3293061028, P2): re-indexing the
+    same ``doc_id`` must NOT cause stale rows to accumulate in
+    ``manifests.jsonl``. The snapshot retains only the most recently
+    indexed manifest per ``doc_id`` (last-write-wins, mirroring the
+    vault commit semantics)."""
+    vault_root = tmp_path / "vault"
+
+    # Initial index + snapshot cycle: two distinct manifests.
+    gateway = SearchGateway()
+    v1 = _make_manifest("doc-alpha", "<PERSON_old> v1 body")
+    v2 = _make_manifest("doc-beta", "<PERSON_beta> beta body")
+    gateway.index(v1)
+    gateway.index(v2)
+    gateway.snapshot(vault_root)
+
+    # Simulate the second-process recovery + re-index pattern: load the
+    # snapshot back, then re-index ``doc-alpha`` with an UPDATED manifest.
+    # Without dedupe the next snapshot would carry both the stale v1 AND
+    # the updated row for the same doc_id, causing stale hits to
+    # resurface in a third process.
+    recovered = SearchGateway()
+    recovered.load(vault_root)
+    v1_updated = _make_manifest("doc-alpha", "<PERSON_new> v2 updated body")
+    recovered.index(v1_updated)
+    recovered.snapshot(vault_root)
+
+    # On-disk: exactly two lines — one per unique doc_id — and doc-alpha
+    # carries the UPDATED redacted_text, not the stale one.
+    final_path = vault_root / "index" / "manifests.jsonl"
+    lines = final_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    parsed = [DocumentManifest.model_validate_json(line) for line in lines]
+    by_id = {m.doc_id: m for m in parsed}
+    assert set(by_id.keys()) == {"doc-alpha", "doc-beta"}
+    assert "v2 updated body" in by_id["doc-alpha"].redacted_text
+    assert "v1 body" not in by_id["doc-alpha"].redacted_text
+
+    # A third process loading the dedupe'd snapshot sees only one
+    # manifest per doc_id; the stale v1 row never resurfaces in search.
+    third = SearchGateway()
+    loaded = third.load(vault_root)
+    assert loaded == 2
+    updated_hits = third.search("updated body")
+    assert len(updated_hits) == 1
+    assert updated_hits[0].doc_id == "doc-alpha"
+    assert third.search("v1 body") == []
+
+
 def test_snapshot_uses_redacted_text_only(tmp_path: Path) -> None:
     """Drive the pipeline end-to-end, snapshot, and assert no raw private
     value appears anywhere in the on-disk JSONL."""
