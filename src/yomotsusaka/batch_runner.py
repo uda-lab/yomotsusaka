@@ -72,6 +72,12 @@ class BatchSummary(BaseModel, frozen=True):
     failed_doc_refs: list[str] = Field(default_factory=list)
     started_at: datetime
     finished_at: datetime
+    # ``index_persisted`` is True iff ``SearchGateway.snapshot`` succeeded at
+    # the tail of ``BatchRunner.run_directory``. A False value indicates the
+    # JSONL snapshot raised ``OSError`` (e.g. read-only vault); the batch
+    # itself is not failed by a snapshot failure — manifests / private
+    # dictionaries are already committed at that point.
+    index_persisted: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +337,27 @@ class BatchRunner:
                     f"all {len(failed_refs)} document(s) failed",
                 )
 
+        # Persist the redacted-only search index so a subsequent process
+        # (e.g. an agent search after this runner exits) can ``load`` it
+        # without re-running the batch. The snapshot writes only the
+        # redacted ``DocumentManifest`` objects — no resolver state, no
+        # raw private values. A snapshot OSError does not fail the batch:
+        # the manifests + private dictionaries committed by the pipeline
+        # are already durable in the vault; only the convenience JSONL
+        # mirror is missing.
+        index_persisted = True
+        try:
+            self._facade.gateway.snapshot(self._facade.vault_root)
+        except OSError:
+            # Count-only log: never echo the vault path or any manifest
+            # content. The path is caller-public for MVP but the runner's
+            # privacy discipline pins this to a category log.
+            logger.warning(
+                "batch_runner: gateway.snapshot failed for batch %s",
+                batch.batch_id,
+            )
+            index_persisted = False
+
         summary = BatchSummary(
             batch_id=batch.batch_id,
             submitted_count=len(doc_refs),
@@ -339,6 +366,7 @@ class BatchRunner:
             failed_doc_refs=failed_refs,
             started_at=started_at,
             finished_at=finished_at,
+            index_persisted=index_persisted,
         )
         logger.info(
             "batch_runner: batch %s submitted=%d committed=%d failed=%d",
