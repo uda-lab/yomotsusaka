@@ -1319,6 +1319,50 @@ def status_report_request(
     return StatusReportResponse(locator=request.locator, status=status)
 
 
+# ---------------------------------------------------------------------------
+# MVP-3 handshake stub (#47 / #43)
+# ---------------------------------------------------------------------------
+#
+# ``execute_request`` is the activation symbol named in the issue #47 MVP-3
+# exposure-contract handshake table. It is added here as a NAMED STUB so
+# that the non-vacuity guard
+# (``tests.test_exposure_contract_mvp3.test_handshake_paths_match_impl_issues``)
+# can verify "module importable AND attribute present" without requiring
+# the real #43 Chikaeshi-dispatcher implementation to have landed.
+#
+# Backend PR #43 replaces this stub with the real execution dispatcher.
+# Activation of the abstract ``ContractExecutionDispatcher`` is gated on
+# ``__is_stub__`` being false: while the marker is True, the
+# ``execution_dispatcher_candidate_provider`` fixture skips with a
+# citation; the moment #43 lands the real function (flipping or removing
+# the marker), the contract activates.
+#
+# Intentionally NOT added to ``__all__`` so the agent-facing public surface
+# does not widen ahead of #43. The drift guard
+# ``test_no_new_unscanned_symbols_in_boundary_all`` therefore does not need
+# to classify this name.
+
+
+def execute_request(*args: Any, **kwargs: Any) -> None:
+    """Stub marker for the issue #43 Chikaeshi execution dispatcher.
+
+    Replace with the real implementation in #43; flip ``__is_stub__`` to
+    ``False`` (or remove the attribute) on the replacement to activate
+    :class:`tests.test_exposure_contract_mvp3.ContractExecutionDispatcher`.
+
+    Raising ``NotImplementedError`` if accidentally invoked is the safest
+    fail-closed behaviour; callers MUST NOT depend on this symbol until
+    #43 lands.
+    """
+    raise NotImplementedError(
+        "yomotsusaka.boundary.execute_request is a #47 handshake stub; "
+        "see issue #43 for the real Chikaeshi dispatcher"
+    )
+
+
+execute_request.__is_stub__ = True  # type: ignore[attr-defined]
+
+
 __all__ = [
     # Locator grammar
     "LOCATOR_SCHEME",
