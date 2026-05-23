@@ -197,19 +197,22 @@ _PRIVATE_KERNEL_EXACT_DENYLIST: frozenset[str] = frozenset(
         "PodHandle",
         "PodConfig",
         "RunPodLifecycle",
-        # #47 handshake stub — replaced by the real attach-style class in
-        # #46; even when real, the class itself must stay vault-side and
-        # surface only via an opaque locator.
+        # #47 handshake symbol — the attach-style class lives in
+        # ``runpod_lifecycle`` (vault-side) and must surface only via an
+        # opaque locator. Re-exporting through ``boundary.__all__`` would
+        # widen the agent-facing surface without going through the
+        # ``EXPECTED_BOUNDARY_SYMBOLS`` review path.
         "AttachRunPodLifecycle",
         # vLLM backend internals — vault-side; #46 must not lift these.
         "VLLMBackend",
         "VLLMResponse",
         # Execution-gateway internals — vault-side; #42/#43 must not lift these.
         "ExecutionGateway",
-        # #47 handshake stub — replaced by the real request model in #42;
-        # the agent-facing surface for execution must be a separate, opaque
-        # request type added explicitly to boundary.__all__ via the
-        # EXPECTED_BOUNDARY_SYMBOLS path, not by lifting this name.
+        # #47 handshake symbol — landed for real by #42 in
+        # ``execution_gateway.__all__``; that module is its legitimate
+        # home. ``boundary.__all__`` must not also re-export it, since
+        # the agent-facing execution surface ships through #43's
+        # ``execute_request`` entry point, not through a bare model name.
         "ExecutionRequest",
         # Schemas that intentionally carry private-side bytes.
         "PrivateDictEntry",

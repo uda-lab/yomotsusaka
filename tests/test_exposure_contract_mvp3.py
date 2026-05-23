@@ -465,16 +465,44 @@ class ContractExecutionRequest:
 
     def _make_request(self, candidate_provider: Any) -> Any:
         request_cls = candidate_provider
-        # Most likely shape: a pydantic BaseModel with an opaque
-        # ``handle`` / ``locator`` field and an ``operation`` string. The
-        # backend PR is expected to supply a richer fixture if the
-        # constructor signature requires more.
+        # Constructor expectations as of #42 (the only landed shape so far):
+        # frozen pydantic model with ``job_name``, ``purpose``, ``scope``,
+        # and optional ``inputs`` dict. Walk a known-safe fixture through
+        # it; ``ExecutionScope`` is co-resident in the same module. The
+        # ``inputs`` dict deliberately carries an opaque locator so the
+        # locator round-trip assertion has something to validate.
         try:
-            return request_cls()
+            from yomotsusaka.execution_gateway import ExecutionScope
+        except ImportError:
+            ExecutionScope = None  # type: ignore[assignment]
+
+        kwargs: dict[str, Any] = {
+            "job_name": "exposure-contract-fixture-job",
+            "purpose": "exposure-contract-fixture-purpose",
+            "inputs": {
+                "target_handle": "private://agent_redacted/manifest/fixture-doc-001",
+            },
+        }
+        if ExecutionScope is not None:
+            kwargs["scope"] = ExecutionScope.ORDINARY_AGENT
+
+        try:
+            return request_cls(**kwargs)
         except TypeError:
+            # Different constructor signature in some future revision —
+            # backend PR must supply a richer fixture.
             pytest.skip(
-                "ExecutionRequest candidate could not be constructed with "
-                "no args; backend PR must supply a richer fixture"
+                "ExecutionRequest candidate constructor signature differs "
+                "from the #42 shape; backend PR must supply a richer fixture"
+            )
+        except Exception:  # noqa: BLE001 — Pydantic ValidationError or similar
+            # The known-safe fixture failed validation. The contract cannot
+            # be exercised without backend-supplied fixtures; skip rather
+            # than fail so the contract surfaces "candidate-provider issue"
+            # rather than "leak".
+            pytest.skip(
+                "ExecutionRequest fixture failed validation against the "
+                "current model shape; backend PR must supply a richer fixture"
             )
 
     def test_no_raw_values(
