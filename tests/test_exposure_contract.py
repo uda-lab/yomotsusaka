@@ -76,8 +76,9 @@ from yomotsusaka.boundary import (
     search_request,
     status_report_request,
 )
+from yomotsusaka.redactor import Span, redact
 from yomotsusaka.schemas import DocumentManifest, EntityKind
-from yomotsusaka.search_gateway import SearchGateway
+from yomotsusaka.search_gateway import QueryResolver, SearchGateway
 
 from tests._exposure_denylist import (
     CANONICAL_SPANS,
@@ -542,6 +543,65 @@ def test_search_response_with_raw_value_queries_yields_no_leak(
         assert response.hits == []
         for blob in _both_json_renders(response):
             _assert_no_raw_values(blob, surface=f"SearchResponse(query={needle!r})")
+
+
+def _make_resolver_indexed_gateway(
+    vault_root: Path, doc_id: str
+) -> SearchGateway:
+    """Build a :class:`SearchGateway` with a populated :class:`QueryResolver`.
+
+    Reproduces the canonical pipeline's redaction to recover the same
+    :class:`PrivateDictEntry` objects an in-process caller would have
+    handed the resolver at index time. This is the resolver-attached
+    twin of :func:`_make_indexed_gateway`.
+    """
+    kernel_spans = [Span(start=s.start, end=s.end, kind=s.kind) for s in CANONICAL_SPANS]
+    _, _, private_dict = redact(CANONICAL_TEXT, kernel_spans)
+    manifest = DocumentManifest.model_validate_json(
+        (vault_root / "manifests" / f"{doc_id}.json").read_text(encoding="utf-8")
+    )
+    resolver = QueryResolver()
+    gateway = SearchGateway(query_resolver=resolver)
+    gateway.index(manifest, private_entries=private_dict)
+    return gateway
+
+
+def test_search_response_with_resolver_translates_raw_query_without_leak(
+    canonical_vault: tuple[Path, ProcessResponse, PublicHandle],
+) -> None:
+    """Resolver-attached path (#48 / architecture.md §12.3): when a raw
+    private value matches a registered entry, the gateway returns a hit
+    via the *translated* key — but the serialised response body still
+    must NOT echo the raw value anywhere (snippet, handle, label, or
+    any nested field). This is the resolver-side counterpart to the
+    pre-resolver zero-hit leakage check above."""
+    vault_root, _response, _handle = canonical_vault
+    gateway = _make_resolver_indexed_gateway(vault_root, "exposure-doc-001")
+
+    for needle in RAW_VALUES:
+        response = search_request(SearchRequest(query=needle), gateway=gateway)
+        # With the resolver attached, the raw value DOES match (via the
+        # translated key); the privacy invariant is that the response
+        # never echoes the raw value, not that hits are absent.
+        assert isinstance(response, SearchResponse)
+        for blob in _both_json_renders(response):
+            _assert_no_raw_values(
+                blob,
+                surface=f"SearchResponse(resolver,query={needle!r})",
+            )
+            _assert_no_paths(
+                blob,
+                surface=f"SearchResponse(resolver,query={needle!r})",
+                extra=_scrub_for_path_assertion(vault_root),
+            )
+        # Recursively sweep every string leaf of the JSON-mode payload
+        # for raw values too — this would catch a leak via a key name
+        # (in case a future field used a raw value as a dict key).
+        for leaf in _iter_strings(response.model_dump(mode="json")):
+            _assert_no_raw_values(
+                leaf,
+                surface=f"SearchResponse.leaf(resolver,query={needle!r})",
+            )
 
 
 # ---------------------------------------------------------------------------

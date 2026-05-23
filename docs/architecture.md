@@ -903,6 +903,8 @@ Queries themselves may contain private information. For example, a user may ask 
 
 Therefore, the search gateway should treat the query as private input. It may translate raw query terms into internal keys before searching the redacted index. This keeps the agent-facing search interaction centred on keys and labels rather than raw values.
 
+The local MVP implements this translation via the private-side `QueryResolver` interface in [`search_gateway.py`](../src/yomotsusaka/search_gateway.py) (see `SearchGateway(query_resolver=...)` and `SearchGateway.index(manifest, private_entries=...)`); the resolver is populated in-memory by the caller from already-materialised `PrivateDictEntry` objects, has no agent-facing reverse-lookup surface, and is not re-exported through `yomotsusaka.boundary`.
+
 ### 12.4 Implementation posture
 
 The MVP does not need a sophisticated search engine. The initial implementation may use a simple full-text index over redacted documents and manifests. The architecture should only require that the search backend can be replaced later.
