@@ -618,6 +618,23 @@ def test_unknown_profile_on_loaded_table_denies_with_policy_denied(
     assert resp.reason is RestorationFailureReason.PolicyDenied
     assert calls == []
 
+    # The deny path must still emit one audit record with the policy
+    # columns populated, even when the deny is the "unknown profile"
+    # special case (which reports the default row's name on
+    # ``policy_matched_profile`` — see ``RestorationPolicyTable.evaluate``
+    # for the rationale). The requested-but-unknown profile name shows
+    # up in ``response.detail`` rather than the audit column.
+    lines = _audit_lines(vault_root)
+    assert len(lines) == 1
+    rec = lines[0]
+    assert rec["audit_record_id"] == resp.audit_record_id
+    assert rec["outcome"] == "failed"
+    assert rec["failure_reason"] == "policy_denied"
+    assert rec["policy_verdict"] == "deny"
+    assert rec["policy_matched_profile"] == "_default_local"
+    assert resp.detail is not None
+    assert "ghost-profile" in resp.detail
+
 
 def test_policy_denied_target_via_public_handle_still_audits_document_id(
     tmp_path: Path,

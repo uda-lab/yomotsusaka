@@ -329,6 +329,14 @@ class RestorationPolicyTable:
                     row = self._rows_by_name[self._default_name]
                     matched = self._default_name
                 else:
+                    # ``matched_profile`` on this branch reports the
+                    # *default row name*, not the requested-but-unknown
+                    # profile. The unrecognised value appears verbatim in
+                    # ``deny_reason`` (and therefore in
+                    # ``RestorationResponse.detail``); an audit reader
+                    # who needs to know which profile the caller asked
+                    # for should consult that field rather than
+                    # ``policy_matched_profile``.
                     return PolicyDecision(
                         verdict="deny",
                         matched_profile=self._default_name,
