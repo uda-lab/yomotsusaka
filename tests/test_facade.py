@@ -477,8 +477,17 @@ def test_facade_execute_delegates_to_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``LocalFacade.execute`` must call :func:`boundary.execute_request`
-    exactly once, passing the request positionally and the held
-    :class:`TenantScope` as the ``tenant`` keyword."""
+    exactly once, passing a scope-pinned copy of the request positionally
+    and the held :class:`TenantScope` as the ``tenant`` keyword.
+
+    The facade owns the privilege ceiling: every other field on the request
+    flows through unchanged, but ``scope`` is overridden to
+    :attr:`ExecutionScope.ORDINARY_AGENT` so the caller cannot widen privilege
+    via the ordinary-agent facade. This test pins the field-by-field
+    invariant; the dedicated
+    ``test_facade_execute_pins_scope_to_ordinary_agent`` test below pins the
+    privilege-ceiling intent.
+    """
     from yomotsusaka import facade as facade_mod
 
     captured: dict[str, object] = {}
@@ -508,10 +517,77 @@ def test_facade_execute_delegates_to_boundary(
 
     assert response is sentinel
     assert captured["call_count"] == 1
-    assert captured["request"] is req
+    # The forwarded request is a scope-pinned copy; every other field is
+    # preserved verbatim. Identity-equality (``is req``) is intentionally
+    # NOT asserted — the facade owns the privilege-ceiling override, so it
+    # must not forward the original object.
+    forwarded = captured["request"]
+    assert isinstance(forwarded, ExecutionRequest)
+    assert forwarded.scope is ExecutionScope.ORDINARY_AGENT
+    assert forwarded.job_name == req.job_name
+    assert forwarded.purpose == req.purpose
+    assert forwarded.inputs == req.inputs
     assert captured["tenant"] is facade._tenant
     # The facade must not also pass vault_root; that would double-bind.
     assert captured["vault_root"] is None
+
+
+def test_facade_execute_pins_scope_to_ordinary_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Privilege-ceiling invariant: even when the caller constructs an
+    :class:`ExecutionRequest` whose ``scope`` is the narrower private
+    value, the facade MUST override it to
+    :attr:`ExecutionScope.ORDINARY_AGENT` before delegating. This is the
+    P1 regression marker for the codex review on PR #80 (issue #73): the
+    facade is the ordinary-agent entry point and must not forward
+    caller-supplied scope unchecked.
+    """
+    from yomotsusaka import facade as facade_mod
+
+    captured: dict[str, object] = {}
+    sentinel = ExecutionResponse(
+        audit_record_id="audit-sentinel",
+        status="failed",
+        artifacts=[],
+        scrubbed_stdout="",
+        scrubbed_stderr="",
+        reason=None,
+        detail=None,
+    )
+
+    def _spy(request: object, *, tenant: object = None, vault_root: object = None) -> ExecutionResponse:  # noqa: ARG001
+        captured["request"] = request
+        return sentinel
+
+    monkeypatch.setattr(facade_mod, "execute_request", _spy)
+
+    # Caller constructs the request with the narrower scope value — a
+    # malicious or buggy caller path. The facade MUST NOT honour that.
+    # We build the narrower-scope request without naming the literal
+    # ``ExecutionScope.PRIVATE_BOUNDARY`` here (the privacy substring scan
+    # on ``facade.py`` does not extend to the tests, but the test reads
+    # clearly without coupling to that string anyway).
+    narrower_scope = next(
+        s for s in ExecutionScope if s is not ExecutionScope.ORDINARY_AGENT
+    )
+    caller_request = ExecutionRequest(
+        job_name="summarise_private_minutes",
+        purpose="privilege-ceiling-test",
+        scope=narrower_scope,
+        inputs={"target_handle": "private://agent_redacted/manifest/exec-doc"},
+    )
+
+    vault = tmp_path / "vault"
+    facade = LocalFacade(vault)
+    facade.execute(caller_request)
+
+    forwarded = captured["request"]
+    assert isinstance(forwarded, ExecutionRequest)
+    assert forwarded.scope is ExecutionScope.ORDINARY_AGENT, (
+        "facade.execute must override scope to ORDINARY_AGENT; the caller "
+        "supplied a narrower scope and the facade forwarded it unchanged"
+    )
 
 
 def test_facade_execute_ordinary_agent_scope_denied(tmp_path: Path) -> None:
