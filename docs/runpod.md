@@ -2,13 +2,16 @@
 
 ## Status
 
-The RunPod path described in this document is **documented but not exercised
-by the local MVP**. `src/yomotsusaka/runpod_lifecycle.py`,
-`src/yomotsusaka/execution_gateway.py`, and `src/yomotsusaka/transfer.py`
-ship as no-op stubs that log a warning and return placeholder values; the
-local MVP runs CPU-only with `DummyBackend`. Real RunPod SDK / REST calls,
-gateway policy enforcement, and remote transfer backends remain out of
-scope until a child issue scopes them. See
+`src/yomotsusaka/runpod_lifecycle.py` and `src/yomotsusaka/vllm_backend.py`
+ship a real **attach-mode** path as of issue #46: the owner provisions a
+RunPod Pod manually, exports `RUNPOD_POD_ID` / `RUNPOD_POD_ENDPOINT`, and
+`AttachRunPodLifecycle` + `VLLMBackend` drive `/health` and
+`POST /v1/chat/completions` against that Pod. The default `mock` mode
+remains no-network; the `manage` mode (full Pod creation/destruction)
+remains `NotImplementedError` pending a follow-up issue that scopes
+Pod-runtime cost control. `src/yomotsusaka/execution_gateway.py` and
+`src/yomotsusaka/transfer.py` remain stubs. The local MVP still runs
+CPU-only with `DummyBackend` by default; `VLLMBackend` is opt-in. See
 [`docs/scaffold-status.md`](scaffold-status.md) for the canonical module
 classification table.
 
@@ -125,6 +128,24 @@ If using the default key:
 
 ```bash
 POD_ID="<your-pod-id>"; curl -s "http://127.0.0.1:8000/v1/chat/completions" -H "Authorization: Bearer sk-${POD_ID}" -H "Content-Type: application/json" -d '{"model":"Qwen/Qwen3-8B","messages":[{"role":"user","content":"日本語で短く自己紹介してください。"}],"temperature":0.2,"max_tokens":128}' | jq -r '.choices[0].message.content'
+```
+
+### Smoke script
+
+For testing from the local machine against a Pod accessed via the RunPod
+proxy, `scripts/smoke_runpod.py` issues the same single chat-completion
+through `VLLMBackend`. The script refuses to run unless
+`RUNPOD_LIVE_SMOKE=1` is set, and on success prints the first 80 chars of
+the response. It is **owner-only and explicitly NOT a CI merge gate** —
+see issue #46 metaplan Fork 8 for the rationale (cost control: the L1 +
+L2 mocked tests under `tests/test_vllm_backend.py` and
+`tests/test_runpod_lifecycle.py` are the merge gate).
+
+```bash
+RUNPOD_LIVE_SMOKE=1 \
+    VLLM_ENDPOINT=https://<pod-id>-8000.proxy.runpod.net \
+    VLLM_API_KEY=sk-<pod-id-or-override> \
+    python3 scripts/smoke_runpod.py
 ```
 
 ## 8. Cost Interpretation
