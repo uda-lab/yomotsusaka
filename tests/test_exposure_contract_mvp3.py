@@ -1,7 +1,7 @@
 """MVP-3 widening of the §29 exposure-contract scan (issue #47).
 
 This module sits beside :mod:`tests.test_exposure_contract` (the 25-test
-MVP-2 scan) and extends it with six abstract contract classes — one per
+MVP-2 scan) and extends it with five abstract contract classes — one per
 new agent-facing surface introduced by RunPod (#46), vLLM (#46), the
 execution gateway (#42), and the Chikaeshi dispatcher (#43):
 
@@ -11,7 +11,15 @@ execution gateway (#42), and the Chikaeshi dispatcher (#43):
 4. ``ContractExecutionDispatcher`` — execution dispatcher results & scrubbed I/O
 5. ``ContractRestorationAuditEcho`` — restoration audit ``policy_profile`` /
    ``approval_ticket`` echoes
-6. ``ContractTenantScopedVaultPath`` — tenant-scoped vault paths
+
+The MVP-3 tenant-scoped vault-path contract (formerly
+``ContractTenantScopedVaultPath``) was removed by issue #75 as part of the
+test-hardening sweep that absorbed issues #65, #66, #67. The
+:class:`AttachRunPodLifecycle` constructor does not accept a ``tenant_id``
+kwarg and multi-tenant routing is not on the MVP-3 roadmap; the contract
+was vacuously skipping every assertion. When tenant scoping does land,
+re-introduce a per-surface contract here with a real candidate-provider
+fixture rather than the old no-args constructor probe.
 
 The §5 non-weakening clause in :doc:`docs/backend-promotion.md` requires
 that the scan be widened **before** the surface lands. Until the matching
@@ -605,33 +613,15 @@ class ContractExecutionDispatcher:
         blob = _walk_payload_strings(result)
         _assert_no_tenant_path_leak(blob, surface="execute_request")
 
-    def test_provider_injects_sentinel(
-        self, execution_dispatcher_candidate_provider: Any
-    ) -> None:
-        """Meta-assertion: the candidate provider's pre-scrub byte stream
-        MUST contain :data:`MOCK_UNSCRUBBED_SENTINELS`. A candidate that
-        forgets to inject the sentinel makes :meth:`test_no_raw_values`
-        pass vacuously — the scrubber could be a no-op. Backends expose a
-        ``raw_stream()`` / ``unscrubbed_bytes()`` attribute on the
-        dispatcher for this introspection.
-        """
-        execute = execution_dispatcher_candidate_provider
-        raw_stream_fn = getattr(execute, "_unscrubbed_bytes_for_tests", None)
-        if not callable(raw_stream_fn):
-            pytest.skip(
-                "candidate dispatcher does not expose "
-                "`_unscrubbed_bytes_for_tests`; backend PR must add it to "
-                "prove its scrubber is non-trivial (see #47 risk note)"
-            )
-        raw = raw_stream_fn()
-        raw_str = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
-        injected = [s for s in MOCK_UNSCRUBBED_SENTINELS if s in raw_str]
-        assert injected, (
-            "candidate dispatcher's pre-scrub bytes contain none of "
-            f"{MOCK_UNSCRUBBED_SENTINELS!r}; backend PR must inject at "
-            "least one sentinel so the scrubber-strips-it assertion is "
-            "non-vacuous"
-        )
+    # NOTE (issue #75 absorbing #65): the former
+    # ``test_provider_injects_sentinel`` introspection method was removed
+    # in the test-hardening sweep. It required the dispatcher to expose
+    # an ``_unscrubbed_bytes_for_tests`` attribute that was never part of
+    # any shipping contract; the method skipped vacuously in every CI
+    # run. Non-vacuity for the scrub-strips-sentinel invariant is now
+    # carried directly by :mod:`tests.test_execution_gateway` (which
+    # drives a real template with sentinel-bearing stdout/stderr), not by
+    # an attribute on the dispatcher.
 
 
 class ContractRestorationAuditEcho:
@@ -702,60 +692,14 @@ class ContractRestorationAuditEcho:
         _assert_no_tenant_path_leak(blob, surface="restoration_audit_echo")
 
 
-class ContractTenantScopedVaultPath:
-    """Abstract contract for tenant-scoped vault path exposure.
-
-    A future tenant-aware vault layout will need to keep the tenant id
-    vault-side; this contract pre-pins that invariant. Currently the
-    fixture used to drive every other surface is single-tenant, so this
-    class skips on the same handshake attributes — the RunPod / vLLM PRs
-    are the natural place to introduce tenant scoping. The skip-reason
-    cites #46 because that is the first backend likely to need
-    multi-tenant routing.
-    """
-
-    def _make_tenant_scoped_response(self, candidate_provider: Any) -> Any:
-        """Default: call the provider with a sentinel tenant_id kwarg."""
-        runpod_attach = candidate_provider
-        try:
-            return runpod_attach(tenant_id=MOCK_TENANT_ID_SENTINELS[0])
-        except TypeError:
-            pytest.skip(
-                "candidate provider does not accept tenant_id kwarg yet; "
-                "tenant-scoping arrives with #46 or a follow-up"
-            )
-
-    def test_no_tenant_path_leak(self, runpod_candidate_provider: Any) -> None:
-        response = self._make_tenant_scoped_response(runpod_candidate_provider)
-        blob = _walk_payload_strings(response)
-        _assert_no_tenant_path_leak(blob, surface="tenant_scoped_vault_path")
-
-    def test_no_raw_values(self, runpod_candidate_provider: Any) -> None:
-        response = self._make_tenant_scoped_response(runpod_candidate_provider)
-        blob = _walk_payload_strings(response)
-        _assert_no_raw_values(blob, surface="tenant_scoped_vault_path")
-
-    def test_no_vault_paths(
-        self, runpod_candidate_provider: Any, tmp_path: Path
-    ) -> None:
-        response = self._make_tenant_scoped_response(runpod_candidate_provider)
-        blob = _walk_payload_strings(response)
-        _assert_no_vault_paths(
-            blob,
-            surface="tenant_scoped_vault_path",
-            extra=(str(tmp_path), str(tmp_path.resolve())),
-        )
-
-    def test_locator_round_trip(self, runpod_candidate_provider: Any) -> None:
-        """Tenant-scoped surfaces must still emit opaque locators only.
-        Any locator-shaped string in the response payload must round-trip
-        through :func:`parse_locator`."""
-        response = self._make_tenant_scoped_response(runpod_candidate_provider)
-        blob = _walk_payload_strings(response)
-        for token in blob.split():
-            _assert_locator_or_skip(
-                token.strip('"').strip(","), surface="tenant_scoped_vault_path"
-            )
+# NOTE (issue #75 absorbing #65): ``ContractTenantScopedVaultPath`` and its
+# concrete subclass ``TestTenantScopedVaultPathContract`` were removed in
+# the test-hardening sweep. The class probed
+# :class:`AttachRunPodLifecycle` for a ``tenant_id`` kwarg that does not
+# exist and is not on the MVP-3 roadmap; every assertion skipped
+# vacuously. When multi-tenant routing lands, re-introduce the contract
+# here with a real candidate-provider fixture (NOT a no-args constructor
+# probe) so the surface is non-vacuously scanned for tenant-id leakage.
 
 
 # ---------------------------------------------------------------------------
@@ -796,6 +740,31 @@ class TestPodHandleContract(ContractPodHandle):
         assert _real_handle.pod_id == MOCK_POD_ID_SENTINELS[0]
         assert _real_handle.endpoint == MOCK_ENDPOINT_URL_SENTINELS[0]
         return {}
+
+    def test_locator_round_trip(self, runpod_candidate_provider: Any) -> None:
+        """Issue #65 / #75: assert the never-expose projection directly.
+
+        Per the metaplan Fork 6 handshake, :class:`PodHandle` is
+        ``never_expose``: the agent-facing projection is the empty
+        mapping (see :meth:`_make_handle`). The base-class
+        :meth:`ContractPodHandle.test_locator_round_trip` skips on a
+        non-pydantic projection, which made this assertion vacuous.
+
+        Override here to assert the absence-of-locator invariant
+        explicitly so a future regression that widens the projection
+        without going through ``EXPECTED_BOUNDARY_SYMBOLS`` fails this
+        test instead of silently passing.
+        """
+        handle = self._make_handle(runpod_candidate_provider)
+        assert handle == {}, (
+            "PodHandle agent-facing projection must remain the empty "
+            "mapping until a backend PR widens the surface through "
+            "EXPECTED_BOUNDARY_SYMBOLS; saw a non-empty projection that "
+            "may carry private state"
+        )
+        # An empty mapping carries zero locator-shaped strings, so the
+        # round-trip count is trivially satisfied. The structural pin is
+        # the empty-mapping assertion above.
 
 
 class TestVLLMBackendContract(ContractVLLMBackend):
@@ -1028,19 +997,9 @@ class TestRestorationAuditEchoContract(ContractRestorationAuditEcho):
             )
 
 
-class TestTenantScopedVaultPathContract(ContractTenantScopedVaultPath):
-    """Activates when #46 lands :class:`AttachRunPodLifecycle` (tenant
-    scoping arrives with the first multi-tenant backend).
-
-    The MVP-3 :class:`AttachRunPodLifecycle` does NOT yet accept a
-    ``tenant_id`` kwarg — multi-tenant routing is reserved for a follow-up
-    backend per metaplan Fork 6 (the contract is pre-pinned to catch
-    leakage the moment tenant_id-aware fixtures land). The default
-    :meth:`_make_tenant_scoped_response` catches the resulting
-    ``TypeError`` and skips with a citation, so the contract stays
-    activated-but-skipped for tenant scoping while activating fully for
-    every other PodHandle invariant.
-    """
+# NOTE (issue #75): ``TestTenantScopedVaultPathContract`` was deleted —
+# see the docstring on the deleted ``ContractTenantScopedVaultPath``
+# above for the rationale and the re-introduction plan.
 
 
 # ---------------------------------------------------------------------------

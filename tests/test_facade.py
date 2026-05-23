@@ -44,6 +44,12 @@ from yomotsusaka.boundary import (
     inspect_request,
     restoration_request,
 )
+from yomotsusaka.execution_gateway import (
+    ExecutionFailureReason,
+    ExecutionRequest,
+    ExecutionResponse,
+    ExecutionScope,
+)
 from yomotsusaka.facade import LocalFacade as DirectLocalFacade
 from yomotsusaka.schemas import DocumentManifest, EntityKind
 from yomotsusaka.search_gateway import SearchGateway
@@ -355,8 +361,51 @@ def test_facade_module_does_not_name_private_boundary_scope() -> None:
     )
 
 
+def test_facade_module_does_not_name_execution_private_boundary_scope() -> None:
+    """``facade.py`` MUST NOT name ``ExecutionScope.PRIVATE_BOUNDARY``
+    anywhere. The facade's ``execute`` method is hard-wired to ordinary-agent
+    semantics; callers needing private-boundary execution invoke
+    :func:`boundary.execute_request` directly. Mirrors the existing
+    ``ResolverScope.PRIVATE_BOUNDARY`` absence assertion."""
+    facade_source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "yomotsusaka"
+        / "facade.py"
+    ).read_text(encoding="utf-8")
+    # The substring guard catches both ``ResolverScope.PRIVATE_BOUNDARY`` and
+    # ``ExecutionScope.PRIVATE_BOUNDARY``; this assertion exists as an
+    # explicit, separately-named regression marker for the execute path.
+    assert "ExecutionScope.PRIVATE_BOUNDARY" not in facade_source, (
+        "facade.py must not construct or reference "
+        "ExecutionScope.PRIVATE_BOUNDARY"
+    )
+
+
+def test_facade_module_does_not_import_private_side_modules() -> None:
+    """``facade.py`` MUST NOT import :mod:`yomotsusaka.templates`,
+    :mod:`yomotsusaka.scrubber`, or :mod:`yomotsusaka.audit`. Those are
+    private-side modules; the boundary already owns them, and the facade is
+    a pure delegator over the already-public surface."""
+    facade_source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "yomotsusaka"
+        / "facade.py"
+    ).read_text(encoding="utf-8")
+    for forbidden in (
+        "yomotsusaka.templates",
+        "yomotsusaka.scrubber",
+        "yomotsusaka.audit",
+    ):
+        assert forbidden not in facade_source, (
+            f"facade.py must not reference {forbidden!r}; route through "
+            "boundary.* instead"
+        )
+
+
 def test_facade_exposes_only_documented_methods() -> None:
-    """Mechanical drift guard: the facade exposes exactly the five
+    """Mechanical drift guard: the facade exposes exactly the six
     documented public methods and the two read-only properties. No
     ``resolve``, ``private_state``, ``audit_log``, or ``restore`` surface."""
     public = {
@@ -365,11 +414,12 @@ def test_facade_exposes_only_documented_methods() -> None:
         if not name.startswith("_")
     }
     expected = {
-        # The five operations.
+        # The six operations.
         "process",
         "inspect",
         "search",
         "request_restore",
+        "execute",
         "status_report",
         # Read-only properties.
         "vault_root",
@@ -384,3 +434,268 @@ def test_facade_exposes_only_documented_methods() -> None:
         assert forbidden not in public, (
             f"facade exposes a forbidden surface: {forbidden!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# execute() — Chikaeshi delegator (issue #73)
+# ---------------------------------------------------------------------------
+
+
+def _execute_request(
+    job_name: str = "summarise_private_minutes",
+    *,
+    locator: str = "private://agent_redacted/manifest/exec-doc",
+) -> ExecutionRequest:
+    """Build an ``ExecutionRequest`` whose ``scope`` is ORDINARY_AGENT.
+
+    The facade is hard-wired to ordinary-agent semantics, so every shipped
+    template's ``min_scope=PRIVATE_BOUNDARY`` requirement is denied at the
+    dispatcher's scope gate (the spec's whole reason for not adding a
+    private-scope code path through the facade)."""
+    return ExecutionRequest(
+        job_name=job_name,
+        purpose="facade-execute-test",
+        scope=ExecutionScope.ORDINARY_AGENT,
+        inputs={"target_handle": locator},
+    )
+
+
+def _read_audit_lines(vault: Path) -> list[dict[str, object]]:
+    import json
+
+    audit_path = vault / "audit" / "restoration.jsonl"
+    if not audit_path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_facade_execute_delegates_to_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``LocalFacade.execute`` must call :func:`boundary.execute_request`
+    exactly once, passing a scope-pinned copy of the request positionally
+    and the held :class:`TenantScope` as the ``tenant`` keyword.
+
+    The facade owns the privilege ceiling: every other field on the request
+    flows through unchanged, but ``scope`` is overridden to
+    :attr:`ExecutionScope.ORDINARY_AGENT` so the caller cannot widen privilege
+    via the ordinary-agent facade. This test pins the field-by-field
+    invariant; the dedicated
+    ``test_facade_execute_pins_scope_to_ordinary_agent`` test below pins the
+    privilege-ceiling intent.
+    """
+    from yomotsusaka import facade as facade_mod
+
+    captured: dict[str, object] = {}
+    sentinel = ExecutionResponse(
+        audit_record_id="audit-sentinel",
+        status="failed",
+        artifacts=[],
+        scrubbed_stdout="",
+        scrubbed_stderr="",
+        reason=None,
+        detail=None,
+    )
+
+    def _spy(request: object, *, tenant: object = None, vault_root: object = None) -> ExecutionResponse:
+        captured["request"] = request
+        captured["tenant"] = tenant
+        captured["vault_root"] = vault_root
+        captured["call_count"] = captured.get("call_count", 0) + 1  # type: ignore[operator]
+        return sentinel
+
+    monkeypatch.setattr(facade_mod, "execute_request", _spy)
+
+    vault = tmp_path / "vault"
+    facade = LocalFacade(vault)
+    req = _execute_request()
+    response = facade.execute(req)
+
+    assert response is sentinel
+    assert captured["call_count"] == 1
+    # The forwarded request is a scope-pinned copy; every other field is
+    # preserved verbatim. Identity-equality (``is req``) is intentionally
+    # NOT asserted — the facade owns the privilege-ceiling override, so it
+    # must not forward the original object.
+    forwarded = captured["request"]
+    assert isinstance(forwarded, ExecutionRequest)
+    assert forwarded.scope is ExecutionScope.ORDINARY_AGENT
+    assert forwarded.job_name == req.job_name
+    assert forwarded.purpose == req.purpose
+    assert forwarded.inputs == req.inputs
+    assert captured["tenant"] is facade._tenant
+    # The facade must not also pass vault_root; that would double-bind.
+    assert captured["vault_root"] is None
+
+
+def test_facade_execute_pins_scope_to_ordinary_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Privilege-ceiling invariant: even when the caller constructs an
+    :class:`ExecutionRequest` whose ``scope`` is the narrower private
+    value, the facade MUST override it to
+    :attr:`ExecutionScope.ORDINARY_AGENT` before delegating. This is the
+    P1 regression marker for the codex review on PR #80 (issue #73): the
+    facade is the ordinary-agent entry point and must not forward
+    caller-supplied scope unchecked.
+    """
+    from yomotsusaka import facade as facade_mod
+
+    captured: dict[str, object] = {}
+    sentinel = ExecutionResponse(
+        audit_record_id="audit-sentinel",
+        status="failed",
+        artifacts=[],
+        scrubbed_stdout="",
+        scrubbed_stderr="",
+        reason=None,
+        detail=None,
+    )
+
+    def _spy(request: object, *, tenant: object = None, vault_root: object = None) -> ExecutionResponse:  # noqa: ARG001
+        captured["request"] = request
+        return sentinel
+
+    monkeypatch.setattr(facade_mod, "execute_request", _spy)
+
+    # Caller constructs the request with the narrower scope value — a
+    # malicious or buggy caller path. The facade MUST NOT honour that.
+    # We build the narrower-scope request without naming the literal
+    # ``ExecutionScope.PRIVATE_BOUNDARY`` here (the privacy substring scan
+    # on ``facade.py`` does not extend to the tests, but the test reads
+    # clearly without coupling to that string anyway).
+    narrower_scope = next(
+        s for s in ExecutionScope if s is not ExecutionScope.ORDINARY_AGENT
+    )
+    caller_request = ExecutionRequest(
+        job_name="summarise_private_minutes",
+        purpose="privilege-ceiling-test",
+        scope=narrower_scope,
+        inputs={"target_handle": "private://agent_redacted/manifest/exec-doc"},
+    )
+
+    vault = tmp_path / "vault"
+    facade = LocalFacade(vault)
+    facade.execute(caller_request)
+
+    forwarded = captured["request"]
+    assert isinstance(forwarded, ExecutionRequest)
+    assert forwarded.scope is ExecutionScope.ORDINARY_AGENT, (
+        "facade.execute must override scope to ORDINARY_AGENT; the caller "
+        "supplied a narrower scope and the facade forwarded it unchanged"
+    )
+
+
+def test_facade_execute_ordinary_agent_scope_denied(tmp_path: Path) -> None:
+    """An ordinary-agent caller targeting a private-boundary template gets
+    a typed failure response from the dispatcher's scope gate. No artifacts,
+    no raw values, scrubbed detail."""
+    from yomotsusaka.boundary import process_document_request as _process_document_request
+
+    vault = tmp_path / "vault"
+    doc_id = "exec-facade-scope-001"
+    # Commit a canonical doc so the target locator resolves; the scope gate
+    # fires before resolution but committing first protects this test from
+    # an unrelated ArtifactMissing regression masking the scope-denial.
+    _process_document_request(
+        ProcessRequest(
+            doc_id=doc_id,
+            raw_text=_RAW_TEXT,
+            spans=list(_CANONICAL_SPANS),
+        ),
+        vault_root=vault,
+    )
+    locator = build_locator(
+        exposure_class="agent_redacted",
+        artifact_kind="manifest",
+        opaque_id=doc_id,
+    )
+
+    facade = LocalFacade(vault)
+    response = facade.execute(_execute_request(locator=locator))
+
+    assert isinstance(response, ExecutionResponse)
+    assert response.status == "failed"
+    assert response.reason is ExecutionFailureReason.ScopeDenied
+    assert response.artifacts == []
+    # The detail string is scrubbed (no raw private values).
+    assert response.detail is not None
+    for needle in ("Alice Tan", "Acme Corp", "12345"):
+        assert needle not in response.detail
+    for needle in ("Alice Tan", "Acme Corp", "12345"):
+        assert needle not in response.model_dump_json()
+
+
+def test_facade_execute_audit_row_landed(tmp_path: Path) -> None:
+    """The audit-row-per-call invariant: a single denied ``execute`` call
+    appends exactly one row to ``<vault_root>/audit/restoration.jsonl``."""
+    vault = tmp_path / "vault"
+    facade = LocalFacade(vault)
+    response = facade.execute(_execute_request())
+
+    rows = [
+        row
+        for row in _read_audit_lines(vault)
+        if row.get("request_id") == response.audit_record_id
+    ]
+    assert len(rows) == 1, (
+        f"expected exactly one audit row for request_id="
+        f"{response.audit_record_id}; got {len(rows)}"
+    )
+
+
+def test_facade_execute_template_not_found(tmp_path: Path) -> None:
+    """An unknown ``job_name`` must surface as
+    :data:`ExecutionFailureReason.TemplateNotFound` through the facade —
+    the failure typing of the underlying dispatcher is not remapped."""
+    vault = tmp_path / "vault"
+    facade = LocalFacade(vault)
+    response = facade.execute(_execute_request(job_name="not-a-real-template"))
+
+    assert isinstance(response, ExecutionResponse)
+    assert response.status == "failed"
+    assert response.reason is ExecutionFailureReason.TemplateNotFound
+
+
+def test_facade_execute_uses_held_tenant(tmp_path: Path) -> None:
+    """When the facade is constructed with a :class:`TenantScope`, the
+    audit row for an ``execute`` call must land under that tenant's
+    ``vault_root``."""
+    from yomotsusaka.tenant import TenantScope
+
+    tenant_vault = tmp_path / "tenant-a-vault"
+    tenant = TenantScope(tenant_id="tenant-a", vault_root=tenant_vault)
+    facade = LocalFacade(tenant=tenant)
+    response = facade.execute(_execute_request())
+
+    rows = [
+        row
+        for row in _read_audit_lines(tenant_vault)
+        if row.get("request_id") == response.audit_record_id
+    ]
+    assert len(rows) == 1, (
+        f"expected the audit row for tenant 'tenant-a' to land under "
+        f"{tenant_vault!s}; found {len(rows)} matching rows"
+    )
+
+
+def test_facade_execute_uses_legacy_vault_root(tmp_path: Path) -> None:
+    """The back-compat positional ``vault_root=`` construction shape must
+    still route the audit row to that vault root (Fork 5 invariant)."""
+    legacy_vault = tmp_path / "legacy-vault"
+    facade = LocalFacade(legacy_vault)
+    response = facade.execute(_execute_request())
+
+    rows = [
+        row
+        for row in _read_audit_lines(legacy_vault)
+        if row.get("request_id") == response.audit_record_id
+    ]
+    assert len(rows) == 1, (
+        f"expected the audit row to land under the legacy vault_root "
+        f"{legacy_vault!s}; found {len(rows)} matching rows"
+    )

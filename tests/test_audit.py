@@ -267,3 +267,103 @@ def test_audit_record_accepts_explicit_policy_fields_for_future_44(
     )
     assert record.policy_profile == "some-profile"
     assert record.approval_ticket == "some-ticket"
+
+
+# ---------------------------------------------------------------------------
+# OSError propagation (issue #67 / #75)
+# ---------------------------------------------------------------------------
+
+
+def test_write_record_propagates_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #67 (absorbed by #75): pin :func:`write_record`'s OSError
+    propagation contract.
+
+    Per the :func:`write_record` docstring: "OSError on filesystem
+    failure (parent unwritable, disk full, etc.). The caller is expected
+    to map this to a structured failure response." The MVP-2 callers
+    (notably :func:`boundary.restoration_request` and
+    :func:`boundary.execute_request`) DEPEND on this contract — they
+    catch ``OSError`` explicitly to translate into
+    :data:`RestorationFailureReason.AuditWriteFailed` /
+    :data:`ExecutionFailureReason.AuditWriteFailed` outcomes (see
+    `boundary.py` steps (c)/(d) and `execution_gateway` audit-first
+    branches). Pinning the contract here ensures a future refactor that
+    swallows or re-raises a different exception type is caught loudly.
+
+    Strategy: monkeypatch :meth:`pathlib.Path.open` to raise ``OSError``
+    when invoked in append-mode on the audit file, then assert:
+
+    1. The exception propagates (no swallowing).
+    2. The audit file is NOT created (no partial state — the scrubber
+       re-check completes first, then the ``open`` failure stops the
+       call before any byte is written).
+    """
+    vault = tmp_path / "vault"
+    record = _make_record()
+
+    # Pre-create the audit directory so the directory-creation step
+    # succeeds; the failure surface we want to pin is the ``open`` call
+    # in append mode, NOT the ``mkdir`` step (which has its own
+    # ``exist_ok=True`` contract).
+    audit_dir = vault / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = audit_dir / "restoration.jsonl"
+
+    real_open = Path.open
+
+    def _fail_open(self: Path, *args: object, **kwargs: object) -> object:
+        # Fail only when opening the specific audit file for writing.
+        # Other ``Path.open`` calls (e.g. for read in tests, or for the
+        # ``mkdir``-internal probe) keep their original behaviour.
+        mode = ""
+        if args:
+            mode_arg = args[0]
+            if isinstance(mode_arg, str):
+                mode = mode_arg
+        mode = str(kwargs.get("mode", mode))
+        if self == audit_path and "a" in mode:
+            raise OSError("simulated audit-file write failure")
+        return real_open(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "open", _fail_open)
+
+    with pytest.raises(OSError, match="simulated audit-file write failure"):
+        write_record(record, vault)
+
+    # The append target must not exist (no partial-line state). If the
+    # test setup pre-created the directory only, the file itself must
+    # remain absent.
+    assert not audit_path.exists(), (
+        "OSError on append must not leave a partial restoration.jsonl on "
+        "disk; the writer is expected to fail before the first byte is "
+        "appended"
+    )
+
+
+@pytest.mark.skip(
+    reason=(
+        "Issue #67 (absorbed by #75): single-process invariant per "
+        "architecture §11.3; the multi-process concurrent-write contract "
+        "is future work (no file lock today). Placeholder stub kept so a "
+        "future locking PR has an existing test slot to populate."
+    )
+)
+def test_write_record_concurrent_writes_future_work() -> None:
+    """Placeholder for the concurrent-writes contract.
+
+    The current writer takes no file lock; ``docs/architecture.md``
+    §11.3 documents a single-process invariant. A future child that adds
+    a lock (or migrates to an SQLite-backed audit store) should populate
+    this slot with a real concurrent-writer test asserting that two
+    interleaved :func:`write_record` calls produce two distinct lines
+    with no torn writes.
+
+    This stub is intentionally a hard ``skip``, not an ``xfail`` —
+    there is no implementation today and no agreed semantics to assert
+    against, so even an ``xfail`` would be ambiguous.
+    """
+    raise NotImplementedError(
+        "concurrent-write contract pending; see docstring for re-introduction plan"
+    )

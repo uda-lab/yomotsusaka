@@ -7,9 +7,17 @@ ship a real **attach-mode** path as of issue #46: the owner provisions a
 RunPod Pod manually, exports `RUNPOD_POD_ID` / `RUNPOD_POD_ENDPOINT`, and
 `AttachRunPodLifecycle` + `VLLMBackend` drive `/health` and
 `POST /v1/chat/completions` against that Pod. The default `mock` mode
-remains no-network; the `manage` mode (full Pod creation/destruction)
-remains `NotImplementedError` pending a follow-up issue that scopes
-Pod-runtime cost control. `src/yomotsusaka/execution_gateway.py` and
+remains no-network. The `manage` mode (full Pod creation/destruction) is
+now implemented by `ManageRunPodLifecycle` (issue #76, closes #70): it
+issues the create → wait-for-health → delete lifecycle against the
+RunPod REST API using `RUNPOD_API_KEY` from env, with cost-controlled
+delete-by-default behaviour. The L1/L2 mocked tests under
+`tests/test_runpod_lifecycle.py` are the merge gate; the L3
+owner-runnable live test gated by `RUNPOD_MANAGE_LIVE=1` is explicitly
+NOT a CI merge gate. See
+[`docs/runpod-agent-lifecycle.md`](runpod-agent-lifecycle.md) for the
+agent-runnable runbook and owner/agent responsibility split.
+`src/yomotsusaka/execution_gateway.py` and
 `src/yomotsusaka/transfer.py` remain stubs. The local MVP still runs
 CPU-only with `DummyBackend` by default; `VLLMBackend` is opt-in. See
 [`docs/scaffold-status.md`](scaffold-status.md) for the canonical module
@@ -220,6 +228,14 @@ Manual or semi-manual Pod operation. Useful for testing vLLM, schemas, extractio
 ### Batch mode
 
 Later, a scheduler can start a Pod, run a batch job, return outputs, and stop the Pod. This should remain a thin automation layer until real operational needs justify more complexity.
+
+The `manage` mode landed in issue #76 is the first thin slice of this
+automation: `ManageRunPodLifecycle` exposes a cost-controlled create →
+wait → smoke → delete loop intended to be run from inside the dev
+container by an agent, with the owner injecting `RUNPOD_API_KEY` and
+spot-checking the RunPod console after the run reports `lifecycle:
+deleted`. See [`docs/runpod-agent-lifecycle.md`](runpod-agent-lifecycle.md)
+for the full runbook.
 
 ## 12. Current Recommendation
 

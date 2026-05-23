@@ -412,6 +412,8 @@ Expected outputs:
 
 This boundary should expose a stable schema. The backend model may be replaced without changing downstream storage or access-control logic.
 
+In the local MVP, this boundary is wired by [`src/yomotsusaka/span_proposer.py`](../src/yomotsusaka/span_proposer.py) (issue #72): `DeterministicSpanProposer` is the LLM-free default driver for the redact → validate → commit pipeline, and `InferenceBackedSpanProposer` is the opt-in seat that delegates to an `InferenceBackend` (with `VLLMBackend` available behind it when the owner has provisioned a Pod). The span proposer is private-side only; it MUST NOT be imported by `yomotsusaka.boundary`. The architectural framing in this section is unchanged — only the implementation link has settled.
+
 ### 5.4 Redaction and keying boundary
 
 Responsible for converting candidate spans into stable private references.
@@ -734,6 +736,8 @@ The VPS-side scheduler should:
 
 The system should assume that RunPod may fail or disappear. The VPS-side queue remains the source of truth.
 
+The local MVP realises this lifecycle through three modes selected by `YOMOTSUSAKA_RUNPOD_MODE`: `mock` (no network, the CI default), `attach` (owner-provisioned Pod attached via `RUNPOD_POD_ID` / `RUNPOD_POD_ENDPOINT`), and `manage` (agent-managed create → wait → delete via the RunPod REST API). The `manage` mode is implemented by `ManageRunPodLifecycle` (issue #76, closes #70) with the cost-controlled default of deleting the Pod after the run so an agent invocation cannot leave a paid Pod running by mistake. The agent-runnable smoke and the owner/agent responsibility split are documented in [`docs/runpod-agent-lifecycle.md`](runpod-agent-lifecycle.md); the L3 live test (`RUNPOD_MANAGE_LIVE=1`) is owner-only and explicitly NOT a CI merge gate. Pod IDs, endpoint URLs, RunPod account API keys, and vLLM bearer tokens are `never_expose` and MUST stay out of every log line, exception message, returned `PodHandle` surface, manifest, audit record, and PR comment; that discipline is enforced by the L1 / L2 unit tests under `tests/test_runpod_lifecycle.py` (refer to `docs/runpod-agent-lifecycle.md` for any owner-facing operational example — it is the single doc that holds the full env-var shape).
+
 ### 7.2 Open-weight model backend
 
 The model backend should run locally on the RunPod instance. Candidate runtimes include vLLM or equivalent open-weight inference systems.
@@ -955,6 +959,8 @@ The key architectural point is not the search engine itself. It is the gateway b
 A private execution gateway is a powerful future extension. It should not be part of the first MVP, but the architecture should reserve a clean boundary for it.
 
 The purpose is to let agents request private-data computations without giving the agent direct filesystem access to private data.
+
+The agent-facing entry point is `LocalFacade.execute(request)` (issue #73), which delegates to `yomotsusaka.boundary.execute_request`. The facade pins the request's `scope` to `ExecutionScope.ORDINARY_AGENT` before dispatch, so the caller-supplied scope cannot widen privilege; every shipped template requires the narrower scope and is therefore denied at the ordinary-agent entry point. See [`docs/chikaeshi.md`](chikaeshi.md) for the full §13 specification.
 
 Example uses:
 
