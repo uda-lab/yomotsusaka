@@ -167,16 +167,27 @@ def test_scrub_stream_path_mask_only_json_jsonl_suffixes() -> None:
     ``.jsonl`` would silently re-expose audit-log paths. Pin both
     directions so a future regex change fails this test loudly.
     """
+    # Each fragment uses a distinct base filename so a substring of one
+    # cannot accidentally appear inside another after masking (e.g. a
+    # bare path that is a prefix of a masked sibling). The audit-log
+    # ``.jsonl`` shape is included explicitly per the copilot review on
+    # PR #82: a regression that silently dropped ``.jsonl`` from the
+    # mask regex would otherwise pass this test vacuously.
     text = (
-        "/manifests/foo.txt and /manifests/foo and /manifests/foo.json"
+        "/manifests/aaa.txt then "
+        "/manifests/bbb then "
+        "/manifests/ccc.json then "
+        "/audit/ddd.jsonl"
     )
     scrubbed = scrub_stream(text, [])
-    # The .json form is masked.
-    assert "/manifests/foo.json" not in scrubbed
-    assert "<vault_path>" in scrubbed
-    # The .txt form and the bare-path form pass through.
-    assert "/manifests/foo.txt" in scrubbed
-    assert "/manifests/foo" in scrubbed
+    # The .json and .jsonl forms are masked.
+    assert "/manifests/ccc.json" not in scrubbed
+    assert "/audit/ddd.jsonl" not in scrubbed
+    # Exactly two distinct masked occurrences (one per masked suffix).
+    assert scrubbed.count("<vault_path>") == 2
+    # The .txt form and the bare-path form pass through unchanged.
+    assert "/manifests/aaa.txt" in scrubbed
+    assert "/manifests/bbb" in scrubbed
 
 
 def test_scrub_stream_case_sensitive_replacement() -> None:
