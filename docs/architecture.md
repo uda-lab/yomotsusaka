@@ -516,9 +516,14 @@ def resolve(
     *,
     scope: ResolverScope,
     purpose: str,
-    vault_root: Path,
+    vault_root: Path | None = None,
+    tenant: TenantScope | None = None,
 ) -> ResolverSuccess | ResolverFailure: ...
 ```
+
+Exactly one of `vault_root` or `tenant` must be supplied; see the
+"Tenant scoping (#45)" subsection below for the binding semantics of the
+two-argument shape.
 
 - `locator: str` — the public URI. Not a `PublicHandle` wrapper, so callers
   whose locator arrived via JSON do not need to round-trip through
