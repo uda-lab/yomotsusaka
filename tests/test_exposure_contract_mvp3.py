@@ -55,6 +55,7 @@ from yomotsusaka.boundary import parse_locator
 
 from tests._exposure_denylist import (
     ALL_MVP3_SENTINELS,
+    CANONICAL_SPANS,
     CANONICAL_TEXT,
     MOCK_APPROVAL_TICKET_SENTINELS,
     MOCK_ENDPOINT_URL_SENTINELS,
@@ -850,13 +851,169 @@ class TestExecutionRequestContract(ContractExecutionRequest):
     """Activates when #42 lands :class:`ExecutionRequest`."""
 
 
+# ---------------------------------------------------------------------------
+# Fixture builder for the Chikaeshi dispatcher contracts (#60).
+# ---------------------------------------------------------------------------
+#
+# Both ``TestExecutionDispatcherContract`` and
+# ``TestRestorationAuditEchoContract`` need a real
+# :func:`boundary.execute_request` invocation against a committed canonical
+# manifest. The fixture builder below drives the full public-safe path
+# (process-document → opaque locator → ExecutionRequest → execute_request)
+# end-to-end and returns the :class:`ExecutionResponse` for leak scanning.
+#
+# The vault is materialised under a ``tempfile.TemporaryDirectory`` whose
+# lifetime is bounded by the helper: the audit-log row is written to disk
+# inside the with-block, and the response (a frozen Pydantic model that
+# does not retain a reference to the vault filesystem path) is returned
+# after the directory has been torn down. This keeps each invocation
+# hermetic without forcing the contract-base ``_dispatch`` signature to
+# accept a ``tmp_path`` parameter (which would diverge from the abstract
+# base's no-tmp-path shape and force every other subclass to thread it
+# through).
+#
+# Per issue #60 acceptance criteria:
+#
+# * The dispatcher contract must call ``execute_request`` with a valid
+#   :class:`ExecutionRequest` fixture and not skip on ``TypeError``.
+# * The audit-echo contract must assert ``policy_profile`` /
+#   ``approval_ticket`` are absent / ``None`` rather than skipping when
+#   :func:`execute_request` does not yet accept those kwargs.
+
+
+def _build_canonical_execution_response(*, purpose: str = "exposure-contract-fixture-purpose") -> Any:
+    """Drive a real :func:`boundary.execute_request` against the canonical
+    fixture text and return the resulting :class:`ExecutionResponse`.
+
+    Used by :class:`TestExecutionDispatcherContract` and
+    :class:`TestRestorationAuditEchoContract` so the contracts no longer
+    skip on ``TypeError`` from a no-arg dispatcher invocation. The
+    response is the agent-facing surface scanned for leakage.
+
+    *purpose* is parameterised so a caller can inject a sentinel-bearing
+    purpose string when they want to prove the non-vacuity of a downstream
+    leak scan (e.g. the audit-echo contract injects nothing — it relies on
+    the existing MVP-3 sentinel set being absent from the response).
+    """
+    import tempfile
+    from pathlib import Path as _Path
+
+    from yomotsusaka.boundary import ProcessRequest, execute_request, process_document_request
+    from yomotsusaka.execution_gateway import ExecutionRequest, ExecutionScope
+
+    with tempfile.TemporaryDirectory(prefix="exposure-mvp3-") as vault_dir:
+        vault = _Path(vault_dir) / "vault"
+        # Commit the canonical fixture so a real manifest+private pair
+        # exists for the dispatcher to resolve. The opaque doc_id avoids
+        # any raw-private-value leakage through the locator.
+        process_response = process_document_request(
+            ProcessRequest(
+                doc_id="exposure-contract-fixture-doc-001",
+                raw_text=CANONICAL_TEXT,
+                spans=list(CANONICAL_SPANS),
+            ),
+            vault_root=vault,
+        )
+        handle = process_response.handle
+
+        request = ExecutionRequest(
+            job_name="summarise_private_minutes",
+            purpose=purpose,
+            scope=ExecutionScope.PRIVATE_BOUNDARY,
+            inputs={"target_handle": handle.locator},
+        )
+        response = execute_request(request, vault_root=vault)
+        # ``ExecutionResponse`` is a frozen Pydantic model that does not
+        # carry a back-reference to the on-disk vault, so it is safe to
+        # return after the temporary directory is torn down.
+        return response
+
+
 class TestExecutionDispatcherContract(ContractExecutionDispatcher):
-    """Activates when #43 lands :func:`boundary.execute_request`."""
+    """Activated by #43 (:func:`boundary.execute_request`) and made
+    non-vacuous by #60.
+
+    Drives a real public-safe path (canonical document → opaque locator →
+    :class:`ExecutionRequest` → :func:`boundary.execute_request`) and scans
+    the resulting :class:`ExecutionResponse` for raw private values, vault
+    paths, tenant sentinels, pod ids, endpoint URLs, approval-ticket
+    sentinels, and policy-profile sentinels.
+    """
+
+    def _dispatch(self, candidate_provider: Any) -> Any:
+        # ``candidate_provider`` resolves to :func:`boundary.execute_request`
+        # itself (via the handshake table); it is left unused here because
+        # the fixture builder imports the function directly to drive a full
+        # canonical pipeline. The arity-mismatch skip the abstract base
+        # falls back to (``execute_request()`` with no args) would mask the
+        # fact that #43 has already landed, so the override unconditionally
+        # builds a real fixture.
+        del candidate_provider
+        return _build_canonical_execution_response()
 
 
 class TestRestorationAuditEchoContract(ContractRestorationAuditEcho):
-    """Activates when #43 lands :func:`boundary.execute_request` and the
-    audit-echo path; both arrive together per the issue body's scope."""
+    """Activated by #43 and made non-vacuous by #60.
+
+    :func:`boundary.execute_request` does NOT yet accept
+    ``policy_profile`` / ``approval_ticket`` kwargs (those arrive with
+    #44's restoration-policy work). Per issue #60 scope, the contract
+    asserts they are absent / ``None`` and that the sentinel values do
+    not appear in the agent-facing surface, rather than skipping the
+    whole audit-echo scan.
+    """
+
+    def _make_audit_echo(self, candidate_provider: Any) -> Any:
+        # Same rationale as ``TestExecutionDispatcherContract._dispatch``:
+        # discard the handshake-resolved attribute and drive a real
+        # request through the fixture builder. The pre-#60 default
+        # tries to pass unsupported kwargs and skips on TypeError —
+        # which made the audit-echo scan vacuous.
+        del candidate_provider
+        return _build_canonical_execution_response()
+
+    def test_response_has_no_policy_or_approval_field(
+        self, execution_dispatcher_candidate_provider: Any
+    ) -> None:
+        """Concrete replacement for the policy/approval-kwarg skip.
+
+        :class:`ExecutionResponse` (#42) intentionally does not declare
+        ``policy_profile`` or ``approval_ticket`` fields; the audit row
+        carries them privately and they never reach the agent. Pin that
+        invariant explicitly so a future field addition that forgets to
+        scrub the echo is caught by this scan rather than the broader
+        sentinel sweep.
+        """
+        echo = self._make_audit_echo(execution_dispatcher_candidate_provider)
+        # Field absence on the response model. Use ``model_fields`` so the
+        # check survives Pydantic v1↔v2 attribute renames if either is
+        # backported.
+        fields = getattr(type(echo), "model_fields", None)
+        assert fields is not None, (
+            "ExecutionResponse must be a Pydantic model exposing "
+            "``model_fields`` for the absence check"
+        )
+        assert "policy_profile" not in fields, (
+            "ExecutionResponse must not echo a ``policy_profile`` field "
+            "to the agent; the audit row keeps it private"
+        )
+        assert "approval_ticket" not in fields, (
+            "ExecutionResponse must not echo an ``approval_ticket`` field "
+            "to the agent; the audit row keeps it private"
+        )
+        # Even if a future field appears, neither sentinel value may
+        # surface in the serialised payload.
+        blob = _walk_payload_strings(echo)
+        for needle in MOCK_POLICY_PROFILE_SENTINELS:
+            assert needle not in blob, (
+                f"ExecutionResponse leaked policy_profile sentinel "
+                f"{needle!r}: {blob!r}"
+            )
+        for needle in MOCK_APPROVAL_TICKET_SENTINELS:
+            assert needle not in blob, (
+                f"ExecutionResponse leaked approval_ticket sentinel "
+                f"{needle!r}: {blob!r}"
+            )
 
 
 class TestTenantScopedVaultPathContract(ContractTenantScopedVaultPath):
