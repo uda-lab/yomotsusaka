@@ -38,10 +38,10 @@ including in this docstring.
 
 Out of scope
 ------------
-* ``audit_log`` — the original issue body listed it as a candidate command,
-  but no matching entry point exists in :mod:`boundary` for MVP-2 and the
-  real audit-log surface is owned by #27. Adding it here would create a
-  facade method without a backing boundary primitive.
+* ``audit_log`` retrieval — the underlying ``<vault_root>/audit/
+  restoration.jsonl`` is written by both :func:`boundary.restoration_request`
+  and :func:`boundary.execute_request`, but a typed read-side surface for
+  it is owned by a future child issue.
 * Any CLI wrapper — explicitly listed as a non-goal on #30. A future
   ``argparse`` wrapper can be layered on top of :class:`LocalFacade` without
   changing this module.
@@ -64,11 +64,17 @@ from yomotsusaka.boundary import (
     SearchResponse,
     StatusReportRequest,
     StatusReportResponse,
+    execute_request,
     inspect_request,
     process_document_request,
     restoration_request,
     search_request,
     status_report_request,
+)
+from yomotsusaka.execution_gateway import (
+    ExecutionRequest,
+    ExecutionResponse,
+    ExecutionScope,
 )
 from yomotsusaka.search_gateway import SearchGateway
 from yomotsusaka.tenant import TenantScope
@@ -191,6 +197,41 @@ class LocalFacade:
             scope=ResolverScope.ORDINARY_AGENT,
             tenant=self._tenant,
         )
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResponse:
+        """Delegate to :func:`boundary.execute_request` for the held tenant.
+
+        The facade is hard-wired to ordinary-agent semantics. The incoming
+        :class:`ExecutionRequest`'s ``scope`` field is **always** overridden
+        to :attr:`ExecutionScope.ORDINARY_AGENT` before dispatch, regardless
+        of the value the caller supplied; this is a privilege ceiling, not
+        a default. The dispatcher's scope gate then returns
+        ``status="failed"``, ``reason=ExecutionFailureReason.ScopeDenied``
+        whenever the template's ``min_scope`` exceeds ordinary-agent — and
+        every shipped template requires the narrower scope, so every
+        ordinary-agent caller is denied. One audit row is appended to
+        ``<vault_root>/audit/restoration.jsonl`` per call (including
+        denials), preserving the Chikaeshi audit contract.
+
+        Callers that actually need the narrower scope must invoke
+        :func:`yomotsusaka.boundary.execute_request` directly with an
+        :class:`ExecutionRequest` whose ``scope`` is the narrower value;
+        this facade method MUST NOT widen the caller's scope (the override
+        below pins that invariant in code, mirroring the
+        ``scope=ResolverScope.ORDINARY_AGENT`` kwarg on
+        :meth:`request_restore`'s call to
+        :func:`yomotsusaka.boundary.restoration_request`).
+        """
+        # Pin scope to ordinary-agent — the facade is the ordinary-agent
+        # entry point and MUST NOT forward whatever ``scope`` the caller
+        # supplied (a malicious or buggy caller could otherwise widen
+        # their effective privilege by constructing the request with the
+        # narrower scope value). ``ExecutionRequest`` is frozen, so we
+        # produce a scope-pinned copy.
+        ordinary_request = request.model_copy(
+            update={"scope": ExecutionScope.ORDINARY_AGENT}
+        )
+        return execute_request(ordinary_request, tenant=self._tenant)
 
     def status_report(
         self, request: StatusReportRequest
