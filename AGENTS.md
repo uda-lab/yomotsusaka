@@ -14,6 +14,7 @@ uv venv
 uv pip install -e ".[dev]"
 uv run pytest
 uv run ruff check src tests
+uv run python -m yomotsusaka.cli.run_batch ./inbox --vault-root ./vault  # quick end-to-end check
 ~~~
 
 ## Architecture
