@@ -1,25 +1,76 @@
 # Policy configuration example
 # Copy to config/policy.yaml and adjust for your deployment.
+#
+# This file documents TWO independent policy concerns under separate
+# top-level keys so they can evolve without colliding:
+#
+# * ``redaction:`` — entity-redaction behaviour for the preprocessing
+#   pipeline (which entity kinds get redacted, minimum confidence, etc.).
+#   Consumed by the redaction pipeline. Schema unchanged from MVP-1.
+#
+# * ``restoration:`` — the **restoration policy table** consulted by
+#   ``yomotsusaka.boundary.restoration_request`` (issue #44). Loaded via
+#   ``RestorationPolicyTable.load_from_path`` and evaluated against the
+#   four reserved fields ``policy_profile``, ``production_scope``,
+#   ``authorization_decision``, ``approval_ticket``.
+#
+# Readers that consume only one section ignore the other; the file is
+# safe to load with ``yaml.safe_load`` without breaking either consumer.
 
-# Entity kinds that should always be redacted
-always_redact:
-  - PERSON
-  - ID_NUMBER
-  - FINANCIAL
-  - HEALTH
+# ---------------------------------------------------------------------------
+# Redaction policy (MVP-1; consumed by the preprocessing pipeline)
+# ---------------------------------------------------------------------------
+redaction:
+  # Entity kinds that should always be redacted
+  always_redact:
+    - PERSON
+    - ID_NUMBER
+    - FINANCIAL
+    - HEALTH
 
-# Entity kinds that should be redacted only in high-sensitivity documents
-conditional_redact:
-  - DATE
-  - LOCATION
-  - ORG
+  # Entity kinds that should be redacted only in high-sensitivity documents
+  conditional_redact:
+    - DATE
+    - LOCATION
+    - ORG
 
-# Minimum confidence score for a detected entity to be redacted (0.0–1.0)
-min_confidence: 0.8
+  # Minimum confidence score for a detected entity to be redacted (0.0–1.0)
+  min_confidence: 0.8
 
-# Destinations that manifests may be transferred to
-allowed_transfer_destinations:
-  - "s3://my-bucket/manifests/"
+  # Destinations that manifests may be transferred to
+  allowed_transfer_destinations:
+    - "s3://my-bucket/manifests/"
 
-# Whether to allow agents to trigger restoration without explicit approval
-require_restoration_approval: true
+  # Whether to allow agents to trigger restoration without explicit approval
+  require_restoration_approval: true
+
+# ---------------------------------------------------------------------------
+# Restoration policy table (issue #44; consumed by the boundary)
+# ---------------------------------------------------------------------------
+# Each row is matched against ``RestorationRequest.policy_profile``. When the
+# request omits ``policy_profile`` the row with ``default: true`` is used.
+# Exactly one row must set ``default: true``; an unknown ``policy_profile``
+# is denied (not silently routed to the default).
+#
+# ``production_scopes: ["*"]`` permits any value; otherwise the request's
+# ``production_scope`` must appear in the list. An empty list permits only
+# the "no production_scope supplied" case.
+restoration:
+  profiles:
+    - profile_name: _default_local
+      production_scopes: ["*"]
+      require_authorization_decision: false
+      approval_ticket_pattern: null
+      default: true
+
+    - profile_name: strict
+      production_scopes: [internal, staging]
+      require_authorization_decision: true
+      approval_ticket_pattern: "^TKT-[0-9]{4,}$"
+      default: false
+
+    - profile_name: production
+      production_scopes: [production]
+      require_authorization_decision: true
+      approval_ticket_pattern: "^TKT-[0-9]{4,}$"
+      default: false

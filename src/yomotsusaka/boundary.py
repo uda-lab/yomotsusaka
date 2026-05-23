@@ -49,6 +49,7 @@ from pydantic import (
 
 from yomotsusaka import restoration_api
 from yomotsusaka.pipeline import process_document
+from yomotsusaka.policy import RestorationPolicyTable
 from yomotsusaka.redactor import Span
 from yomotsusaka.schemas import (
     ArtifactHandle,
@@ -586,6 +587,7 @@ class RestorationFailureReason(str, Enum):
     ArtifactMissing = "artifact_missing"
     AuditWriteFailed = "audit_write_failed"
     KernelError = "kernel_error"
+    PolicyDenied = "policy_denied"
 
 
 class RestorationRequest(BaseModel, frozen=True):
@@ -921,6 +923,8 @@ def _append_restoration_audit(
     outcome: Literal["accepted", "failed"],
     failure_reason: RestorationFailureReason | None,
     returned_entry_count: int | None,
+    policy_verdict: Literal["permit", "deny"] | None = None,
+    policy_matched_profile: str | None = None,
 ) -> str:
     """Append one JSONL audit record to ``<vault_root>/audit/restoration.jsonl``.
 
@@ -1008,6 +1012,8 @@ def _append_restoration_audit(
         "outcome": outcome,
         "failure_reason": failure_reason.value if failure_reason is not None else None,
         "returned_entry_count": returned_entry_count,
+        "policy_verdict": policy_verdict,
+        "policy_matched_profile": policy_matched_profile,
     }
     line = json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
     with audit_path.open("a", encoding="utf-8") as fh:
@@ -1041,14 +1047,20 @@ def restoration_request(
     *,
     scope: ResolverScope,
     vault_root: Path,
+    policy_table: RestorationPolicyTable | None = None,
 ) -> RestorationResponse:
-    """Audit-logged, scope-gated restoration entry point.
+    """Audit-logged, scope-gated, policy-checked restoration entry point.
 
     Every observable code path writes (or attempts to write) one or two
     audit records to ``<vault_root>/audit/restoration.jsonl`` before
     returning. The kernel :func:`restoration_api.restore` is only invoked
     when ``scope == ResolverScope.PRIVATE_BOUNDARY``, the request schema is
-    valid, and the intent audit record has been written.
+    valid, the policy table permits the request, and the intent audit
+    record has been written.
+
+    ``policy_table`` defaults to ``None`` → :meth:`RestorationPolicyTable.default_local`
+    (a single permissive row) so existing MVP-2 callers and tests that do
+    not pass a table see no behavioural change.
 
     Failure modes:
 
@@ -1058,6 +1070,11 @@ def restoration_request(
     * Non-``PRIVATE_BOUNDARY`` scope →
       :data:`RestorationFailureReason.ScopeDenied`. Audit written; kernel NOT
       called.
+    * Policy-table deny (issue #44) →
+      :data:`RestorationFailureReason.PolicyDenied`. One ``outcome="failed"``
+      audit record is written **before** the response returns; the kernel
+      is NOT called. ``detail`` carries the policy's deny reason with
+      ``vault_root`` substrings stripped.
     * Audit-write failure on the accept path →
       :data:`RestorationFailureReason.AuditWriteFailed`. Kernel NOT called.
     * Unknown artifact (kernel raises "No private data found") →
@@ -1172,6 +1189,47 @@ def restoration_request(
             detail="scope does not authorise restoration",
         )
 
+    # ---- step (c.5) policy table evaluation. Audit-first contract: a deny
+    # writes one outcome="failed" record BEFORE returning the response.
+    # Mirrors the ScopeDenied OSError→AuditWriteFailed pattern exactly.
+    effective_policy = policy_table if policy_table is not None else RestorationPolicyTable.default_local()
+    decision = effective_policy.evaluate(
+        policy_profile=request.policy_profile,
+        production_scope=request.production_scope,
+        authorization_decision=request.authorization_decision,
+        approval_ticket=request.approval_ticket,
+    )
+    if decision.verdict == "deny":
+        audit_id = _new_audit_id()
+        try:
+            _append_restoration_audit(
+                vault_root,
+                audit_record_id=audit_id,
+                scope=scope,
+                request=request,
+                outcome="failed",
+                failure_reason=RestorationFailureReason.PolicyDenied,
+                returned_entry_count=None,
+                policy_verdict="deny",
+                policy_matched_profile=decision.matched_profile,
+            )
+        except OSError:
+            return RestorationResponse(
+                outcome="failed",
+                audit_record_id=audit_id,
+                document_id=document_id,
+                reason=RestorationFailureReason.AuditWriteFailed,
+                detail="audit log could not be written",
+            )
+        deny_detail = decision.deny_reason or "policy denied this request"
+        return RestorationResponse(
+            outcome="failed",
+            audit_record_id=audit_id,
+            document_id=document_id,
+            reason=RestorationFailureReason.PolicyDenied,
+            detail=_strip_vault_root(deny_detail, vault_root),
+        )
+
     # ---- step (d): intent audit BEFORE kernel call. Failure here is a hard
     # stop — we never reach the kernel without a durable audit record.
     audit_id = _new_audit_id()
@@ -1184,6 +1242,8 @@ def restoration_request(
             outcome="accepted",
             failure_reason=None,
             returned_entry_count=None,
+            policy_verdict="permit",
+            policy_matched_profile=decision.matched_profile,
         )
     except OSError:
         return RestorationResponse(
@@ -1239,6 +1299,8 @@ def restoration_request(
                 outcome="failed",
                 failure_reason=reason_code,
                 returned_entry_count=None,
+                policy_verdict="permit",
+                policy_matched_profile=decision.matched_profile,
             )
         except OSError:
             return RestorationResponse(
@@ -1279,6 +1341,8 @@ def restoration_request(
             outcome="accepted",
             failure_reason=None,
             returned_entry_count=len(filtered),
+            policy_verdict="permit",
+            policy_matched_profile=decision.matched_profile,
         )
     except OSError:
         return RestorationResponse(
