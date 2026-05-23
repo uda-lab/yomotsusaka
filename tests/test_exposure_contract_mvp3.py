@@ -881,14 +881,26 @@ class TestExecutionRequestContract(ContractExecutionRequest):
 #   :func:`execute_request` does not yet accept those kwargs.
 
 
-def _build_canonical_execution_response(*, purpose: str = "exposure-contract-fixture-purpose") -> Any:
-    """Drive a real :func:`boundary.execute_request` against the canonical
-    fixture text and return the resulting :class:`ExecutionResponse`.
+def _build_canonical_execution_response(
+    dispatcher: Any,
+    *,
+    purpose: str = "exposure-contract-fixture-purpose",
+) -> Any:
+    """Drive a real Chikaeshi dispatcher call against the canonical fixture
+    and return the resulting :class:`ExecutionResponse`.
 
     Used by :class:`TestExecutionDispatcherContract` and
     :class:`TestRestorationAuditEchoContract` so the contracts no longer
-    skip on ``TypeError`` from a no-arg dispatcher invocation. The
-    response is the agent-facing surface scanned for leakage.
+    skip on ``TypeError`` from a no-arg dispatcher invocation.
+
+    *dispatcher* MUST be the handshake-resolved callable supplied by
+    :func:`execution_dispatcher_candidate_provider` — never a freshly
+    imported ``boundary.execute_request``. Codex review of #60 PR #64
+    flagged the direct-import shape as a false-negative coverage gap:
+    a future move/wrap of the dispatcher (or a monkeypatched test
+    double) would otherwise be silently bypassed. Threading
+    *dispatcher* through keeps the contract pinned to whatever
+    ``HANDSHAKE_TABLE`` resolves at test time.
 
     *purpose* is parameterised so a caller can inject a sentinel-bearing
     purpose string when they want to prove the non-vacuity of a downstream
@@ -898,7 +910,7 @@ def _build_canonical_execution_response(*, purpose: str = "exposure-contract-fix
     import tempfile
     from pathlib import Path as _Path
 
-    from yomotsusaka.boundary import ProcessRequest, execute_request, process_document_request
+    from yomotsusaka.boundary import ProcessRequest, process_document_request
     from yomotsusaka.execution_gateway import ExecutionRequest, ExecutionScope
 
     with tempfile.TemporaryDirectory(prefix="exposure-mvp3-") as vault_dir:
@@ -922,7 +934,7 @@ def _build_canonical_execution_response(*, purpose: str = "exposure-contract-fix
             scope=ExecutionScope.PRIVATE_BOUNDARY,
             inputs={"target_handle": handle.locator},
         )
-        response = execute_request(request, vault_root=vault)
+        response = dispatcher(request, vault_root=vault)
         # ``ExecutionResponse`` is a frozen Pydantic model that does not
         # carry a back-reference to the on-disk vault, so it is safe to
         # return after the temporary directory is torn down.
@@ -934,28 +946,27 @@ class TestExecutionDispatcherContract(ContractExecutionDispatcher):
     non-vacuous by #60.
 
     Drives a real public-safe path (canonical document → opaque locator →
-    :class:`ExecutionRequest` → :func:`boundary.execute_request`) and scans
+    :class:`ExecutionRequest` → handshake-resolved dispatcher) and scans
     the resulting :class:`ExecutionResponse` for raw private values, vault
     paths, tenant sentinels, pod ids, endpoint URLs, approval-ticket
     sentinels, and policy-profile sentinels.
     """
 
     def _dispatch(self, candidate_provider: Any) -> Any:
-        # ``candidate_provider`` resolves to :func:`boundary.execute_request`
-        # itself (via the handshake table); it is left unused here because
-        # the fixture builder imports the function directly to drive a full
-        # canonical pipeline. The arity-mismatch skip the abstract base
-        # falls back to (``execute_request()`` with no args) would mask the
-        # fact that #43 has already landed, so the override unconditionally
-        # builds a real fixture.
-        del candidate_provider
-        return _build_canonical_execution_response()
+        # ``candidate_provider`` is the handshake-resolved dispatcher
+        # supplied by :func:`execution_dispatcher_candidate_provider`
+        # (currently :func:`boundary.execute_request`, but resolved
+        # through :data:`HANDSHAKE_TABLE` so a future rename / relocation
+        # / wrapper is still exercised by this contract). The pre-#60
+        # default invoked it with no args and skipped on ``TypeError``,
+        # which masked the fact that #43 had already landed.
+        return _build_canonical_execution_response(candidate_provider)
 
 
 class TestRestorationAuditEchoContract(ContractRestorationAuditEcho):
     """Activated by #43 and made non-vacuous by #60.
 
-    :func:`boundary.execute_request` does NOT yet accept
+    The handshake-resolved dispatcher does NOT yet accept
     ``policy_profile`` / ``approval_ticket`` kwargs (those arrive with
     #44's restoration-policy work). Per issue #60 scope, the contract
     asserts they are absent / ``None`` and that the sentinel values do
@@ -965,12 +976,13 @@ class TestRestorationAuditEchoContract(ContractRestorationAuditEcho):
 
     def _make_audit_echo(self, candidate_provider: Any) -> Any:
         # Same rationale as ``TestExecutionDispatcherContract._dispatch``:
-        # discard the handshake-resolved attribute and drive a real
-        # request through the fixture builder. The pre-#60 default
-        # tries to pass unsupported kwargs and skips on TypeError —
-        # which made the audit-echo scan vacuous.
-        del candidate_provider
-        return _build_canonical_execution_response()
+        # thread the handshake-resolved dispatcher through the fixture
+        # builder so the contract follows whatever ``HANDSHAKE_TABLE``
+        # resolves at test time, instead of a direct ``boundary``
+        # import. The pre-#60 default tried to pass unsupported kwargs
+        # and skipped on TypeError — which made the audit-echo scan
+        # vacuous.
+        return _build_canonical_execution_response(candidate_provider)
 
     def test_response_has_no_policy_or_approval_field(
         self, execution_dispatcher_candidate_provider: Any
