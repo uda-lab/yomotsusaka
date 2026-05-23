@@ -21,6 +21,11 @@ env/
 # Vault (local dev only — never commit private data)
 .vault/
 
+# Environment files (never commit credentials; see .env.example)
+.env
+.env.local
+.env.*.local
+
 # Pytest / coverage
 .pytest_cache/
 .coverage
