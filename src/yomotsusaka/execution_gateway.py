@@ -50,6 +50,39 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from yomotsusaka.boundary import PublicHandle
 from yomotsusaka.schemas import ArtifactHandle
 
+# ---------------------------------------------------------------------------
+# Failure taxonomy (Fork 5; new in #43)
+# ---------------------------------------------------------------------------
+
+
+class ExecutionFailureReason(str, Enum):
+    """Closed failure taxonomy for :func:`yomotsusaka.boundary.execute_request`.
+
+    Modelled on :class:`yomotsusaka.boundary.ResolverFailureReason`. NOT a
+    reuse: the resolver enum is owned by the ``resolve()`` contract and
+    overloading it with execution-specific reasons would force #28's
+    contract tests to grow. The two enums evolve independently.
+
+    Mapping from :class:`yomotsusaka.boundary.ResolverFailureReason` when
+    the dispatcher calls :func:`boundary.resolve` internally:
+
+    * ``MalformedLocator`` / ``UnknownArtifact`` / ``ArtifactMissing``
+      → :data:`ArtifactMissing`
+    * ``ScopeDenied`` → :data:`ScopeDenied`
+    * ``PurposeNotPermitted`` → :data:`PurposeNotPermitted`
+
+    The original :class:`ResolverFailureReason` value is preserved in the
+    audit record's ``resolver_reason`` field for forensic correlation.
+    """
+
+    ScopeDenied = "scope_denied"
+    PurposeNotPermitted = "purpose_not_permitted"
+    TemplateNotFound = "template_not_found"
+    SchemaInvalid = "schema_invalid"
+    ScrubFailed = "scrub_failed"
+    TemplateRaised = "template_raised"
+    ArtifactMissing = "artifact_missing"
+
 logger = logging.getLogger(__name__)
 
 
@@ -187,6 +220,19 @@ class ExecutionResponse(BaseModel):
         description="Scrubbed stderr fragment; same contract as "
         "``scrubbed_stdout``.",
     )
+    reason: ExecutionFailureReason | None = Field(
+        default=None,
+        description="Failure classification when :attr:`status` is "
+        "``\"failed\"``; ``None`` on success. The closed-set values are "
+        "defined in :class:`ExecutionFailureReason` (Fork 5).",
+    )
+    detail: str | None = Field(
+        default=None,
+        description="Free-form failure detail string, already scrubbed of "
+        "raw values and vault paths. ``None`` on success. The dispatcher "
+        "guarantees this field never echoes a raw private value or an "
+        "absolute filesystem path.",
+    )
 
     @field_validator("audit_record_id")
     @classmethod
@@ -275,11 +321,12 @@ class ExecutionGateway:
 
 
 __all__ = [
-    # New Chikaeshi spec symbols (declared, not plumbed; see #43).
+    # New Chikaeshi spec symbols (declared in #42, plumbed in #43).
     "ExecutionScope",
     "ExecutionRequest",
     "ExecutionResponse",
     "ExecutionFailure",
+    "ExecutionFailureReason",
     # Legacy stub (behaviour preserved).
     "ExecutionGateway",
 ]
