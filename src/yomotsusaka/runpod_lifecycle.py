@@ -18,22 +18,28 @@ Mode semantics (metaplan Fork 1):
   ``stop_pod`` is a logged no-op (owner is responsible per
   ``docs/runpod.md`` §9); ``is_ready`` issues ``GET {endpoint}/health``
   with a 5 s timeout. This is the only mode that MUST work for issue #46.
-* ``manage`` — full RunPod GraphQL lifecycle. Stubbed
-  :class:`NotImplementedError` in this PR; reserved for a follow-up issue
-  scoping Pod-creation cost control.
+* ``manage`` — :class:`ManageRunPodLifecycle`. Real RunPod REST lifecycle
+  (create → wait → delete) issued via ``httpx`` against
+  ``https://rest.runpod.io/v1``. ``RUNPOD_API_KEY`` is read from env (or
+  passed explicitly) as a bearer token. All log lines are category-only
+  literals; Pod IDs, endpoint URLs, and bearer tokens never appear in any
+  log record, exception message, or :class:`PodHandle` field exposed
+  outside the private kernel. See ``docs/runpod-agent-lifecycle.md`` for
+  the owner/agent split and cost-control rationale (issue #70 / #76).
 
 Credentials are env-var-only (metaplan Fork 3). No config file, no secret
 manager, no keyring integration. ``RUNPOD_API_KEY`` is read only in
-``manage`` mode (currently NotImplementedError); ``RUNPOD_POD_ID`` and
-``RUNPOD_POD_ENDPOINT`` are required in ``attach`` mode. None of these
-values are logged, included in exception messages, returned in any
-``PodHandle`` field, or serialised in any ``ResolverFailure.detail``.
+``manage`` mode; ``RUNPOD_POD_ID`` and ``RUNPOD_POD_ENDPOINT`` are
+required in ``attach`` mode. None of these values are logged, included in
+exception messages, returned in any ``PodHandle`` field, or serialised in
+any ``ResolverFailure.detail``.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -87,9 +93,10 @@ class RunPodConfigError(Exception):
     """Raised when the lifecycle mode is misconfigured.
 
     Examples: ``attach`` mode with ``RUNPOD_POD_ID`` unset, ``manage``
-    mode without ``RUNPOD_API_KEY``, an unknown ``YOMOTSUSAKA_RUNPOD_MODE``
-    value. The exception message names the missing env var (the key, NOT
-    the value) so the caller can diagnose without leaking credentials.
+    mode with neither ``api_key`` kwarg nor ``RUNPOD_API_KEY`` env var,
+    an unknown ``YOMOTSUSAKA_RUNPOD_MODE`` value. The exception message
+    names the missing env var (the key, NOT the value) so the caller can
+    diagnose without leaking credentials.
     """
 
 
@@ -102,9 +109,10 @@ class RunPodLifecycle:
     """Abstract base for RunPod lifecycle managers.
 
     Concrete subclasses are :class:`MockRunPodLifecycle` (no network),
-    :class:`AttachRunPodLifecycle` (real ``attach`` mode), and a future
-    ``ManageRunPodLifecycle`` (gated behind a follow-up issue;
-    currently raises :class:`NotImplementedError` on instantiation).
+    :class:`AttachRunPodLifecycle` (env-supplied handle, real ``attach``
+    mode), and :class:`ManageRunPodLifecycle` (real REST create / wait /
+    delete; the cost-controlled ``manage`` mode shipped by issue #76 /
+    closes #70).
     """
 
     def start_pod(self, config: PodConfig) -> PodHandle:
@@ -217,25 +225,304 @@ class AttachRunPodLifecycle(RunPodLifecycle):
 
 
 # ---------------------------------------------------------------------------
-# Mode 3: manage — reserved for follow-up issue
+# Mode 3: manage — real REST lifecycle (create / wait / delete)
 # ---------------------------------------------------------------------------
 
 
-class ManageRunPodLifecycle(RunPodLifecycle):
-    """Reserved manage-mode lifecycle.
+_RUNPOD_REST_BASE = "https://rest.runpod.io/v1"
+"""RunPod REST API base URL.
 
-    Full RunPod GraphQL Pod-creation / destruction is out of scope for
-    issue #46. Instantiation raises :class:`NotImplementedError` with a
-    pointer to the follow-up issue. Metaplan Fork 1 + Fork 4 spelled out
-    why: shipping Pod-creation without cost control (autoscaling guard,
-    Pod-runtime cap, idle reaper) would be a billing footgun.
+Held as a module-level constant so a future endpoint change (or a test
+substitution) does not require touching call sites. Decision 1 of
+``/tmp/mvp4_tightened_76.md`` freezes the REST mechanism; the exact base
+URL is the only seam left swappable.
+"""
+
+_MANAGE_CREATE_TIMEOUT_SECONDS = 30
+"""Single ``POST /v1/pods`` request timeout (httpx Client timeout)."""
+
+_MANAGE_HEALTH_POLL_INTERVAL_SECONDS = 5
+"""Sleep between consecutive ``/health`` probes during the wait phase."""
+
+_MANAGE_HEALTH_POLL_MAX_ATTEMPTS = 60
+"""Maximum number of ``/health`` probes. 60 * 5 s = 5 minute wall-clock cap."""
+
+_MANAGE_DELETE_TIMEOUT_SECONDS = 30
+"""Single ``DELETE /v1/pods/{podId}`` request timeout."""
+
+
+class ManageRunPodLifecycle(RunPodLifecycle):
+    """Real RunPod ``manage`` mode — create → wait → delete via REST.
+
+    Issued exclusively over the RunPod REST API (``rest.runpod.io/v1``)
+    via :mod:`httpx`. Authenticates with ``Authorization: Bearer
+    ${RUNPOD_API_KEY}`` (read from env unless an explicit ``api_key``
+    kwarg overrides). No subprocess fall-back — Decision 1 of issue #76
+    freezes the mechanism on REST because the repository already mocks
+    every other HTTP seam via :class:`httpx.MockTransport`
+    (``AttachRunPodLifecycle``, ``VLLMBackend``,
+    ``smoke_runpod._probe_chat_completions``); adding a second mock
+    idiom for one class would diverge the test surface.
+
+    Privacy invariants (binding per ``docs/runpod-agent-lifecycle.md`` §6
+    and ``/tmp/mvp4_tightened_76.md`` Decision 3):
+
+    * Every log record contains ONLY one of the 10 category literals
+      (``created``, ``waiting_health``, ``healthy``, ``deleted``, …).
+    * No exception message echoes the Pod ID, endpoint URL, response
+      body, raw ``httpx`` error text, or the bearer token.
+    * The returned :class:`PodHandle` keeps ``pod_id`` / ``endpoint``
+      as ``never_expose`` private state; the boundary never widens.
+
+    Constructor contract (Decision 2):
+
+    * ``api_key=None`` reads ``RUNPOD_API_KEY``; an explicit non-None
+      string overrides; an explicit empty string is treated as missing.
+    * ``pod_config`` is the default :class:`PodConfig` passed to
+      :meth:`start_pod` when the caller does not supply one.
+    * ``transport`` is the ``httpx.BaseTransport`` injection seam for
+      the L1 mock tests.
+    * ``pod_id`` / ``endpoint`` are present **only** so the exposure-
+      contract test (`tests/test_exposure_contract_mvp3.py::TestPodHandleContract`)
+      can construct the manage-mode lifecycle with sentinel values and
+      receive the corresponding :class:`PodHandle` back without making
+      any network call. When BOTH are provided, :meth:`start_pod` skips
+      the REST create and returns the handle directly. When either is
+      absent, ``RUNPOD_API_KEY`` must be available (the normal path).
     """
 
-    def __init__(self) -> None:
-        raise NotImplementedError(
-            "manage mode requires Pod-creation cost-control wiring; "
-            "see the follow-up issue tracked in #46 metaplan Fork 1/Fork 4"
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        pod_config: PodConfig | None = None,
+        transport: httpx.BaseTransport | None = None,
+        pod_id: str | None = None,
+        endpoint: str | None = None,
+    ) -> None:
+        # Explicit pod_id+endpoint short-circuits the create call entirely
+        # — this is the seam the exposure-contract test relies on. In that
+        # mode we do not require an API key; the lifecycle becomes a thin
+        # wrapper that returns the supplied handle and proxies is_ready /
+        # stop_pod against it.
+        bypass = pod_id is not None and endpoint is not None
+
+        # api_key resolution mirrors AttachRunPodLifecycle's explicit-args-
+        # override-env shape. An explicitly empty string is treated as
+        # missing, matching VLLMBackend.__init__ semantics.
+        resolved_api_key: str | None
+        if api_key is not None:
+            resolved_api_key = api_key
+        else:
+            resolved_api_key = os.environ.get("RUNPOD_API_KEY")
+        if resolved_api_key == "":
+            resolved_api_key = None
+
+        if not bypass and not resolved_api_key:
+            raise RunPodConfigError(
+                "RUNPOD_API_KEY required in manage mode"
+            )
+
+        self._api_key = resolved_api_key
+        self._pod_config = pod_config or PodConfig()
+        self._transport = transport
+        self._bypass_pod_id = pod_id
+        self._bypass_endpoint = endpoint.rstrip("/") if endpoint else None
+
+    # ------------------------------------------------------------------
+    # httpx client construction (REST + health probe)
+    # ------------------------------------------------------------------
+
+    def _rest_client(self, *, timeout: float) -> httpx.Client:
+        kwargs: dict[str, object] = {
+            "timeout": timeout,
+            "base_url": _RUNPOD_REST_BASE,
+        }
+        if self._transport is not None:
+            kwargs["transport"] = self._transport
+        return httpx.Client(**kwargs)  # type: ignore[arg-type]
+
+    def _health_client(self) -> httpx.Client:
+        kwargs: dict[str, object] = {"timeout": _ATTACH_HEALTH_TIMEOUT_SECONDS}
+        if self._transport is not None:
+            kwargs["transport"] = self._transport
+        return httpx.Client(**kwargs)  # type: ignore[arg-type]
+
+    def _auth_headers(self) -> dict[str, str]:
+        # The bearer header is built only at call time and never logged.
+        # The Authorization value never leaves this method.
+        return {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+
+    # ------------------------------------------------------------------
+    # Public lifecycle API
+    # ------------------------------------------------------------------
+
+    def start_pod(self, config: PodConfig | None = None) -> PodHandle:
+        """Create a Pod and wait for its endpoint to become healthy.
+
+        When the lifecycle was constructed with explicit ``pod_id`` and
+        ``endpoint`` kwargs, the REST create is skipped entirely and the
+        supplied handle is returned without any network activity. This is
+        the seam the exposure-contract test relies on (see Decision 2 in
+        ``/tmp/mvp4_tightened_76.md``).
+
+        Otherwise: ``POST /v1/pods`` with the resolved :class:`PodConfig`,
+        parse the created Pod's id+endpoint, then poll ``/health`` up to
+        ``_MANAGE_HEALTH_POLL_MAX_ATTEMPTS`` times.
+        """
+        if self._bypass_pod_id is not None and self._bypass_endpoint is not None:
+            # No-network branch — exposure-contract test path.
+            return PodHandle(
+                pod_id=self._bypass_pod_id, endpoint=self._bypass_endpoint
+            )
+
+        resolved_config = config or self._pod_config
+        try:
+            with self._rest_client(timeout=_MANAGE_CREATE_TIMEOUT_SECONDS) as client:
+                response = client.post(
+                    "/pods",
+                    headers=self._auth_headers(),
+                    json=self._create_payload(resolved_config),
+                )
+        except httpx.HTTPError:
+            # Decision 3 / S2: PodUnavailableError carries only the
+            # category literal. The underlying httpx error message
+            # (which may include the URL) does NOT propagate.
+            logger.info("create_failed")
+            raise PodUnavailableError("create_failed")
+
+        if not 200 <= response.status_code < 300:
+            logger.info("create_failed")
+            raise PodUnavailableError("create_failed")
+
+        try:
+            data = response.json()
+            pod_id, endpoint = self._extract_pod_identity(data)
+        except (ValueError, KeyError, TypeError):
+            logger.info("create_failed")
+            raise PodUnavailableError("create_failed")
+
+        if not pod_id or not endpoint:
+            logger.info("create_failed")
+            raise PodUnavailableError("create_failed")
+
+        handle = PodHandle(pod_id=pod_id, endpoint=endpoint.rstrip("/"))
+        logger.info("created")
+
+        # Wait phase — pure category-only logging.
+        self._wait_for_healthy(handle)
+        return handle
+
+    def stop_pod(self, handle: PodHandle, *, terminate: bool = True) -> None:
+        """Stop or delete the Pod.
+
+        Default ``terminate=True`` issues ``DELETE /v1/pods/{podId}`` —
+        this is the cost-control default per ``docs/runpod.md`` §9 and
+        issue #70: stopped Pods continue to bill for retained volume
+        storage, so the agent-managed flow deletes by default. Set
+        ``terminate=False`` only when the caller explicitly wants to
+        retain ``/workspace`` (rare; documented in the runbook).
+        """
+        path = (
+            f"/pods/{handle.pod_id}"
+            if terminate
+            else f"/pods/{handle.pod_id}/stop"
         )
+        try:
+            with self._rest_client(timeout=_MANAGE_DELETE_TIMEOUT_SECONDS) as client:
+                if terminate:
+                    response = client.delete(path, headers=self._auth_headers())
+                else:
+                    response = client.post(path, headers=self._auth_headers())
+        except httpx.HTTPError:
+            logger.info("cleanup_failed")
+            raise PodUnavailableError("cleanup_failed")
+
+        if not 200 <= response.status_code < 300:
+            logger.info("cleanup_failed")
+            raise PodUnavailableError("cleanup_failed")
+
+        logger.info("deleted" if terminate else "stopped")
+
+    def is_ready(self, handle: PodHandle) -> bool:
+        """Probe ``GET {endpoint}/health`` — identical to attach mode."""
+        url = f"{handle.endpoint.rstrip('/')}/health"
+        try:
+            with self._health_client() as client:
+                response = client.get(url)
+        except httpx.HTTPError:
+            return False
+        return response.status_code == 200
+
+    # ------------------------------------------------------------------
+    # Internal helpers (no logging — caller emits category literals only)
+    # ------------------------------------------------------------------
+
+    def _wait_for_healthy(self, handle: PodHandle) -> None:
+        """Poll :meth:`is_ready` up to ``_MANAGE_HEALTH_POLL_MAX_ATTEMPTS``
+        times, sleeping ``_MANAGE_HEALTH_POLL_INTERVAL_SECONDS`` between
+        probes. Raises :class:`PodUnavailableError` with the
+        ``wait_timeout`` category on exhaustion.
+
+        Both constants are module-level so the L1 tests can monkeypatch
+        them to small values without resorting to ``time.sleep`` mocks
+        (see Decision 5 in ``/tmp/mvp4_tightened_76.md``).
+        """
+        for _ in range(_MANAGE_HEALTH_POLL_MAX_ATTEMPTS):
+            if self.is_ready(handle):
+                logger.info("healthy")
+                return
+            logger.info("waiting_health")
+            time.sleep(_MANAGE_HEALTH_POLL_INTERVAL_SECONDS)
+        logger.info("wait_timeout")
+        raise PodUnavailableError("wait_timeout")
+
+    @staticmethod
+    def _create_payload(config: PodConfig) -> dict[str, Any]:
+        """Build the ``POST /v1/pods`` JSON body from a :class:`PodConfig`.
+
+        Field names follow the public RunPod REST schema. The payload is
+        constructed here (not in :meth:`start_pod`) so the test seam can
+        inspect it via a :class:`httpx.MockTransport` handler.
+        """
+        return {
+            "gpuTypeIds": [config.gpu_type],
+            "imageName": config.image,
+            "containerDiskInGb": config.disk_gb,
+            "env": {"MODEL_ID": config.model_id, **config.extra},
+        }
+
+    @staticmethod
+    def _extract_pod_identity(data: Any) -> tuple[str | None, str | None]:
+        """Read ``id`` and the inference endpoint URL out of the REST
+        response body.
+
+        RunPod's response shapes vary across template versions; this
+        helper tolerates two common forms:
+
+        1. ``{"id": "<pod-id>", "endpoint": "https://..."}`` — flat.
+        2. ``{"id": "<pod-id>", "publicIp": "1.2.3.4", "ports": [...]}``
+           — synthesise ``https://<pod-id>-8000.proxy.runpod.net`` from
+           the documented runpod-proxy pattern.
+
+        Returns ``(None, None)`` on unrecognised shapes; the caller then
+        treats this as ``create_failed`` without echoing the raw body.
+        """
+        if not isinstance(data, dict):
+            return None, None
+        pod_id = data.get("id") or data.get("pod_id")
+        if not isinstance(pod_id, str) or not pod_id:
+            return None, None
+        endpoint = data.get("endpoint") or data.get("publicEndpoint")
+        if not isinstance(endpoint, str) or not endpoint:
+            # Synthesise the RunPod proxy URL from the Pod ID. The proxy
+            # pattern is documented in docs/runpod.md and used elsewhere
+            # in the repo.
+            endpoint = f"https://{pod_id}-8000.proxy.runpod.net"
+        return pod_id, endpoint
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +544,8 @@ def lifecycle_from_env() -> RunPodLifecycle:
     if mode == "attach":
         return AttachRunPodLifecycle()
     if mode == "manage":
+        # API key resolution happens inside ManageRunPodLifecycle.__init__;
+        # raises RunPodConfigError if unset.
         return ManageRunPodLifecycle()
     raise RunPodConfigError(
         f"{_MODE_ENV_VAR} must be one of 'mock' | 'attach' | 'manage'"
