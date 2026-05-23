@@ -165,6 +165,7 @@ def test_facade_public_surface_unchanged_under_tenant_construction(
         "inspect",
         "search",
         "request_restore",
+        "execute",
         "status_report",
         "vault_root",
         "gateway",

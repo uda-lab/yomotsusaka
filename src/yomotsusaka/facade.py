@@ -38,10 +38,10 @@ including in this docstring.
 
 Out of scope
 ------------
-* ``audit_log`` — the original issue body listed it as a candidate command,
-  but no matching entry point exists in :mod:`boundary` for MVP-2 and the
-  real audit-log surface is owned by #27. Adding it here would create a
-  facade method without a backing boundary primitive.
+* ``audit_log`` retrieval — the underlying ``<vault_root>/audit/
+  restoration.jsonl`` is written by both :func:`boundary.restoration_request`
+  and :func:`boundary.execute_request`, but a typed read-side surface for
+  it is owned by a future child issue.
 * Any CLI wrapper — explicitly listed as a non-goal on #30. A future
   ``argparse`` wrapper can be layered on top of :class:`LocalFacade` without
   changing this module.
@@ -64,12 +64,14 @@ from yomotsusaka.boundary import (
     SearchResponse,
     StatusReportRequest,
     StatusReportResponse,
+    execute_request,
     inspect_request,
     process_document_request,
     restoration_request,
     search_request,
     status_report_request,
 )
+from yomotsusaka.execution_gateway import ExecutionRequest, ExecutionResponse
 from yomotsusaka.search_gateway import SearchGateway
 from yomotsusaka.tenant import TenantScope
 
@@ -191,6 +193,27 @@ class LocalFacade:
             scope=ResolverScope.ORDINARY_AGENT,
             tenant=self._tenant,
         )
+
+    def execute(self, request: ExecutionRequest) -> ExecutionResponse:
+        """Delegate to :func:`boundary.execute_request` for the held tenant.
+
+        The facade is hard-wired to ordinary-agent semantics: callers submit
+        an :class:`ExecutionRequest` through this method to traverse the
+        sanctioned, audit-logged Chikaeshi dispatcher, but the dispatcher's
+        scope gate returns ``status="failed"``,
+        ``reason=ExecutionFailureReason.ScopeDenied`` whenever the template's
+        ``min_scope`` exceeds the caller's scope — and every shipped template
+        requires private-boundary scope, so every ordinary-agent caller is
+        denied. One audit row is appended to
+        ``<vault_root>/audit/restoration.jsonl`` per call (including denials),
+        preserving the Chikaeshi audit contract.
+
+        Callers that actually need private-boundary execution must invoke
+        :func:`yomotsusaka.boundary.execute_request` directly with an
+        :class:`ExecutionRequest` whose ``scope`` is the narrower value;
+        this facade method does NOT widen the caller's scope.
+        """
+        return execute_request(request, tenant=self._tenant)
 
     def status_report(
         self, request: StatusReportRequest
