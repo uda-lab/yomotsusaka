@@ -380,3 +380,102 @@ def test_cli_no_fail_on_error_returns_zero(tmp_path: Path) -> None:
     )
     assert result.returncode == 0
     assert "committed=3" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Regression coverage for codex P1 findings on PR #85
+# ---------------------------------------------------------------------------
+
+
+def test_batch_runner_disambiguates_same_stem_in_different_subdirs(
+    tmp_path: Path,
+) -> None:
+    """Codex P1 (review 4350963030): files with identical stems in distinct
+    subdirectories must NOT collapse to the same doc_id, or the second
+    commit would silently overwrite the first while ``committed_count``
+    still incremented for both."""
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    (inbox / "a").mkdir(parents=True)
+    (inbox / "b").mkdir(parents=True)
+    body_a = "Alice Tan works at Acme Corp. ID: 11111."
+    body_b = "Bob Lee joined Globex Inc. ID: 22222."
+    (inbox / "a" / "report.txt").write_text(body_a, encoding="utf-8")
+    (inbox / "b" / "report.txt").write_text(body_b, encoding="utf-8")
+
+    facade = LocalFacade(vault)
+    runner = BatchRunner(facade=facade)
+    summary = runner.run_directory(inbox)
+
+    assert summary.submitted_count == 2
+    assert summary.committed_count == 2
+    assert summary.failed_count == 0
+
+    # Two distinct manifest files must exist on disk — without the
+    # disambiguator, the second commit would overwrite the first and only
+    # one manifest would survive.
+    manifests = sorted((vault / "manifests").glob("*.json"))
+    assert len(manifests) == 2
+
+    # Both redactions must round-trip through search — neither was
+    # overwritten by the other.
+    person_hits = facade.search(SearchRequest(query="<PERSON_"))
+    assert len({hit.handle.locator for hit in person_hits.hits}) == 2
+
+
+def test_batch_runner_disambiguates_stems_normalising_to_same_token(
+    tmp_path: Path,
+) -> None:
+    """Codex P1 (review 4350963030, second clause): two files whose stems
+    differ only by characters outside ``[A-Za-z0-9._-]`` would, under a
+    naive sanitiser, normalise to the same token. The disambiguator must
+    keep them distinct."""
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    inbox.mkdir(parents=True)
+    # "report 1.txt" and "report?1.txt" both have a stem that sanitises to
+    # "report_1" under the [A-Za-z0-9._-] charset projection.
+    (inbox / "report 1.txt").write_text(
+        "Alice Tan works at Acme Corp. ID: 33333.", encoding="utf-8"
+    )
+    (inbox / "report+1.txt").write_text(
+        "Bob Lee joined Globex Inc. ID: 44444.", encoding="utf-8"
+    )
+
+    facade = LocalFacade(vault)
+    runner = BatchRunner(facade=facade)
+    summary = runner.run_directory(inbox)
+
+    assert summary.submitted_count == 2
+    assert summary.committed_count == 2
+    assert summary.failed_count == 0
+    assert len(list((vault / "manifests").glob("*.json"))) == 2
+
+
+def test_batch_runner_isolates_unicode_decode_failure(
+    tmp_path: Path,
+) -> None:
+    """Codex P1 (review 4350963030): a non-UTF-8 document must be recorded
+    as a per-doc failure, not abort the surrounding batch with an
+    uncaught ``UnicodeDecodeError``."""
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    inbox.mkdir(parents=True)
+    (inbox / "good.txt").write_text(
+        "Alice Tan works at Acme Corp. ID: 55555.", encoding="utf-8"
+    )
+    # Stand-alone 0xff is invalid as a leading byte in UTF-8.
+    (inbox / "bad.bin").write_bytes(b"\xff\xfe\x00invalid-utf8")
+
+    facade = LocalFacade(vault)
+    runner = BatchRunner(facade=facade)
+    # Must not raise UnicodeDecodeError out of run_directory.
+    summary = runner.run_directory(inbox)
+
+    assert summary.submitted_count == 2
+    assert summary.committed_count == 1
+    assert summary.failed_count == 1
+    assert len(summary.failed_doc_refs) == 1
+    assert summary.failed_doc_refs[0].endswith("bad.bin")
+    # The healthy document committed successfully.
+    assert len(list((vault / "manifests").glob("*.json"))) == 1

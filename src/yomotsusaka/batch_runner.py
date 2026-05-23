@@ -33,6 +33,7 @@ The runner is single-threaded and processes documents sequentially.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from datetime import datetime, timezone
@@ -79,25 +80,63 @@ class BatchSummary(BaseModel, frozen=True):
 
 # Mirror the kernel ``_DOC_ID_PATTERN`` charset (``[A-Za-z0-9._-]{1,128}``)
 # so a doc_id derived here is always accepted by the facade's process call.
-# The derivation is intentionally lossy: a path stem is normalised by
-# replacing every disallowed character with ``_`` and truncating to 128.
+# The derivation is intentionally lossy on the stem (charset normalisation)
+# but appends a short content-free hash of the path relative to the inbox
+# root so distinct on-disk files NEVER collapse to the same doc_id (which
+# would silently overwrite manifests in the vault).
 _DOC_ID_ALLOWED = re.compile(r"[^A-Za-z0-9._-]")
 _DOC_ID_MAX = 128
+# 10 hex chars of SHA-256 over the inbox-relative path. 40 bits is ample
+# disambiguation for any realistic inbox (collision probability ~1e-12 at
+# one-million files) while keeping the resulting doc_id compact.
+_DISAMBIGUATOR_HEX_LEN = 10
 
 
-def _derive_doc_id(path: Path) -> str:
-    """Return a filesystem-safe doc_id derived from *path*'s stem.
+def _derive_doc_id(path: Path, inbox: Path) -> str:
+    """Return a filesystem-safe, collision-resistant doc_id for *path*.
 
     The kernel restricts doc_id to ``[A-Za-z0-9._-]{1,128}`` and rejects the
-    path-traversal segments ``.`` / ``..``. This helper normalises the file
-    stem into that charset deterministically so callers do not need to
-    pre-sanitise filenames.
+    path-traversal segments ``.`` / ``..``. This helper:
+
+    1. Normalises the file stem into the allowed charset (lossy: any
+       disallowed character is replaced with ``_``).
+    2. Appends a short SHA-256-derived disambiguator computed over the
+       path's location **relative to the inbox root**. Two files with the
+       same stem in different subdirectories (e.g. ``a/report.txt`` and
+       ``b/report.txt``), or two files whose stems normalise to the same
+       token, therefore receive distinct doc_ids.
+
+    The disambiguator is deterministic: rerunning the runner over the same
+    inbox produces the same doc_ids, so manifests written on a prior run
+    are overwritten in-place rather than accumulated as duplicates.
+
+    The hash is computed over a string only — never the file contents, so
+    no raw private text reaches this function's hash input.
     """
     stem = path.stem or "doc"
-    sanitised = _DOC_ID_ALLOWED.sub("_", stem)[:_DOC_ID_MAX]
-    if sanitised in {"", ".", ".."}:
-        sanitised = "doc"
-    return sanitised
+    sanitised_stem = _DOC_ID_ALLOWED.sub("_", stem)
+    if sanitised_stem in {"", ".", ".."}:
+        sanitised_stem = "doc"
+
+    # Compute the inbox-relative path. Fall back to the absolute path when
+    # the file is not under the inbox (defensive — ``run_directory`` only
+    # yields paths from ``inbox.rglob('*')`` so this should not normally
+    # occur).
+    try:
+        rel = path.relative_to(inbox)
+        disambiguator_input = rel.as_posix()
+    except ValueError:
+        disambiguator_input = str(path)
+
+    digest = hashlib.sha256(
+        disambiguator_input.encode("utf-8", errors="replace")
+    ).hexdigest()[:_DISAMBIGUATOR_HEX_LEN]
+
+    # Reserve the suffix budget so the assembled doc_id stays within the
+    # kernel's 128-char cap. Suffix is ``"-" + digest`` (11 chars).
+    budget = _DOC_ID_MAX - (1 + _DISAMBIGUATOR_HEX_LEN)
+    stem_part = sanitised_stem[:budget] or "doc"
+    return f"{stem_part}-{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -152,21 +191,33 @@ class BatchRunner:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _process_one(self, path: Path) -> DocumentManifest | None:
+    def _process_one(self, path: Path, inbox: Path) -> DocumentManifest | None:
         """Drive *path* through the facade and return the indexed manifest.
 
         Returns ``None`` (and logs a count-only failure) on any per-document
         failure. The runner-internal log line never echoes raw text; it
         records the file path (caller-public) and the failure category
         only.
+
+        Failure isolation: any expected per-document failure — OS-level
+        read errors (``OSError``) AND decode failures
+        (``UnicodeDecodeError``, a subclass of ``ValueError``) on non-UTF-8
+        inputs — is caught here so the surrounding :meth:`run_directory`
+        loop continues with the next document instead of aborting the
+        whole batch. The runner only surfaces unexpected exceptions (e.g.
+        a kernel programmer error) to the caller.
         """
         try:
             raw_text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # ``UnicodeDecodeError`` is raised by ``read_text`` when the
+            # file's bytes are not valid UTF-8. Treating it as a per-doc
+            # failure (rather than an exception that aborts the batch)
+            # preserves the documented failure-isolation contract.
             logger.warning("batch_runner: read failed for %s", path)
             return None
 
-        doc_id = _derive_doc_id(path)
+        doc_id = _derive_doc_id(path, inbox)
         try:
             spans = self._proposer.propose(raw_text)
         except Exception:
@@ -257,7 +308,7 @@ class BatchRunner:
         manifests: list[DocumentManifest] = []
         failed_refs: list[str] = []
         for doc_ref in doc_refs:
-            manifest = self._process_one(Path(doc_ref))
+            manifest = self._process_one(Path(doc_ref), inbox)
             if manifest is None:
                 failed_refs.append(doc_ref)
             else:
