@@ -155,6 +155,106 @@ def test_scrub_stream_does_not_mask_unrelated_paths() -> None:
     assert "/tmp/build/output.log" in scrubbed
 
 
+def test_scrub_stream_path_mask_only_json_jsonl_suffixes() -> None:
+    """Issue #67 (absorbed by #75): pin the vault-path mask suffix set.
+
+    The path-shape mask only matches vault-layout substrings whose
+    filename ends with ``.json`` or ``.jsonl``. Other suffixes (``.txt``)
+    and the bare-path form (no extension) pass through unchanged. A
+    silent widening of the regex to match arbitrary filenames under the
+    vault subtree would mangle template stderr that legitimately
+    references unrelated files; conversely a narrowing that loses
+    ``.jsonl`` would silently re-expose audit-log paths. Pin both
+    directions so a future regex change fails this test loudly.
+    """
+    text = (
+        "/manifests/foo.txt and /manifests/foo and /manifests/foo.json"
+    )
+    scrubbed = scrub_stream(text, [])
+    # The .json form is masked.
+    assert "/manifests/foo.json" not in scrubbed
+    assert "<vault_path>" in scrubbed
+    # The .txt form and the bare-path form pass through.
+    assert "/manifests/foo.txt" in scrubbed
+    assert "/manifests/foo" in scrubbed
+
+
+def test_scrub_stream_case_sensitive_replacement() -> None:
+    """Issue #67 (absorbed by #75): pin the case-sensitive raw-value
+    mask.
+
+    :func:`scrub_stream` uses :meth:`str.replace`, which is
+    case-sensitive. A lowercase rendering of a registered raw value
+    (e.g. ``"alice tan"`` for a registered ``"Alice Tan"``) currently
+    passes through unchanged. This is the present contract — pin it
+    explicitly so a future case-insensitive rewrite is a deliberate,
+    independently-reviewed change rather than an ambient regression.
+
+    Note: this is NOT an endorsement of case-insensitive scrubbing as a
+    privacy posture. The redactor's :class:`Validator` enforces no-raw-
+    value invariants on manifest text upstream; this test only pins what
+    the free-form scrubber does TODAY for templated stdout/stderr.
+    """
+    entries = [
+        PrivateDictEntry(
+            key="<PERSON_a5f4ff58>",
+            original_value="Alice Tan",
+            kind=EntityKind.PERSON,
+        ),
+    ]
+    # Lowercase form is NOT a substring match for the registered raw
+    # value; the scrubber leaves it alone.
+    scrubbed = scrub_stream("alice tan was here", entries)
+    assert scrubbed == "alice tan was here"
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Unicode normalisation gap (issue #67 / #75): scrub_stream uses "
+        "str.replace which compares code points byte-for-byte. An NFD-"
+        "encoded raw value does not match an NFC-registered original_"
+        "value (or vice versa). Pin the current behaviour as xfail so a "
+        "future normalising scrubber flips this to a real pass; consider "
+        "fixing in a follow-up child."
+    ),
+    strict=True,
+)
+def test_scrub_stream_nfc_nfd_normalisation_pin() -> None:
+    """Issue #67 (absorbed by #75) — xfail pin for the NFC/NFD gap.
+
+    Register an NFC-normalised raw value (single composed code point for
+    the accented character). Scrub a text carrying the NFD-decomposed
+    form (combining mark following the base letter). The byte sequences
+    are distinct, so :meth:`str.replace` does not match — the NFD form
+    passes through unchanged, which the assertion below catches.
+
+    Marked ``strict=True`` so the day :func:`scrub_stream` learns to
+    normalise its inputs, this xfail flips to ``XPASSED`` and the test
+    must be promoted to a real pass.
+    """
+    import unicodedata
+
+    nfc_value = unicodedata.normalize("NFC", "Álice")  # "Álice", precomposed
+    nfd_value = unicodedata.normalize("NFD", "Álice")  # "A" + combining acute + "lice"
+    assert nfc_value != nfd_value, (
+        "fixture sanity: NFC and NFD encodings must differ byte-wise; "
+        "if they ever match the test is no longer exercising the gap"
+    )
+
+    entries = [
+        PrivateDictEntry(
+            key="<PERSON_alice>",
+            original_value=nfc_value,
+            kind=EntityKind.PERSON,
+        ),
+    ]
+    scrubbed = scrub_stream(f"{nfd_value} was here", entries)
+    # CURRENT behaviour: NFD form passes through. Assertion intentionally
+    # asserts the FIXED behaviour (NFD masked) so xfail flips to xpass
+    # the day the scrubber learns to normalise.
+    assert nfd_value not in scrubbed
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed re-check
 # ---------------------------------------------------------------------------

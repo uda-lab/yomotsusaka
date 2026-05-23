@@ -801,12 +801,119 @@ def test_resolver_failure_artifact_missing_when_private_dict_absent_is_opaque(
         )
 
 
-def test_resolver_failure_scope_denied_is_deferred_to_issue_27() -> None:
-    """MVP-2 resolver accepts every :class:`ResolverScope` value (see
-    metaplan Fork 6); :class:`ResolverFailureReason.ScopeDenied` is reserved
-    for the #27 policy table. Skip with a citation so a future scope-aware
-    resolver flips this to a real assertion."""
-    pytest.skip("MVP-2 accepts all scopes; see #27 for policy-gated ScopeDenied")
+def test_resolver_failure_scope_denied_no_leak(
+    canonical_vault: tuple[Path, ProcessResponse, PublicHandle],
+) -> None:
+    """Issue #66 (absorbed by #75): pin the leak-scan invariants on the
+    two restoration-policy denial paths.
+
+    Two complementary paths land the caller in a structured
+    ``RestorationResponse(outcome="failed", ...)`` denial:
+
+    1. **Scope-gate denial.** A non-``PRIVATE_BOUNDARY`` scope is rejected
+       by the boundary's scope gate (step (c) in
+       :func:`restoration_request`) before the policy table runs;
+       ``reason`` is :data:`RestorationFailureReason.ScopeDenied`. The
+       canonical fixture's
+       ``test_resolver_failure_purpose_not_permitted_is_opaque`` already
+       exercises this path implicitly, but issue #66 calls for an
+       explicit standalone assertion so the test name encodes the
+       contract.
+    2. **Policy-table denial.** A ``PRIVATE_BOUNDARY``-scoped request
+       carrying an unknown ``policy_profile`` is rejected by the policy
+       table (deny-by-default per :class:`RestorationPolicyTable`
+       semantics); ``reason`` is
+       :data:`RestorationFailureReason.PolicyDenied`. The detail string
+       contains the unknown profile name verbatim (audit-visible) but
+       must not echo raw private values or vault-shaped paths.
+
+    Both paths share the same leak-scan invariant: the serialised
+    response must carry no raw private value and no vault-shaped path.
+    The previous skip in this slot (``"MVP-2 accepts all scopes; see #27
+    for policy-gated ScopeDenied"``) was stale — #27 has landed and
+    :class:`RestorationPolicyTable` is the policy table referenced
+    there.
+    """
+    from yomotsusaka.boundary import RestorationFailureReason
+    from yomotsusaka.policy import (
+        RestorationPolicyRow,
+        RestorationPolicyTable,
+    )
+
+    vault_root, _process_response, handle = canonical_vault
+
+    # ---- Path 1: scope gate denial under ORDINARY_AGENT.
+    # A strict policy table is constructed locally so the test pins the
+    # gate ordering: the scope gate fires BEFORE the policy table is
+    # consulted, so the policy table's `require_authorization_decision`
+    # is irrelevant to this branch. (If the gate ordering ever flips, the
+    # reason changes to PolicyDenied and the assertion below catches it.)
+    strict_table = RestorationPolicyTable(
+        [
+            RestorationPolicyRow(
+                profile_name="strict-production",
+                production_scopes=["production"],
+                require_authorization_decision=True,
+                approval_ticket_pattern=None,
+                default=True,
+            )
+        ]
+    )
+    scope_failure = restoration_request(
+        _exposure_restoration_request(handle),
+        scope=ResolverScope.ORDINARY_AGENT,
+        vault_root=vault_root,
+        policy_table=strict_table,
+    )
+    assert isinstance(scope_failure, RestorationResponse)
+    assert scope_failure.outcome == "failed"
+    assert scope_failure.reason is RestorationFailureReason.ScopeDenied
+    for blob in _both_json_renders(scope_failure):
+        _assert_no_raw_values(
+            blob, surface="RestorationResponse.ScopeDenied"
+        )
+        _assert_no_paths(
+            blob,
+            surface="RestorationResponse.ScopeDenied",
+            extra=_scrub_for_path_assertion(vault_root),
+        )
+
+    # ---- Path 2: policy-table denial under PRIVATE_BOUNDARY.
+    # ``PRIVATE_BOUNDARY`` clears the scope gate; the request then names
+    # an unknown ``policy_profile``, which the table denies by default
+    # (``route_unknown_profile_to_default`` is ``False`` on user-loaded
+    # tables — see :meth:`RestorationPolicyTable.__init__`). The
+    # resulting ``RestorationResponse`` carries ``PolicyDenied`` and a
+    # detail string that names the unknown profile — privacy-discipline
+    # requires that the detail nevertheless carries no raw value and no
+    # vault-shaped path.
+    base_request = _exposure_restoration_request(handle)
+    policy_denied_request = RestorationRequest(
+        caller_label=base_request.caller_label,
+        reason=base_request.reason,
+        timestamp=base_request.timestamp,
+        target_public_handle=base_request.target_public_handle,
+        requested_entity_kinds=list(base_request.requested_entity_kinds),
+        policy_profile="profile-does-not-exist",
+    )
+    policy_failure = restoration_request(
+        policy_denied_request,
+        scope=ResolverScope.PRIVATE_BOUNDARY,
+        vault_root=vault_root,
+        policy_table=strict_table,
+    )
+    assert isinstance(policy_failure, RestorationResponse)
+    assert policy_failure.outcome == "failed"
+    assert policy_failure.reason is RestorationFailureReason.PolicyDenied
+    for blob in _both_json_renders(policy_failure):
+        _assert_no_raw_values(
+            blob, surface="RestorationResponse.PolicyDenied"
+        )
+        _assert_no_paths(
+            blob,
+            surface="RestorationResponse.PolicyDenied",
+            extra=_scrub_for_path_assertion(vault_root),
+        )
 
 
 def test_resolver_failure_purpose_not_permitted_is_opaque(tmp_path: Path) -> None:
