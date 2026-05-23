@@ -94,6 +94,7 @@ class RunPodLifecycle:
 #
 # Intentionally NOT exported from any agent-facing surface.
 
+
 class AttachRunPodLifecycle:
     """Stub marker class for the issue #46 attach-style RunPod lifecycle.
 

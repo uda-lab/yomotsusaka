@@ -80,6 +80,7 @@ class ExecutionGateway:
 #
 # Intentionally NOT exported from any agent-facing surface.
 
+
 class ExecutionRequest:
     """Stub marker class for the issue #42 execution-gateway request model.
 
