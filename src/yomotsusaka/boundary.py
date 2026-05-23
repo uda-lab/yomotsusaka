@@ -872,22 +872,37 @@ def inspect_request(
     return InspectResponse(manifest=PublicManifestView.from_manifest(manifest))
 
 
-def _redacted_snippet(text: str, query: str, *, window: int = 60) -> str:
-    """Return a window of *text* around the first case-insensitive match of *query*.
+def _redacted_snippet(
+    text: str,
+    needles: tuple[str, ...],
+    *,
+    window: int = 60,
+) -> str:
+    """Return a window of *text* around the first case-insensitive match of any *needle*.
 
     The window is taken from ``text`` only — which is already redacted on
     indexed manifests — so the result carries no raw private values.
+
+    *needles* is a tuple of post-translation search terms (i.e. redacted
+    keys plus the resolved residual, never the raw query). The first
+    needle that locates inside *text* anchors the window; if no needle
+    matches (or *needles* is empty), the first ``window`` characters of
+    *text* are returned.
     """
-    if not query:
+    if not needles:
         return text[:window]
-    haystack = text.lower()
-    needle = query.lower()
-    idx = haystack.find(needle)
-    if idx == -1:
-        return text[:window]
-    start = max(0, idx - window // 2)
-    end = min(len(text), idx + len(query) + window // 2)
-    return text[start:end]
+    haystack_lower = text.lower()
+    for needle in needles:
+        if not needle:
+            continue
+        needle_lower = needle.lower()
+        idx = haystack_lower.find(needle_lower)
+        if idx == -1:
+            continue
+        start = max(0, idx - window // 2)
+        end = min(len(text), idx + len(needle) + window // 2)
+        return text[start:end]
+    return text[:window]
 
 
 def search_request(
@@ -901,12 +916,36 @@ def search_request(
     hit is by construction public-safe. The boundary still drops the raw
     :class:`DocumentManifest` reference and exposes only handle / snippet /
     labels.
+
+    When the gateway carries a :class:`~yomotsusaka.search_gateway.QueryResolver`,
+    the raw query is translated to redacted-side needles before the snippet
+    window is computed, so the raw query string can never anchor the
+    snippet even via the substring search fallback. When no resolver is
+    attached, the raw query is used as the sole needle — preserving the
+    pre-resolver behaviour bit-for-bit.
     """
     raw_hits: list[DocumentManifest] = gateway.search(request.query, top_k=request.top_k)
+    resolver = gateway.query_resolver
+    if resolver is None:
+        needles: tuple[str, ...] = (request.query,)
+    else:
+        resolved = resolver.translate(request.query)
+        # Translated terms first (so the snippet anchors on a redacted key
+        # whenever the raw query was successfully translated); residual
+        # second only when it carries non-whitespace text.
+        needle_list = list(resolved.translated_terms)
+        if resolved.residual and resolved.residual.strip():
+            needle_list.append(resolved.residual)
+        needles = tuple(needle_list) if needle_list else (request.query,)
+        # Privacy guard: if translation produced anything, the raw query
+        # MUST NOT be used as a needle (it would defeat the whole point
+        # of the resolver). The branch above already enforces this by
+        # only falling back to ``(request.query,)`` when both translated
+        # terms and residual are empty.
     hits = [
         SearchHit(
             handle=_public_handle_for(m.doc_id),
-            redacted_snippet=_redacted_snippet(m.redacted_text, request.query),
+            redacted_snippet=_redacted_snippet(m.redacted_text, needles),
             labels=list(m.labels),
         )
         for m in raw_hits

@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from yomotsusaka import restoration_api
 from yomotsusaka.boundary import (
     InspectRequest,
     InspectResponse,
@@ -44,8 +45,9 @@ from yomotsusaka.boundary import (
     search_request,
     status_report_request,
 )
-from yomotsusaka.schemas import DocumentManifest, EntityKind
-from yomotsusaka.search_gateway import SearchGateway
+from yomotsusaka.redactor import Span, redact
+from yomotsusaka.schemas import ArtifactHandle, DocumentManifest, EntityKind
+from yomotsusaka.search_gateway import QueryResolver, SearchGateway
 
 
 _RAW_TEXT = "Alice Tan works at Acme Corp. Patient ID: 12345."
@@ -375,3 +377,119 @@ def test_inspect_request_rejects_empty_purpose(tmp_path: Path) -> None:
     )
     assert isinstance(response, ResolverFailure)
     assert response.reason is ResolverFailureReason.PurposeNotPermitted
+
+
+# ---------------------------------------------------------------------------
+# search_request — QueryResolver round-trip (#48)
+# ---------------------------------------------------------------------------
+
+
+def _canonical_kernel_spans() -> list[Span]:
+    return [Span(start=s.start, end=s.end, kind=s.kind) for s in _CANONICAL_SPAN_SPECS]
+
+
+def test_search_request_with_resolver_translates_raw_query_to_hit(
+    tmp_path: Path,
+) -> None:
+    """A raw private value submitted as the query through the public boundary
+    must surface as a hit when the gateway carries a :class:`QueryResolver`
+    populated from the document's private dictionary — and the resulting
+    :class:`SearchResponse` must not echo the raw value anywhere."""
+    vault_root = tmp_path / "vault"
+    doc_id = "resolver-search-001"
+    _process_canonical(vault_root, doc_id=doc_id)
+
+    # Re-derive the manifest + private dictionary the same way the kernel
+    # did, so the resolver registration mirrors what an in-process caller
+    # would have registered at index time.
+    _, _, private_dict = redact(_RAW_TEXT, _canonical_kernel_spans())
+    manifest = DocumentManifest.model_validate_json(
+        (vault_root / "manifests" / f"{doc_id}.json").read_text(encoding="utf-8")
+    )
+
+    resolver = QueryResolver()
+    gateway = SearchGateway(query_resolver=resolver)
+    gateway.index(manifest, private_entries=private_dict)
+
+    # Submit a RAW private value as the query — the canonical privacy
+    # case from architecture.md §12.3.
+    response = search_request(SearchRequest(query="Alice Tan"), gateway=gateway)
+    assert isinstance(response, SearchResponse)
+    assert len(response.hits) == 1
+    hit = response.hits[0]
+    assert isinstance(hit, SearchHit)
+    assert hit.handle.locator == _expected_locator(doc_id)
+
+    # Privacy invariant: the serialised response carries NO raw private
+    # value anywhere — not in the snippet, not in the handle, not in
+    # labels.
+    blob = response.model_dump_json()
+    for needle in _RAW_NEEDLES:
+        assert needle not in blob, (
+            f"search response leaked raw private value {needle!r} after "
+            "resolver-mediated translation"
+        )
+
+
+def test_search_request_with_resolver_round_trips_to_restoration(
+    tmp_path: Path,
+) -> None:
+    """The full §12.3 round-trip: raw private value → translated key → hit
+    → restoration_api.restore — which is the SOLE sanctioned path through
+    which a raw ``original_value`` becomes observable."""
+    vault_root = tmp_path / "vault"
+    doc_id = "resolver-restore-001"
+    _process_canonical(vault_root, doc_id=doc_id)
+
+    _, _, private_dict = redact(_RAW_TEXT, _canonical_kernel_spans())
+    manifest = DocumentManifest.model_validate_json(
+        (vault_root / "manifests" / f"{doc_id}.json").read_text(encoding="utf-8")
+    )
+
+    resolver = QueryResolver()
+    gateway = SearchGateway(query_resolver=resolver)
+    gateway.index(manifest, private_entries=private_dict)
+
+    # Step 1: agent submits a raw private value as the query.
+    response = search_request(SearchRequest(query="Alice Tan"), gateway=gateway)
+    assert len(response.hits) == 1
+    hit_locator = response.hits[0].handle.locator
+    # The hit locator round-trips to the same doc_id we just committed.
+    expected = _expected_locator(doc_id)
+    assert hit_locator == expected
+
+    # Step 2: re-hydrate via restoration_api.restore (the only sanctioned
+    # path). Construct the ArtifactHandle from the vault layout the
+    # kernel already wrote.
+    private_path = (vault_root / "private" / f"{doc_id}.json").resolve()
+    handle = ArtifactHandle(doc_id=doc_id, vault_path=str(private_path))
+    restored = restoration_api.restore(handle, vault_root=vault_root)
+    restored_values = {e.original_value for e in restored}
+    assert "Alice Tan" in restored_values
+    assert "Acme Corp" in restored_values
+    assert "12345" in restored_values
+
+
+def test_search_request_without_resolver_preserves_zero_hits_for_raw_query(
+    tmp_path: Path,
+) -> None:
+    """The §Done criterion: a gateway constructed without ``query_resolver``
+    and indexed without ``private_entries`` must produce identical
+    ``search_request`` results to the pre-change implementation, including
+    the zero-hit guarantee for raw private values."""
+    vault_root = tmp_path / "vault"
+    doc_id = "resolver-zero-hit"
+    _process_canonical(vault_root, doc_id=doc_id)
+
+    manifest = DocumentManifest.model_validate_json(
+        (vault_root / "manifests" / f"{doc_id}.json").read_text(encoding="utf-8")
+    )
+    gateway = SearchGateway()
+    gateway.index(manifest)
+
+    for needle in _RAW_NEEDLES:
+        response = search_request(SearchRequest(query=needle), gateway=gateway)
+        assert response.hits == [], (
+            "without a QueryResolver attached, raw private values must "
+            f"continue to produce zero hits; got hits for {needle!r}"
+        )

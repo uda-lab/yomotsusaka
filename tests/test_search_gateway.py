@@ -18,10 +18,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from yomotsusaka.pipeline import process_document
-from yomotsusaka.redactor import Span
-from yomotsusaka.schemas import DocumentManifest, EntityKind
-from yomotsusaka.search_gateway import SearchGateway
+from yomotsusaka.redactor import Span, redact
+from yomotsusaka.schemas import DocumentManifest, EntityKind, PrivateDictEntry
+from yomotsusaka.search_gateway import QueryResolver, ResolvedQuery, SearchGateway
 
 
 @dataclass(frozen=True)
@@ -114,3 +116,195 @@ def test_search_gateway_only_indexes_redacted_manifest(tmp_path: Path) -> None:
     for needle in ("Alice Tan", "Acme Corp", "12345"):
         for hay in haystacks:
             assert needle not in hay
+
+
+# ---------------------------------------------------------------------------
+# QueryResolver — raw → key translation at the private boundary (#48)
+# ---------------------------------------------------------------------------
+
+
+def _canonical_private_entries(raw_text: str) -> tuple[DocumentManifest, list[PrivateDictEntry]]:
+    """Reproduce the canonical redaction → return (redacted manifest, private dict).
+
+    The redactor is deterministic, so the keys produced here are identical
+    to the ones the pipeline persists to ``<vault_root>/private/...``.
+    """
+    redacted_text, entities, private_dict = redact(raw_text, _canonical_spans())
+    manifest = DocumentManifest(
+        doc_id="resolver-test-001",
+        source_ref="resolver-test-001",
+        redacted_text=redacted_text,
+        entities=entities,
+    )
+    return manifest, private_dict
+
+
+def test_query_resolver_translates_raw_to_key_and_returns_hit() -> None:
+    """A raw private term known to the resolver must produce a hit via the
+    translated key, exactly as the equivalent placeholder query would."""
+    raw_text = "Alice Tan works at Acme Corp. Patient ID: 12345."
+    manifest, private_dict = _canonical_private_entries(raw_text)
+
+    resolver = QueryResolver()
+    gateway = SearchGateway(query_resolver=resolver)
+    gateway.index(manifest, private_entries=private_dict)
+
+    # The raw value "Alice Tan" was a registered raw value; the gateway
+    # must translate it and return the indexed manifest.
+    hits = gateway.search("Alice Tan")
+    assert hits == [manifest]
+
+    # The corresponding redacted-key query must return the same manifest.
+    person_entry = next(e for e in private_dict if e.kind is EntityKind.PERSON)
+    placeholder_hits = gateway.search(person_entry.key)
+    assert placeholder_hits == [manifest]
+
+    # Privacy-boundary sweep: the returned manifest is the same redacted
+    # object the existing tests sweep. No raw fixture value may appear in
+    # any string-shaped field of the returned manifest.
+    (indexed,) = hits
+    haystacks = [
+        indexed.doc_id,
+        indexed.source_ref,
+        indexed.redacted_text,
+        indexed.summary,
+        *indexed.labels,
+        *(record.redacted_key for record in indexed.entities),
+    ]
+    for needle in ("Alice Tan", "Acme Corp", "12345"):
+        for hay in haystacks:
+            assert needle not in hay
+
+
+def test_query_resolver_unknown_raw_value_still_zero_hits() -> None:
+    """Even with a resolver attached, a raw value that was NEVER registered
+    must produce zero hits — the privacy invariant from the resolver-less
+    case is preserved."""
+    raw_text = "Alice Tan works at Acme Corp. Patient ID: 12345."
+    manifest, private_dict = _canonical_private_entries(raw_text)
+
+    resolver = QueryResolver()
+    gateway = SearchGateway(query_resolver=resolver)
+    gateway.index(manifest, private_entries=private_dict)
+
+    # "Bob Smith" was never indexed, never registered; it must not match.
+    assert gateway.search("Bob Smith") == []
+
+
+def test_query_resolver_without_private_entries_preserves_zero_hits() -> None:
+    """A gateway with a resolver but indexed WITHOUT ``private_entries``
+    must behave identically to a gateway with no resolver: raw private
+    values yield zero hits because nothing was registered for translation."""
+    raw_text = "Alice Tan works at Acme Corp. Patient ID: 12345."
+    manifest, _ = _canonical_private_entries(raw_text)
+
+    resolver = QueryResolver()
+    gateway = SearchGateway(query_resolver=resolver)
+    gateway.index(manifest)  # no private_entries kwarg → nothing to translate
+
+    for needle in ("Alice Tan", "Acme Corp", "12345"):
+        assert gateway.search(needle) == []
+
+
+def test_query_resolver_collision_raises() -> None:
+    """Re-registering the same raw value with a different key is a hard
+    error; the resolver MUST surface it loudly rather than silently picking
+    one mapping over the other."""
+    resolver = QueryResolver()
+    resolver.register("Alice Tan", "<PERSON_aaaaaaaa>")
+    # Idempotent re-register with the same key is fine.
+    resolver.register("Alice Tan", "<PERSON_aaaaaaaa>")
+    # Same raw value, different key → ValueError.
+    with pytest.raises(ValueError):
+        resolver.register("Alice Tan", "<PERSON_bbbbbbbb>")
+
+
+def test_query_resolver_longest_match_first() -> None:
+    """When two registered raw values overlap (one is a prefix of the
+    other), the longer match must win to avoid mis-translating
+    ``"Alice Tan"`` as just ``"Alice"``."""
+    resolver = QueryResolver()
+    resolver.register("Alice", "<PERSON_aaaaaaaa>")
+    resolver.register("Alice Tan", "<PERSON_bbbbbbbb>")
+
+    resolved = resolver.translate("Alice Tan is here")
+    # The longer registered value must win.
+    assert resolved.translated_terms == ("<PERSON_bbbbbbbb>",)
+    # "Alice" must NOT appear in the residual since it was consumed as
+    # part of the longer match.
+    assert "Alice" not in resolved.residual
+    assert "Tan" not in resolved.residual
+
+
+def test_query_resolver_passes_through_unregistered_text_to_residual() -> None:
+    """Unregistered text in the query must survive verbatim in the residual;
+    registered raw values must NOT appear in the residual after translation."""
+    resolver = QueryResolver()
+    resolver.register("Alice Tan", "<PERSON_xxxxxxxx>")
+
+    resolved = resolver.translate("hello Alice Tan world")
+    assert isinstance(resolved, ResolvedQuery)
+    assert resolved.translated_terms == ("<PERSON_xxxxxxxx>",)
+    # Raw value MUST be absent from the residual (privacy contract).
+    assert "Alice Tan" not in resolved.residual
+    # Unregistered framing text passes through.
+    assert "hello" in resolved.residual
+    assert "world" in resolved.residual
+
+
+def test_query_resolver_empty_query_returns_empty_resolved_query() -> None:
+    resolver = QueryResolver()
+    resolver.register("Alice Tan", "<PERSON_x>")
+    resolved = resolver.translate("")
+    assert resolved.translated_terms == ()
+    assert resolved.residual == ""
+
+
+def test_search_gateway_without_resolver_preserves_legacy_behaviour() -> None:
+    """The §Done criterion: a gateway constructed without ``query_resolver``
+    and indexed without ``private_entries`` must produce identical results
+    to the pre-change implementation — including the zero-hit guarantee
+    for raw private values."""
+    raw_text = "Alice Tan works at Acme Corp. Patient ID: 12345."
+    manifest, _ = _canonical_private_entries(raw_text)
+
+    gateway = SearchGateway()
+    gateway.index(manifest)
+
+    # Zero-hit invariant (pre-existing).
+    assert gateway.search("Alice Tan") == []
+    assert gateway.search("Acme Corp") == []
+    assert gateway.search("12345") == []
+
+    # Placeholder substring still hits.
+    assert gateway.search("<PERSON_") == [manifest]
+
+
+def test_search_gateway_resolver_dedupes_across_translated_and_residual() -> None:
+    """If both the translated key and the residual would match the same
+    manifest, the manifest must appear only once in the result list."""
+    raw_text = "Alice Tan works at Acme Corp. Patient ID: 12345."
+    manifest, private_dict = _canonical_private_entries(raw_text)
+
+    resolver = QueryResolver()
+    gateway = SearchGateway(query_resolver=resolver)
+    gateway.index(manifest, private_entries=private_dict)
+
+    # Query combines a raw private value AND a generic literal that
+    # appears in the redacted text. Both would independently match the
+    # same manifest; dedupe must keep it to a single entry.
+    hits = gateway.search("Alice Tan works at")
+    assert hits == [manifest]
+
+
+def test_search_gateway_index_ignores_private_entries_without_resolver() -> None:
+    """Indexing with ``private_entries`` but no resolver attached must not
+    raise — the entries are silently dropped (no place to put them)."""
+    raw_text = "Alice Tan works at Acme Corp. Patient ID: 12345."
+    manifest, private_dict = _canonical_private_entries(raw_text)
+
+    gateway = SearchGateway()  # no resolver
+    gateway.index(manifest, private_entries=private_dict)
+
+    # Raw queries still produce zero hits (no resolver to translate them).
+    assert gateway.search("Alice Tan") == []
