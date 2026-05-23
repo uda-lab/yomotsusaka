@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -80,31 +79,18 @@ from yomotsusaka.boundary import (
 from yomotsusaka.schemas import DocumentManifest, EntityKind
 from yomotsusaka.search_gateway import SearchGateway
 
-
-# ---------------------------------------------------------------------------
-# Canonical fixture (umbrella #4)
-# ---------------------------------------------------------------------------
-
-CANONICAL_TEXT = "Alice Tan works at Acme Corp. Patient ID: 12345."
-
-# Offsets are verified at module import below so this stays in lockstep with
-# CANONICAL_TEXT if the fixture ever drifts.
-CANONICAL_SPANS: tuple[SpanSpec, ...] = (
-    SpanSpec(start=0, end=9, kind=EntityKind.PERSON),
-    SpanSpec(start=19, end=28, kind=EntityKind.ORG),
-    SpanSpec(start=42, end=47, kind=EntityKind.ID_NUMBER),
+from tests._exposure_denylist import (
+    CANONICAL_SPANS,
+    CANONICAL_TEXT,
+    PATH_LEAK_PATTERNS,
+    RAW_VALUES,
 )
 
-RAW_VALUES: tuple[str, ...] = ("Alice Tan", "Acme Corp", "12345")
 
-assert CANONICAL_TEXT[0:9] == "Alice Tan"
-assert CANONICAL_TEXT[19:28] == "Acme Corp"
-assert CANONICAL_TEXT[42:47] == "12345"
-
-PATH_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"/manifests/[^/\"\\]+\.json"),
-    re.compile(r"/private/[^/\"\\]+\.json"),
-)
+# ---------------------------------------------------------------------------
+# Canonical fixture (umbrella #4) — imported from :mod:`tests._exposure_denylist`
+# so the MVP-2 scan and the MVP-3 widening share a single source of truth.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +176,96 @@ def test_no_new_unscanned_symbols_in_boundary_all() -> None:
         f"{sorted(unclassified)!r}. Either add the name to "
         "EXPECTED_BOUNDARY_SYMBOLS and write a per-surface test, or add it "
         "to _KNOWN_NON_RESPONSE_EXPORTS with a justification."
+    )
+
+
+# Kernel-symbol prefixes and exact names that must never be re-exported from
+# ``boundary.__all__``. The prefix check catches anything a future MVP-3
+# backend PR might tempt-import for convenience (``_kernel_*``, ``_private_*``);
+# the exact-name check catches private-kernel datatypes whose names do not
+# carry an underscore prefix (e.g. ``PodHandle``, ``VLLMResponse``,
+# ``PodConfig``) — these belong vault-side and must surface only as opaque
+# locators on the agent-facing boundary.
+_PRIVATE_KERNEL_PREFIX_DENYLIST: tuple[str, ...] = (
+    "_kernel_",
+    "_private_",
+)
+
+_PRIVATE_KERNEL_EXACT_DENYLIST: frozenset[str] = frozenset(
+    {
+        # RunPod lifecycle internals — vault-side; #46 must not lift these.
+        "PodHandle",
+        "PodConfig",
+        "RunPodLifecycle",
+        # #47 handshake symbol — the attach-style class lives in
+        # ``runpod_lifecycle`` (vault-side) and must surface only via an
+        # opaque locator. Re-exporting through ``boundary.__all__`` would
+        # widen the agent-facing surface without going through the
+        # ``EXPECTED_BOUNDARY_SYMBOLS`` review path.
+        "AttachRunPodLifecycle",
+        # vLLM backend internals — vault-side; #46 must not lift these.
+        "VLLMBackend",
+        "VLLMResponse",
+        # Execution-gateway internals — vault-side; #42/#43 must not lift these.
+        "ExecutionGateway",
+        # #47 handshake symbol — landed for real by #42 in
+        # ``execution_gateway.__all__``; that module is its legitimate
+        # home. ``boundary.__all__`` must not also re-export it, since
+        # the agent-facing execution surface ships through #43's
+        # ``execute_request`` entry point, not through a bare model name.
+        "ExecutionRequest",
+        # Schemas that intentionally carry private-side bytes.
+        "PrivateDictEntry",
+        "ArtifactHandle",
+    }
+)
+
+
+def test_boundary_all_does_not_export_private_kernel_symbols() -> None:
+    """Second drift guard (issue #47): ``boundary.__all__`` must not grow
+    re-exports of private-kernel symbols introduced by MVP-3 backends.
+
+    The §5 non-weakening clause forbids backend PRs from "lifting" a
+    private-kernel datatype (e.g. ``PodHandle``, ``VLLMResponse``,
+    ``ExecutionGateway``) onto the agent-facing surface as a shortcut. Such
+    a re-export would bypass the per-surface leakage scans by sneaking a
+    raw-bearing dataclass into the public namespace.
+
+    This guard fires the moment any MVP-3 PR (or any later PR) adds a name
+    to ``boundary.__all__`` that either:
+
+    1. starts with a ``_kernel_`` / ``_private_`` prefix, or
+    2. matches a known-private-kernel exact name from
+       :data:`_PRIVATE_KERNEL_EXACT_DENYLIST`.
+
+    If a future refactor legitimately needs to expose one of the listed
+    names through ``boundary``, the deny-list itself must be edited in a
+    separate, independently-reviewed PR — not in the same backend
+    integration PR (per §5 of ``docs/backend-promotion.md``).
+    """
+    module_all = set(boundary.__all__)
+
+    prefix_violations = sorted(
+        name
+        for name in module_all
+        if any(name.startswith(prefix) for prefix in _PRIVATE_KERNEL_PREFIX_DENYLIST)
+    )
+    assert not prefix_violations, (
+        "boundary.__all__ re-exports private-kernel symbol(s) matching a "
+        f"deny-list prefix: {prefix_violations!r}. Per §5 non-weakening "
+        "clause in docs/backend-promotion.md, kernel-prefixed names must "
+        "stay vault-side; remove the re-export and surface the value via an "
+        "opaque locator instead."
+    )
+
+    exact_violations = sorted(module_all & _PRIVATE_KERNEL_EXACT_DENYLIST)
+    assert not exact_violations, (
+        "boundary.__all__ re-exports private-kernel datatype(s): "
+        f"{exact_violations!r}. These names carry raw private values or "
+        "vault paths by design; per §5 non-weakening clause in "
+        "docs/backend-promotion.md, the boundary must expose only an opaque "
+        "locator. If this exposure is genuinely needed, propose the "
+        "deny-list edit in a separate, independently-reviewed PR."
     )
 
 

@@ -72,3 +72,35 @@ class RunPodLifecycle:
         """
         logger.warning("RunPodLifecycle.is_ready is a stub — returning False")
         return False
+
+
+# ---------------------------------------------------------------------------
+# MVP-3 handshake stub (#47 / #46)
+# ---------------------------------------------------------------------------
+#
+# ``AttachRunPodLifecycle`` is the activation symbol named in the issue #47
+# MVP-3 exposure-contract handshake table. It is added here as a NAMED STUB
+# so that the non-vacuity guard
+# (``tests.test_exposure_contract_mvp3.test_handshake_paths_match_impl_issues``)
+# can verify "module importable AND attribute present" without requiring
+# the real #46 implementation to have landed.
+#
+# Backend PR #46 replaces this stub with the real attach-style lifecycle
+# manager. Activation of the abstract ``ContractPodHandle`` is gated on
+# ``__is_stub__`` being false: while the marker is True, the
+# ``runpod_candidate_provider`` fixture skips with a citation; the moment
+# #46 sets ``__is_stub__ = False`` (or removes the marker) on its real
+# class, the contract activates.
+#
+# Intentionally NOT exported from any agent-facing surface.
+
+
+class AttachRunPodLifecycle:
+    """Stub marker class for the issue #46 attach-style RunPod lifecycle.
+
+    Replace with the real implementation in #46; flip ``__is_stub__`` to
+    ``False`` (or remove the attribute) to activate the abstract exposure
+    contract in :mod:`tests.test_exposure_contract_mvp3`.
+    """
+
+    __is_stub__: bool = True
