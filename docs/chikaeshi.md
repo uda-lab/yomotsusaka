@@ -178,6 +178,40 @@ section in the same PR. #42 only pins that the file path is
 `<vault_root>/audit/restoration.jsonl` and that the audit-record id
 threads through `ExecutionResponse`.
 
+### 4.1 Audit-write failure is explicit (#59)
+
+The dispatcher promises one durable audit row per call. When the
+underlying `audit.write_record` raises (either `AuditError` from the
+pre-write scrubber re-check, or `OSError` from the filesystem),
+`boundary.execute_request` MUST NOT claim the call succeeded or echo
+the original failure classification as if the audit row had landed.
+
+The dedicated failure reason
+`ExecutionFailureReason.AuditWriteFailed` (`"audit_write_failed"`)
+exists for exactly this case. The behaviour is:
+
+- Every path that reaches a required audit write — including the
+  success path after template output is available, and every
+  `_emit_failure` denial path (schema-invalid, scope-denied,
+  template-not-found, template-raised, scrub-failed,
+  artifact-missing, purpose-not-permitted) — returns
+  `ExecutionResponse(status="failed", reason=AuditWriteFailed, ...)`
+  if its required audit row cannot be persisted. No path returns
+  `status="accepted"` after the success audit write fails.
+- The response carries `artifacts=[]`, empty scrubbed stdout/stderr,
+  and a public-safe `detail` string that names only the original
+  outcome category (an enum value, never raw caller input). The
+  detail field never echoes a filesystem path, vault root, raw
+  private value, endpoint URL, pod id, or tenant identifier.
+- A failure-log line at `logger.error` records the request id,
+  original outcome category, and reason for forensic correlation;
+  the log line is similarly stripped of raw values and paths.
+- No audit row lands for the request when the write itself fails —
+  the append-only file may not even exist yet for first-call
+  failures. Tests that assert "one row per call" therefore exclude
+  `AuditWriteFailed` responses (the contract for that response is
+  zero durable rows, not one).
+
 ## 5. Container profile (§13.3 invariants)
 
 > Specification only; not yet enforced.
@@ -242,8 +276,12 @@ emit:
 - `"accepted"` — template ran to completion; `artifacts` carries the
   produced handles.
 - `"failed"` — template was refused (scope/purpose, schema-invalid,
-  scrubber failure, container exit non-zero, etc.). `artifacts` is
-  empty; `scrubbed_stderr` may carry a short diagnostic.
+  scrubber failure, container exit non-zero, etc.) OR the required
+  audit write itself failed (see §4.1). `artifacts` is empty;
+  `scrubbed_stderr` may carry a short diagnostic. The `reason` field
+  carries an :class:`ExecutionFailureReason`; the dedicated
+  `AuditWriteFailed` value distinguishes "audit pipeline failed" from
+  the seven classifications that imply a durable audit row landed.
 
 The dispatcher in #43 may narrow `status` to a `Literal[...]` or
 `Enum`; that narrowing is a backwards-compatible refinement (every
