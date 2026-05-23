@@ -66,6 +66,7 @@ cp config/model.example.yaml config/model.yaml
 - Source-of-truth precedence — see [`docs/architecture.md#source-of-truth-precedence`](docs/architecture.md#source-of-truth-precedence).
 - [RunPod notes](docs/runpod.md) — GPU setup, real costs, and vLLM startup args for self-hosted inference.
 - [Naming](docs/naming.md) — mythological component codenames (Ifuya, Kukuri, Chikaeshi, Chibiki, Kamuzumi).
+- [gate-keeper integration](docs/gate-keeper.md) — repository/process-guard policy separation; see [`policy/repo-rules.md`](policy/repo-rules.md) for the first rule catalog.
 
 ---
 
