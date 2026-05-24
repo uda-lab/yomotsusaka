@@ -74,7 +74,7 @@ For a public-safe markdown report over a recorded scenario run, pipe a
 `ScenarioResult` JSON into:
 
 ```bash
-python -m yomotsusaka.cli.operational_report < scenario.json
+uv run python -m yomotsusaka.cli.operational_report < scenario.json
 ```
 
 (MVP-5 child 03 / #92; the renderer is a fail-closed redacted sweep over
