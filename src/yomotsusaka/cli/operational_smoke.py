@@ -672,6 +672,23 @@ def _synthesise_counters(
     # phase ledger itself, not as a counter.
     if runpod is not None and runpod[0] != _STATUS_SKIPPED:
         counters["runpod_lifecycle_category"] = runpod[1]
+        # Cross-CLI state alignment (codex review on PR #119, P1).
+        # ``operational_report.classify_result_state`` is fail-closed: a
+        # failing scenario that touched RunPod defaults to
+        # ``failed_owner_action`` UNLESS the strict-bool flag
+        # ``runpod_cleanup_confirmed`` is exactly ``True``. Smoke's own
+        # classifier (:func:`_synthesise_result`) only routes to
+        # ``failed_owner_action`` when the runpod fail-category is
+        # ``cleanup_failed``; every other runpod fail
+        # (``api_key_missing``, ``wait_timeout``, ``create_failed``)
+        # routes to ``failed_cleaned``. Without an explicit flag the
+        # report renderer would render those latter cases as
+        # owner-action-required while smoke's stdout said
+        # ``failed_cleaned`` — a state mismatch that misleads operators.
+        # Mirror smoke's classifier here so both CLIs agree.
+        counters["runpod_cleanup_confirmed"] = (
+            runpod[1] != _CAT_FAIL_RUNPOD_CLEANUP
+        )
 
     return counters
 

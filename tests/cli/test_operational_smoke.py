@@ -937,6 +937,100 @@ def test_emit_json_runpod_category_present_on_live_run(
     )
 
 
+def test_emit_json_state_matches_smoke_for_runpod_failures(
+    tmp_path: Path,
+) -> None:
+    """Codex P1 (PR #119 review id 4352393743): when smoke reports
+    ``failed_cleaned`` for a RunPod-touched run, the JSON the report
+    renderer consumes MUST classify identically (``failed_cleaned``), not
+    ``failed_owner_action``.
+
+    The report renderer's ``classify_result_state`` is fail-closed: it
+    defaults to ``failed_owner_action`` for any failing scenario that
+    touched RunPod, unless the strict-bool ``runpod_cleanup_confirmed``
+    flag is exactly ``True``. We pin that the bridge emits the flag
+    correctly so the two CLIs agree.
+    """
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    _write_corpus(inbox, _canonical_corpus())
+    emit_path = tmp_path / "scenario.json"
+
+    # Force the api_key_missing path: --live-runpod with no key. Smoke
+    # classifies this as failed_cleaned (only cleanup_failed promotes
+    # to owner_action). The bridge must surface a payload that the
+    # report renderer also classifies as failed_cleaned.
+    result = _run_cli(
+        [
+            str(inbox),
+            "--vault-root",
+            str(vault),
+            "--live-runpod",
+            "--emit-json",
+            str(emit_path),
+        ]
+    )
+    assert result.returncode == 1
+    assert _result_line(result.stdout) == "failed_cleaned"
+
+    payload = json.loads(emit_path.read_text(encoding="utf-8"))
+    counters = payload["counters"]
+    assert counters["runpod_lifecycle_category"] == "api_key_missing"
+    # Strict-bool: must be the literal True, not a string or int — the
+    # renderer's check rejects anything that is not the Python bool.
+    assert counters["runpod_cleanup_confirmed"] is True
+
+    # End-to-end: render the report and assert the state token agrees.
+    from yomotsusaka.cli import operational_report as report_cli
+    from yomotsusaka.operational_report import (
+        classify_result_state,
+        render_report,
+    )
+
+    scenario = report_cli._parse_scenario_result(payload)
+    assert classify_result_state(scenario) == "failed_cleaned"
+    rendered = render_report(scenario)
+    assert "## Result\n\nfailed_cleaned\n" in rendered
+
+
+def test_emit_json_state_matches_smoke_for_cleanup_failed() -> None:
+    """Inverse of the P1 alignment: when the runpod fail-category IS
+    ``cleanup_failed``, smoke routes to ``failed_owner_action`` and the
+    JSON must carry ``runpod_cleanup_confirmed=False`` so the report
+    renderer agrees. Direct unit-test of the synthesiser because
+    triggering a real cleanup_failed needs a mocked lifecycle.
+    """
+    from yomotsusaka.cli import operational_smoke as cli_mod
+    from yomotsusaka.operational_report import (
+        PhaseRecord as ReportPhaseRecord,
+        ScenarioResult,
+        classify_result_state,
+    )
+
+    statuses = [
+        ("batch", "ok", "batch_ok"),
+        ("index_snapshot", "ok", "index_snapshot_ok"),
+        ("index_reload", "ok", "index_reload_ok"),
+        ("search_smoke", "ok", "search_smoke_ok"),
+        ("restoration_request", "ok", "restoration_ok"),
+        ("audit_inspect", "ok", "audit_inspect_ok"),
+        ("runpod_lifecycle", "fail", "cleanup_failed"),
+    ]
+    counters = cli_mod._synthesise_counters(statuses, batch_summary=None)
+    assert counters["runpod_lifecycle_category"] == "cleanup_failed"
+    assert counters["runpod_cleanup_confirmed"] is False
+
+    # The renderer agrees: failed_owner_action.
+    scenario = ScenarioResult(
+        phases=tuple(
+            ReportPhaseRecord(p, s, c)  # type: ignore[arg-type]
+            for p, s, c in statuses
+        ),
+        counters=counters,
+    )
+    assert classify_result_state(scenario) == "failed_owner_action"
+
+
 def test_synthesise_counters_omits_runpod_when_skipped() -> None:
     """Direct unit-test of the counter-synthesis helper: a skipped RunPod
     phase MUST NOT emit a ``runpod_lifecycle_category`` key. An empty
@@ -954,6 +1048,10 @@ def test_synthesise_counters_omits_runpod_when_skipped() -> None:
     ]
     counters = cli_mod._synthesise_counters(statuses, batch_summary=None)
     assert "runpod_lifecycle_category" not in counters
+    # When the phase did NOT run, the cleanup-confirmed flag also stays
+    # out of the payload — there is no failing scenario to classify, so
+    # the report renderer's fail-closed default never fires.
+    assert "runpod_cleanup_confirmed" not in counters
     # Boolean-as-int counters are integers, not bool-strings.
     assert counters["index_snapshot_ok"] == 1
     assert counters["index_loadable"] == 1
