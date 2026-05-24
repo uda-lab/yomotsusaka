@@ -17,6 +17,12 @@ uv run ruff check src tests
 uv run python -m yomotsusaka.cli.run_batch ./inbox --vault-root ./vault  # quick end-to-end check
 ~~~
 
+## Operational smoke
+
+~~~sh
+uv run python -m yomotsusaka.cli.operational_smoke ./inbox --vault-root ./vault  # MVP-5 #91; no network by default
+~~~
+
 ## Architecture
 
 - `docs/architecture.md` governs privacy-boundary decisions when docs, tests, or module comments conflict.

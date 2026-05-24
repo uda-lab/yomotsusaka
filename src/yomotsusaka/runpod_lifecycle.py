@@ -250,6 +250,32 @@ _MANAGE_HEALTH_POLL_MAX_ATTEMPTS = 60
 _MANAGE_DELETE_TIMEOUT_SECONDS = 30
 """Single ``DELETE /v1/pods/{podId}`` request timeout."""
 
+_MANAGE_CLEANUP_RETRY_DELAY_SECONDS = 2
+"""Sleep between the first and second cleanup attempts (issue #90).
+
+When the first ``DELETE /v1/pods/{podId}`` attempt fails (transient
+network error or non-2xx response), the lifecycle waits this many
+seconds and issues exactly ONE more REST-based attempt before raising
+``PodUnavailableError("cleanup_failed")``. The retry is bounded
+(single attempt) to keep the worst-case cleanup wall-clock predictable
+for the agent-runnable MVP-5 flow (umbrella #89): two REST attempts
+plus one short sleep cannot exceed ``2 * _MANAGE_DELETE_TIMEOUT_SECONDS
++ _MANAGE_CLEANUP_RETRY_DELAY_SECONDS`` (62 s by default).
+
+Module-level so L1 tests can monkeypatch it to 0 without touching
+``time.sleep`` mocks (mirrors the ``_MANAGE_HEALTH_POLL_*`` pattern).
+"""
+
+_MANAGE_CLEANUP_MAX_ATTEMPTS = 2
+"""Total number of cleanup attempts (1 original + 1 bounded retry).
+
+Issue #90: a bounded REST-based safe-retry on cleanup failure. The
+retry uses the same REST mechanism — no fall-back to ``runpodctl`` or
+any out-of-band channel — so the public-safe category vocabulary is
+unchanged. Module-level so L1 tests can monkeypatch to 1 to assert
+the no-retry baseline if needed.
+"""
+
 
 class ManageRunPodLifecycle(RunPodLifecycle):
     """Real RunPod ``manage`` mode — create → wait → delete via REST.
@@ -434,6 +460,17 @@ class ManageRunPodLifecycle(RunPodLifecycle):
         ``_auth_headers`` would build ``Authorization: Bearer None`` and
         surface a misleading ``cleanup_failed`` (copilot review on PR
         #84).
+
+        Bounded safe-retry (issue #90 / MVP-5 umbrella #89): when the
+        first REST attempt fails (transient HTTPError or non-2xx
+        response), wait ``_MANAGE_CLEANUP_RETRY_DELAY_SECONDS`` and
+        issue ONE more REST attempt before raising
+        ``PodUnavailableError("cleanup_failed")``. The retry stays on
+        the REST mechanism — no out-of-band ``runpodctl`` fall-back —
+        so the public-safe category vocabulary and the agent-facing
+        surface contract are unchanged. The bound is intentionally
+        narrow (single retry) to keep worst-case cleanup wall-clock
+        predictable for the agent-runnable lifecycle.
         """
         if self._bypass_pod_id is not None and self._bypass_endpoint is not None:
             # Bypass mode — the test seam supplied the handle; no REST
@@ -448,21 +485,55 @@ class ManageRunPodLifecycle(RunPodLifecycle):
             if terminate
             else f"/pods/{handle.pod_id}/stop"
         )
-        try:
-            with self._rest_client(timeout=_MANAGE_DELETE_TIMEOUT_SECONDS) as client:
-                if terminate:
-                    response = client.delete(path, headers=self._auth_headers())
-                else:
-                    response = client.post(path, headers=self._auth_headers())
-        except httpx.HTTPError:
-            logger.info("cleanup_failed")
-            raise PodUnavailableError("cleanup_failed")
 
-        if not 200 <= response.status_code < 300:
-            logger.info("cleanup_failed")
-            raise PodUnavailableError("cleanup_failed")
+        # Bounded REST retry loop (issue #90). The loop runs at most
+        # ``_MANAGE_CLEANUP_MAX_ATTEMPTS`` times; on each failure that is
+        # not the final attempt, we log ``cleanup_retry`` (diagnostic
+        # surface only) and sleep before retrying. On the final failure
+        # we log ``cleanup_failed`` and raise. No public-safe category
+        # change: the category vocabulary the helper script consumes
+        # (``cleanup_failed`` / ``deleted`` / ``stopped``) is unchanged.
+        # No reason string is propagated past the retry boundary — the
+        # raw ``httpx`` exception text and the response body MUST NOT
+        # reach the public-safe surface (per Decision 3 / §6).
+        for attempt in range(_MANAGE_CLEANUP_MAX_ATTEMPTS):
+            attempt_failed = False
+            try:
+                with self._rest_client(
+                    timeout=_MANAGE_DELETE_TIMEOUT_SECONDS
+                ) as client:
+                    if terminate:
+                        response = client.delete(
+                            path, headers=self._auth_headers()
+                        )
+                    else:
+                        response = client.post(
+                            path, headers=self._auth_headers()
+                        )
+            except httpx.HTTPError:
+                attempt_failed = True
+            else:
+                if 200 <= response.status_code < 300:
+                    logger.info("deleted" if terminate else "stopped")
+                    return
+                attempt_failed = True
 
-        logger.info("deleted" if terminate else "stopped")
+            # Failure on this attempt. If we have a retry budget left,
+            # emit the diagnostic-only ``cleanup_retry`` marker and sleep.
+            # ``cleanup_retry`` is a logger-only diagnostic literal
+            # (carries no Pod id / URL / response body / bearer / exception
+            # text) — it never reaches the public-safe ``lifecycle:``
+            # channel emitted by ``scripts/manage_runpod.py``.
+            if attempt_failed and attempt < _MANAGE_CLEANUP_MAX_ATTEMPTS - 1:
+                logger.info("cleanup_retry")
+                if _MANAGE_CLEANUP_RETRY_DELAY_SECONDS > 0:
+                    time.sleep(_MANAGE_CLEANUP_RETRY_DELAY_SECONDS)
+
+        # All attempts exhausted — surface the terminal category. The
+        # public-safe ``cleanup_failed`` literal is the only thing the
+        # helper script consumes.
+        logger.info("cleanup_failed")
+        raise PodUnavailableError("cleanup_failed")
 
     def is_ready(self, handle: PodHandle) -> bool:
         """Probe ``GET {endpoint}/health`` — identical to attach mode."""

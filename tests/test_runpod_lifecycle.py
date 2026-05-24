@@ -390,6 +390,13 @@ def test_manage_lifecycle_stop_pod_failure_raises_cleanup_failed(
     monkeypatch.setattr(
         runpod_lifecycle_module, "_MANAGE_HEALTH_POLL_INTERVAL_SECONDS", 0
     )
+    # Issue #90: stop_pod now retries once before raising; keep the test
+    # wall-clock sub-second by zeroing the retry delay. The terminal
+    # category remains ``cleanup_failed`` after the bounded retry budget
+    # is exhausted.
+    monkeypatch.setattr(
+        runpod_lifecycle_module, "_MANAGE_CLEANUP_RETRY_DELAY_SECONDS", 0
+    )
     handler = _make_lifecycle_handler(fail_on_delete=True)
     lifecycle = ManageRunPodLifecycle(
         api_key="sk-test", transport=httpx.MockTransport(handler)
@@ -398,6 +405,98 @@ def test_manage_lifecycle_stop_pod_failure_raises_cleanup_failed(
     with pytest.raises(PodUnavailableError) as excinfo:
         lifecycle.stop_pod(handle, terminate=True)
     assert excinfo.value.args[0] == "cleanup_failed"
+
+
+def test_manage_lifecycle_stop_pod_retries_once_before_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #90: cleanup uses a bounded REST-based safe-retry.
+
+    On a transient ``DELETE`` failure the lifecycle issues exactly one
+    more REST attempt before raising. The retry stays on the REST
+    mechanism — no ``runpodctl`` fall-back — and the terminal category
+    remains the public-safe ``cleanup_failed`` literal.
+    """
+    monkeypatch.setattr(
+        runpod_lifecycle_module, "_MANAGE_HEALTH_POLL_INTERVAL_SECONDS", 0
+    )
+    monkeypatch.setattr(
+        runpod_lifecycle_module, "_MANAGE_CLEANUP_RETRY_DELAY_SECONDS", 0
+    )
+    record: dict[str, list[httpx.Request]] = {}
+    handler = _make_lifecycle_handler(fail_on_delete=True, record=record)
+    lifecycle = ManageRunPodLifecycle(
+        api_key="sk-test", transport=httpx.MockTransport(handler)
+    )
+    handle = lifecycle.start_pod(PodConfig())
+    with pytest.raises(PodUnavailableError) as excinfo:
+        lifecycle.stop_pod(handle, terminate=True)
+    assert excinfo.value.args[0] == "cleanup_failed"
+    # Two DELETE attempts were issued (initial + one bounded retry).
+    assert len(record.get("DELETE", [])) == 2, (
+        f"expected exactly 2 DELETE attempts (initial + retry); got "
+        f"{len(record.get('DELETE', []))}"
+    )
+
+
+def test_manage_lifecycle_stop_pod_retry_succeeds_after_first_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #90: the bounded retry can recover from a single transient
+    failure. The first DELETE fails, the second DELETE succeeds, and
+    ``stop_pod`` returns cleanly. The diagnostic surface records the
+    retry; the public-safe category vocabulary is unchanged.
+    """
+    monkeypatch.setattr(
+        runpod_lifecycle_module, "_MANAGE_HEALTH_POLL_INTERVAL_SECONDS", 0
+    )
+    monkeypatch.setattr(
+        runpod_lifecycle_module, "_MANAGE_CLEANUP_RETRY_DELAY_SECONDS", 0
+    )
+
+    delete_call_counter = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path.endswith("/pods"):
+            return httpx.Response(
+                201,
+                json={
+                    "id": "pod-retry-001",
+                    "endpoint": "http://retry.invalid:8000",
+                },
+            )
+        if path.endswith("/health"):
+            return httpx.Response(200)
+        if request.method == "DELETE" and "/pods/" in path:
+            delete_call_counter["n"] += 1
+            if delete_call_counter["n"] == 1:
+                raise httpx.ConnectError(
+                    "simulated transient delete failure", request=request
+                )
+            return httpx.Response(200)
+        return httpx.Response(404)
+
+    lifecycle = ManageRunPodLifecycle(
+        api_key="sk-test", transport=httpx.MockTransport(handler)
+    )
+    handle = lifecycle.start_pod(PodConfig())
+    with caplog.at_level(logging.INFO, logger="yomotsusaka.runpod_lifecycle"):
+        # No exception — the second attempt succeeded.
+        lifecycle.stop_pod(handle, terminate=True)
+    assert delete_call_counter["n"] == 2
+    messages = [r.getMessage() for r in caplog.records]
+    # The diagnostic surface records the retry and the final success.
+    assert "cleanup_retry" in messages, (
+        f"expected cleanup_retry on diagnostic logger; got {messages!r}"
+    )
+    assert "deleted" in messages, (
+        f"expected final 'deleted' marker after successful retry; got "
+        f"{messages!r}"
+    )
+    # The terminal failure category is NEVER emitted on the recovery path.
+    assert "cleanup_failed" not in messages
 
 
 def test_manage_lifecycle_stop_pod_terminate_false_uses_stop_endpoint(
@@ -458,6 +557,8 @@ def test_manage_lifecycle_logs_only_category_literals(
         "create_failed",
         "wait_timeout",
         "cleanup_failed",
+        # Issue #90 — bounded REST-based cleanup retry diagnostic marker.
+        "cleanup_retry",
     }
     for msg in messages:
         assert msg in allowed, f"log record {msg!r} is not a category literal"
@@ -692,31 +793,90 @@ def _make_fake_smoke_runner(*, success: bool = True):
     return runner, captured
 
 
-def test_manage_helper_runpodctl_missing_exits_two(
+def test_manage_helper_runpodctl_missing_is_not_a_preflight_failure(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("RUNPOD_API_KEY", "sk-test")
+    """Issue #90 / MVP-5: missing ``runpodctl`` must NOT abort the run.
+
+    The lifecycle is fully REST-based; ``runpodctl`` is now optional
+    owner break-glass tooling (``docs/runpod-agent-lifecycle.md`` §10,
+    ``docs/runpod.md`` §10). The helper:
+
+    - MUST NOT emit ``lifecycle: runpodctl_missing`` on stdout (the
+      public-safe ``lifecycle:`` channel is reserved for hard categories).
+    - MUST NOT write a ``runpodctl_missing`` row to the JSONL log
+      (downstream consumers gate on the failure rows).
+    - MUST NOT exit non-zero just because ``runpodctl`` is absent.
+    - MAY emit a single informational ``runpodctl_missing`` line on the
+      ``logger.info`` diagnostic surface for owner-side debugging.
+
+    The only mandatory preflight remains ``RUNPOD_API_KEY`` (covered by
+    the next test).
+    """
     log_path = tmp_path / "lifecycle.jsonl"
 
-    rc = manage_runpod.run_lifecycle(
-        keep_pod=False,
-        pod_config=PodConfig(),
-        lifecycle_factory=lambda: _make_fake_lifecycle(),
-        smoke_runner=lambda *_a, **_k: None,
-        lifecycle_log=log_path,
-        runpodctl_check=lambda: False,
-    )
+    fake = _make_fake_lifecycle()
+    runner, _captured = _make_fake_smoke_runner(success=True)
+    with caplog.at_level(logging.INFO, logger="yomotsusaka.manage_runpod"):
+        rc = manage_runpod.run_lifecycle(
+            keep_pod=False,
+            pod_config=PodConfig(),
+            lifecycle_factory=lambda: fake,
+            smoke_runner=runner,
+            lifecycle_log=log_path,
+            env={"RUNPOD_API_KEY": "sk-test"},
+            runpodctl_check=lambda: False,
+        )
     out = capsys.readouterr()
-    assert rc == manage_runpod.EXIT_PREFLIGHT_FAILED
-    assert "lifecycle: runpodctl_missing" in out.out
-    # No REST call happened — no smoke env in log.
-    _assert_no_helper_secret(out.out + "\n" + out.err)
-    # The JSONL row was appended.
+
+    # The run completes successfully; missing runpodctl is informational.
+    assert rc == manage_runpod.EXIT_OK, (
+        f"missing runpodctl must not fail the run; got rc={rc} "
+        f"stdout={out.out!r} stderr={out.err!r}"
+    )
+    assert "lifecycle: runpodctl_missing" not in out.out, (
+        "the public-safe lifecycle: channel must not carry runpodctl_missing "
+        "under default mode"
+    )
+    # The lifecycle reached delete (it is REST end-to-end; runpodctl
+    # absence does not block the happy path).
+    assert "lifecycle: created" in out.out
+    assert "lifecycle: deleted" in out.out
+
+    # Diagnostic logger surface MAY carry the informational marker, but
+    # not at a higher severity than INFO.
+    info_messages = [
+        r.getMessage() for r in caplog.records if r.levelno <= logging.INFO
+    ]
+    assert any("runpodctl_missing" in m for m in info_messages), (
+        "expected an informational runpodctl_missing logger.info line on the "
+        "diagnostic surface; got " + repr(info_messages)
+    )
+
+    # The JSONL log must NOT contain a runpodctl_missing row — downstream
+    # report surfaces (MVP-5 child 03) gate on the failure rows.
     rows = [json.loads(line) for line in log_path.read_text().splitlines()]
-    assert rows and rows[0]["category"] == "runpodctl_missing"
-    assert set(rows[0].keys()) == {"timestamp", "request_id", "category"}
+    categories = [r["category"] for r in rows]
+    assert "runpodctl_missing" not in categories, (
+        "lifecycle.jsonl must not record runpodctl_missing as a failure "
+        f"category under default mode; got categories={categories}"
+    )
+
+    # Sanitisation invariant still holds across all surfaces.
+    _assert_no_helper_secret(out.out + "\n" + out.err)
+
+
+def test_manage_helper_runpodctl_constant_remains_for_consumers() -> None:
+    """Issue #90: the ``runpodctl_missing`` constant stays defined.
+
+    Even though the default happy path no longer emits the category, the
+    constant remains as a stable public-safe identifier for downstream
+    consumers and for any future ``--strict-runpodctl`` opt-in flag.
+    """
+    assert manage_runpod._CATEGORY_PREFLIGHT_RUNPODCTL == "runpodctl_missing"
 
 
 def test_manage_helper_api_key_missing_exits_two(

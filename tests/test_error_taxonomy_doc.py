@@ -1,13 +1,15 @@
 """Drift-detection test for ``docs/error-taxonomy.md``.
 
-Asserts that every value of the four ``*FailureReason`` / ``*Reason`` surfaces
-appears in ``docs/error-taxonomy.md`` and that each enum class name appears as
-an H2 header (``## <ClassName>``). When a new enum value is added at the source
-without being documented here, this test fails with a message pointing the
-maintainer at child issue #74 (mvp4 stacked-PR series) for guidance.
+Asserts that every value of the five ``*FailureReason`` / ``*Reason`` /
+``OperationalCategory`` surfaces appears in ``docs/error-taxonomy.md`` and
+that each surface's class name appears as an H2 header (``## <ClassName>``).
+When a new enum value is added at the source without being documented here,
+this test fails with a message pointing the maintainer at child issue #74
+(MVP-4 stacked-PR series) — or, for the operational taxonomy, child issue
+#93 (MVP-5) — for guidance.
 
-Three of the four surfaces are ``enum.Enum`` subclasses; the fourth
-(``InferenceBackendReason``) is a ``typing.Literal`` alias. Both shapes are
+Four of the five surfaces are ``enum.Enum`` subclasses;
+``InferenceBackendReason`` is a ``typing.Literal`` alias. Both shapes are
 handled below.
 """
 
@@ -24,6 +26,7 @@ from yomotsusaka.boundary import (
 )
 from yomotsusaka.execution_gateway import ExecutionFailureReason
 from yomotsusaka.inference_backend import InferenceBackendReason
+from yomotsusaka.operational_taxonomy import OperationalCategory
 
 DOC_PATH = Path(__file__).resolve().parent.parent / "docs" / "error-taxonomy.md"
 
@@ -46,6 +49,10 @@ _ENUM_SURFACES: tuple[tuple[str, tuple[str, ...]], ...] = (
         # ``InferenceBackendReason`` is ``typing.Literal[...]``, not an Enum.
         # ``typing.get_args`` returns the literal string members.
         tuple(get_args(InferenceBackendReason)),
+    ),
+    (
+        "OperationalCategory",
+        tuple(member.value for member in OperationalCategory),
     ),
 )
 
@@ -116,11 +123,12 @@ def test_surfaces_enumerate_known_enum_shapes() -> None:
         "RestorationFailureReason",
         "ExecutionFailureReason",
         "InferenceBackendReason",
+        "OperationalCategory",
     }
     surface_names = {name for name, _values in _ENUM_SURFACES}
     assert surface_names == expected_names, (
         f"surface tuple {surface_names} drifted from expected {expected_names}; "
-        "update _ENUM_SURFACES to match the four documented enums."
+        "update _ENUM_SURFACES to match the five documented enums."
     )
 
 
@@ -140,6 +148,7 @@ def test_enum_subclasses_are_str_enums_where_expected() -> None:
         ResolverFailureReason,
         RestorationFailureReason,
         ExecutionFailureReason,
+        OperationalCategory,
     ):
         assert issubclass(klass, Enum), f"{klass.__name__} is not an Enum subclass"
         for member in klass:
