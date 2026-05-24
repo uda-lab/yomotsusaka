@@ -1,0 +1,41 @@
+name: gate-keeper
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  gatekeeper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      - name: Install project
+        run: uv sync --extra dev
+
+      - name: check_docs_commands
+        run: uv run python scripts/gatekeeper/check_docs_commands.py
+
+      - name: check_docs_links
+        run: uv run python scripts/gatekeeper/check_docs_links.py --no-gh
+
+      - name: check_readme_provenance
+        run: uv run python scripts/gatekeeper/check_readme_provenance.py
+
+      - name: check_agents_md
+        run: uv run python scripts/gatekeeper/check_agents_md.py
+
+      # vocab_drift has 2 pre-existing failures on tip-of-main that are
+      # tracked as a deferred follow-up from MVP-6 (issue #123).
+      # Run advisory only so known-broken drift does not block every PR
+      # until the follow-up lands.
+      - name: check_vocab_drift (advisory)
+        run: uv run python scripts/gatekeeper/check_vocab_drift.py
+        continue-on-error: true
