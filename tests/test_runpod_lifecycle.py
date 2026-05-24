@@ -710,12 +710,21 @@ def test_manage_lifecycle_handle_exposure_unchanged(
 
 # ---------------------------------------------------------------------------
 # RUNPOD_TEMPLATE_ID — _create_payload round-trip (L1) + env-var hook (L2)
-# issue #126
+# issue #126; codex P1 fixup on PR #131 strengthens the precedence rule
+# so PodConfig() picks up the env at default-factory time (so explicit
+# PodConfig() callers like scripts/manage_runpod.py also honour the env).
 # ---------------------------------------------------------------------------
 
 
-def test_create_payload_without_template_id_omits_template_key() -> None:
-    """L1 — _create_payload with template_id=None must not include templateId."""
+def test_create_payload_without_template_id_omits_template_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L1 — _create_payload with template_id=None must not include templateId.
+
+    PodConfig() now reads RUNPOD_TEMPLATE_ID via its default factory, so
+    this test explicitly clears the env to assert the None case.
+    """
+    monkeypatch.delenv("RUNPOD_TEMPLATE_ID", raising=False)
     config = PodConfig()
     assert config.template_id is None
     payload = ManageRunPodLifecycle._create_payload(config)
@@ -726,8 +735,11 @@ def test_create_payload_without_template_id_omits_template_key() -> None:
     assert "env" in payload
 
 
-def test_create_payload_with_template_id_includes_template_key() -> None:
+def test_create_payload_with_template_id_includes_template_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """L1 — _create_payload with template_id set includes templateId value."""
+    monkeypatch.delenv("RUNPOD_TEMPLATE_ID", raising=False)
     config = PodConfig(template_id="tmpl-abc123")
     payload = ManageRunPodLifecycle._create_payload(config)
     assert payload["templateId"] == "tmpl-abc123"
@@ -736,6 +748,106 @@ def test_create_payload_with_template_id_includes_template_key() -> None:
     assert "imageName" in payload
     assert "containerDiskInGb" in payload
     assert "env" in payload
+
+
+def test_pod_config_reads_template_id_from_env_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for codex P1 on PR #131: PodConfig() picks up env at
+    default-factory time so every caller — including ones that construct
+    PodConfig() explicitly (e.g. ``scripts/manage_runpod.py``) — honours
+    RUNPOD_TEMPLATE_ID without explicit threading.
+    """
+    monkeypatch.setenv("RUNPOD_TEMPLATE_ID", "tmpl-from-env-xyz")
+    config = PodConfig()
+    assert config.template_id == "tmpl-from-env-xyz", (
+        "PodConfig() default factory must read RUNPOD_TEMPLATE_ID from env; "
+        f"got {config.template_id!r}"
+    )
+
+
+def test_pod_config_explicit_template_id_overrides_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Precedence: explicit kwarg > env > None.
+
+    Codex P1 fixup on PR #131 — when the caller passes an explicit
+    ``template_id`` to ``PodConfig(...)``, that value must win over any
+    ``RUNPOD_TEMPLATE_ID`` env var.
+    """
+    monkeypatch.setenv("RUNPOD_TEMPLATE_ID", "tmpl-from-env")
+    config = PodConfig(template_id="tmpl-explicit")
+    assert config.template_id == "tmpl-explicit", (
+        "explicit PodConfig(template_id=...) must override env; "
+        f"got {config.template_id!r}"
+    )
+
+
+def test_pod_config_empty_env_template_id_treated_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty RUNPOD_TEMPLATE_ID is treated as unset.
+
+    Mirrors the empty-string handling for RUNPOD_API_KEY (see
+    ``test_manage_lifecycle_empty_api_key_treated_as_missing``). An empty
+    string from the env must resolve to None, not be sent as
+    ``templateId=""`` in the REST body.
+    """
+    monkeypatch.setenv("RUNPOD_TEMPLATE_ID", "")
+    config = PodConfig()
+    assert config.template_id is None
+
+
+def test_explicit_pod_config_with_env_template_id_includes_in_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1 regression: explicit ``PodConfig()`` + env-set
+    RUNPOD_TEMPLATE_ID must still yield ``templateId`` in the POST /pods
+    payload.
+
+    This is the exact failure mode codex flagged — the primary caller
+    (``scripts/manage_runpod.py``) constructs ``PodConfig()`` explicitly
+    and passes it as ``pod_config=...``. The env-var must be honoured in
+    that path or the owner-pinned template is silently ignored.
+    """
+    monkeypatch.setenv("RUNPOD_TEMPLATE_ID", "tmpl-explicit-cfg")
+    received_payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+        if request.method == "POST" and request.url.path.endswith("/pods"):
+            received_payloads.append(_json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={
+                    "id": "pod-explicit-cfg",
+                    "endpoint": "http://explicit-cfg.invalid:8000",
+                },
+            )
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200)
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        return httpx.Response(404)
+
+    import yomotsusaka.runpod_lifecycle as _mod
+    monkeypatch.setattr(_mod, "_MANAGE_HEALTH_POLL_INTERVAL_SECONDS", 0)
+    # Caller constructs PodConfig() explicitly — mirrors the
+    # scripts/manage_runpod.py primary call site.
+    explicit_config = PodConfig()
+    lifecycle = ManageRunPodLifecycle(
+        api_key="sk-test",
+        pod_config=explicit_config,
+        transport=httpx.MockTransport(handler),
+    )
+    handle = lifecycle.start_pod()
+    lifecycle.stop_pod(handle, terminate=True)
+
+    assert len(received_payloads) == 1
+    assert received_payloads[0].get("templateId") == "tmpl-explicit-cfg", (
+        "explicit PodConfig() must still pick up RUNPOD_TEMPLATE_ID via "
+        f"its default factory; got {received_payloads[0]}"
+    )
 
 
 def test_manage_lifecycle_env_template_id_flows_into_payload(
