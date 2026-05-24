@@ -16,6 +16,7 @@
 ~~~sh
 uv run pytest
 uv run ruff check src tests
+uv run yomo-gatekeeper
 ~~~
 
 ## Maintenance
