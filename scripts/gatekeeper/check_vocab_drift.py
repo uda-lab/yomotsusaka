@@ -73,6 +73,17 @@ __all__ = [
 # Markdown and RST docs participate in the canonical-token surface.
 CATEGORY_TOKEN_RE = re.compile(r"`(?P<tok>[a-z][a-z0-9_]*)`")
 
+# Matches a quoted Python string literal carrying a lowercase
+# snake_case identifier — e.g. ``"batch_ok"`` or ``'batch_ok'``. The
+# CLI modules emit category values as bare string literals
+# (``_CAT_OK_BATCH = "batch_ok"``), and the issue #115 spec
+# explicitly names the CLI files as part of the D1 scan set:
+# *every category token name appearing in CLI output, JSON schemas,
+# or docs is a member of OperationalCategory*. Without this regex,
+# drift in runtime literals would slip past D1 (flagged by codex on
+# PR #118).
+PY_STRING_TOKEN_RE = re.compile(r"['\"](?P<tok>[a-z][a-z0-9_]*)['\"]")
+
 # Closed enumeration: only these five tokens are interesting.
 EXPOSURE_TOKEN_RE = re.compile(
     r"`(?P<tok>agent_public|agent_redacted|private|restricted|never_expose)`"
@@ -127,6 +138,31 @@ CATEGORY_SYNONYM_ALLOWLIST: frozenset[str] = frozenset(
         "audit_record_id",
         "audit_file_missing",
         "audit_write_failed",
+        # ---------------------------------------------------------------
+        # Pre-#111 baseline: the operational_smoke CLI emits its own
+        # local category vocabulary that runs parallel to (and is
+        # documented to be canonicalized against)
+        # OperationalCategory under issue #111. Listing them here
+        # keeps the check passing on tip-of-main per #115 acceptance
+        # criteria while still catching any NEW drift introduced
+        # post-#115. #111 trims this bucket as it canonicalizes each
+        # token in src/yomotsusaka/cli/operational_smoke.py.
+        # ---------------------------------------------------------------
+        "batch_committed",
+        "batch_no_documents",
+        "batch_all_failed",
+        "batch_partial_commit",
+        "batch_infrastructure_error",
+        "index_reloaded",
+        "index_reload_failed",
+        "restoration_request_recorded",
+        "restoration_request_unexpected_outcome",
+        "audit_present",
+        "audit_record_not_found",
+        "runpod_cycle_complete",
+        "runpod_disabled",
+        "runpod_kept",
+        "search_no_hits",
     }
 )
 
@@ -192,30 +228,46 @@ def check_operational_category_drift(repo_root: Path) -> list[Finding]:
     findings: list[Finding] = []
     for p in _d1_scan_set(repo_root):
         rel = str(p.relative_to(repo_root))
+        # For .py files we scan BOTH backtick-quoted docstring tokens
+        # AND single-/double-quoted Python string literals. The
+        # docstring shape catches RST ``index_snapshot`` references;
+        # the string-literal shape catches the actual runtime values
+        # the CLI emits (``"batch_ok"`` etc.). For .md files only the
+        # backtick form is meaningful.
+        regexes = (
+            (CATEGORY_TOKEN_RE, PY_STRING_TOKEN_RE)
+            if p.suffix == ".py"
+            else (CATEGORY_TOKEN_RE,)
+        )
         for i, raw_line in enumerate(p.read_text().splitlines(), start=1):
-            for m in CATEGORY_TOKEN_RE.finditer(raw_line):
-                tok = m.group("tok")
-                if "_" not in tok:
-                    continue
-                prefix = tok.split("_", 1)[0]
-                if prefix not in CATEGORY_PREFIXES:
-                    continue
-                if tok in canonical:
-                    continue
-                if tok in CATEGORY_SYNONYM_ALLOWLIST:
-                    continue
-                findings.append(
-                    Finding(
-                        severity="error",
-                        code="VOCAB_DRIFT_OP_CATEGORY",
-                        file=rel,
-                        line=i,
-                        message=(
-                            f"`{tok}` is not a canonical OperationalCategory "
-                            "member nor a documented synonym"
-                        ),
+            matched_on_line: set[str] = set()
+            for regex in regexes:
+                for m in regex.finditer(raw_line):
+                    tok = m.group("tok")
+                    if tok in matched_on_line:
+                        continue
+                    matched_on_line.add(tok)
+                    if "_" not in tok:
+                        continue
+                    prefix = tok.split("_", 1)[0]
+                    if prefix not in CATEGORY_PREFIXES:
+                        continue
+                    if tok in canonical:
+                        continue
+                    if tok in CATEGORY_SYNONYM_ALLOWLIST:
+                        continue
+                    findings.append(
+                        Finding(
+                            severity="error",
+                            code="VOCAB_DRIFT_OP_CATEGORY",
+                            file=rel,
+                            line=i,
+                            message=(
+                                f"`{tok}` is not a canonical OperationalCategory "
+                                "member nor a documented synonym"
+                            ),
+                        )
                     )
-                )
     return findings
 
 

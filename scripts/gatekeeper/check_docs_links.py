@@ -202,11 +202,19 @@ def resolve_link(link: Link, repo_root: Path) -> list[Finding]:
             return []  # empty target — nothing to resolve
         return _check_anchor_in_file(link.source, anchor, link, repo_root)
 
-    # Absolute-style or repo-rooted path.
+    # Absolute-style paths (leading ``/``) are the only repo-rooted
+    # form. Every other relative path resolves against the source
+    # file's directory — matching GitHub-flavored Markdown semantics.
+    #
+    # An earlier draft of this script treated any ``docs/...`` /
+    # ``src/...`` prefix as repo-rooted, which silently accepted
+    # ``[x](docs/architecture.md)`` written from inside
+    # ``docs/foo.md`` (the real GFM target is
+    # ``docs/docs/architecture.md``, which is broken). Resolving
+    # uniformly against the source file's directory makes that bug
+    # detectable — flagged by codex on PR #118.
     if path_part.startswith("/"):
         resolved = (repo_root / path_part.lstrip("/")).resolve()
-    elif path_part.startswith(("src/", "tests/", "docs/", "scripts/", "config/", "policy/")):
-        resolved = (repo_root / path_part).resolve()
     else:
         resolved = (link.source.parent / path_part).resolve()
 

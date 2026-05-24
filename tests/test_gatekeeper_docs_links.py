@@ -278,6 +278,55 @@ def test_external_links_skipped(cdl, tmp_path):
     assert findings == []
 
 
+def test_docs_prefix_inside_docs_dir_is_relative(cdl, tmp_path):
+    """A link of shape ``[x](docs/architecture.md)`` inside ``docs/foo.md``
+    must NOT be silently accepted — GFM resolves relative to the
+    current file, so the real target is ``docs/docs/architecture.md``
+    (which does not exist). Codex flagged this on PR #118 (review
+    comment 3294376917).
+    """
+
+    repo = tmp_path
+    (repo / "pyproject.toml").write_text('[project]\nname="fake"\n')
+    (repo / "README.md").write_text("# fake\n")
+    (repo / "docs").mkdir()
+    # The actual target.
+    (repo / "docs" / "architecture.md").write_text("# Arch\n")
+    # The doc with the misformatted link — the bug we want to detect.
+    (repo / "docs" / "foo.md").write_text(
+        "# Foo\n\nSee [arch](docs/architecture.md).\n"
+    )
+    findings: list = []
+    for doc in cdl.collect_docs(repo):
+        for link in cdl.extract_links(doc):
+            findings.extend(cdl.resolve_link(link, repo))
+    codes = {f.code for f in findings}
+    assert "LINK_BROKEN" in codes
+    # The broken link is the one in docs/foo.md, not anything else.
+    broken = [f for f in findings if f.code == "LINK_BROKEN"]
+    assert all(f.file == "docs/foo.md" for f in broken)
+
+
+def test_same_link_resolves_from_repo_root(cdl, tmp_path):
+    """The same ``docs/architecture.md`` link FROM README.md DOES
+    resolve cleanly — README.md is at the repo root so the
+    relative-to-source resolution gives the right answer.
+    """
+
+    repo = tmp_path
+    (repo / "pyproject.toml").write_text('[project]\nname="fake"\n')
+    (repo / "docs").mkdir()
+    (repo / "docs" / "architecture.md").write_text("# Arch\n")
+    (repo / "README.md").write_text(
+        "# repo root\n\nSee [arch](docs/architecture.md).\n"
+    )
+    findings: list = []
+    for doc in cdl.collect_docs(repo):
+        for link in cdl.extract_links(doc):
+            findings.extend(cdl.resolve_link(link, repo))
+    assert findings == []
+
+
 def test_heading_slug_handles_numeric_prefix(cdl):
     assert cdl.iter_headings  # ensure import worked
     from _common import heading_slug  # type: ignore[import-not-found]

@@ -92,14 +92,20 @@ def _make_fake_repo(tmp_path: Path, fixture_name: str, doc_name: str) -> Path:
 
 
 def test_d1_flags_non_canonical_category_token(cvd, tmp_path):
-    """A doc claiming ``batch_committed`` triggers ``VOCAB_DRIFT_OP_CATEGORY``."""
+    """A doc claiming ``batch_kaput`` triggers ``VOCAB_DRIFT_OP_CATEGORY``.
+
+    Uses a deliberately nonsense token outside both
+    :class:`OperationalCategory` and the documented synonym
+    allowlist so the test stays valid as #111 expands the
+    allowlist over time.
+    """
 
     repo = _make_fake_repo(tmp_path, "vocab_drift_category.md", "fake.md")
     findings = cvd.check_operational_category_drift(repo)
     codes = {f.code for f in findings}
     assert "VOCAB_DRIFT_OP_CATEGORY" in codes
     drifted = [f for f in findings if f.code == "VOCAB_DRIFT_OP_CATEGORY"]
-    assert any("batch_committed" in f.message for f in drifted)
+    assert any("batch_kaput" in f.message for f in drifted)
 
 
 def test_d1_accepts_synonym_allowlist(cvd, tmp_path):
@@ -135,6 +141,36 @@ def test_d1_canonical_tokens_pass(cvd, tmp_path):
     )
     findings = cvd.check_operational_category_drift(repo)
     assert findings == []
+
+
+def test_d1_scans_python_string_literals(cvd, tmp_path):
+    """A ``.py`` file with a non-canonical string-literal token is flagged.
+
+    Codex on PR #118 pointed out that the original
+    backtick-only regex left runtime literals (``"batch_ok"`` etc.)
+    out of D1's reach. The check now scans Python string literals
+    in .py files too — this test guards that path against
+    regression.
+    """
+
+    repo = tmp_path
+    (repo / "pyproject.toml").write_text('[project]\nname="fake"\n')
+    (repo / "README.md").write_text("# fake\n")
+    (repo / "docs").mkdir()
+    src_dir = repo / "src" / "yomotsusaka" / "cli"
+    src_dir.mkdir(parents=True)
+    (src_dir / "operational_smoke.py").write_text(
+        '"""Fake module."""\n'
+        '_CAT_BAD = "batch_kaput"\n'
+        '_CAT_FINE = "batch_ok"\n'
+    )
+    findings = cvd.check_operational_category_drift(repo)
+    codes = {f.code for f in findings}
+    assert "VOCAB_DRIFT_OP_CATEGORY" in codes
+    drifted = [f for f in findings if f.code == "VOCAB_DRIFT_OP_CATEGORY"]
+    assert any("batch_kaput" in f.message for f in drifted)
+    # And the canonical literal is NOT flagged.
+    assert not any("batch_ok" in f.message for f in drifted)
 
 
 def test_d1_unrelated_prefix_ignored(cvd, tmp_path):
