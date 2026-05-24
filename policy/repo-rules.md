@@ -82,6 +82,45 @@ report records that explicitly.
 - All review threads must be resolved before merge. [severity: error]
 - PR tasks and checkboxes must all be complete before merging. [severity: error]
 
+## README audience and provenance hygiene
+
+```text
+README.md must serve general readers — describing project purpose,
+installation, usage, configuration, and links to stable documentation.
+It must not act as an agent work log, implementation diary, or
+issue cross-reference index. Agent-workflow history, MVP/child issue
+provenance, PR/issue-number breadcrumbs, and implementation-dispatch
+notes belong in GitHub issues, GitHub PRs, AGENTS.md, or dedicated
+internal docs under docs/ — not in README.md.
+
+The deterministic patterns below are evaluated against the prose body
+of README.md only. Edge-case carve-outs documented inline as part of
+each rule:
+
+  * URL anchors (link targets containing `#fragment`) are exempt;
+    Markdown anchor refs of the form `[text](#section-slug)` are
+    intra-document navigation, not issue references.
+  * The literal token "agent" remains a legitimate product-audience
+    term when it describes the actual user audience (e.g. "agent
+    workflows", "agent-facing outputs"). The rules below target
+    workflow-provenance phrasing, not the product-level term.
+  * A "Changelog" or "Release notes" subsection, if introduced
+    later, may legitimately cite issue and PR numbers; such a
+    subsection is the documented carve-out and is exempt from the
+    deterministic checks.
+
+The check is implemented at scripts/gatekeeper/check_readme_provenance.py
+and runs in the same family as the other gate-keeper sibling scripts.
+```
+
+- `README.md` must not contain explicit GitHub issue or PR breadcrumbs of the form `issue #N`, `PR #N`, or a bare `#N` outside URL anchors and Markdown anchor refs. [severity: error]
+- `README.md` must not contain MVP child references of the form `MVP-N child` or `MVP-N umbrella`. [severity: error]
+- `README.md` must not contain the workflow-provenance term `umbrella` outside a documented changelog carve-out. [severity: error]
+- `README.md` must not contain the workflow-provenance phrase `owner decision`. [severity: error]
+- `README.md` must not contain the workflow-provenance phrase `agent-runnable dispatch` or `agent runnable dispatch`. [severity: error]
+- `README.md` must not contain the workflow-provenance phrases `introduced by`, `child issue`, or `post hermes`. [severity: error]
+- `README.md` should describe behaviour as the current product contract rather than as development provenance, so that statements such as "is REST end-to-end" appear without an accompanying issue or PR citation. [severity: advisory]
+
 ## Advisory semantic checks
 
 ```text
