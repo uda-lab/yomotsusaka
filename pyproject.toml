@@ -25,6 +25,15 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/yomotsusaka"]
 
+# Pin the demo-corpus package-data files explicitly. Hatchling auto-includes
+# all files under ``src/yomotsusaka/`` by default, but listing the .txt
+# fixtures here keeps the contract visible: ``operational_smoke
+# --demo-corpus`` resolves them via ``importlib.resources``, so they MUST
+# ship inside the wheel even when the build defaults change.
+[tool.hatch.build.targets.wheel.force-include]
+"src/yomotsusaka/cli/_demo_corpus/canonical_employee.txt" = "yomotsusaka/cli/_demo_corpus/canonical_employee.txt"
+"src/yomotsusaka/cli/_demo_corpus/multi_mention.txt" = "yomotsusaka/cli/_demo_corpus/multi_mention.txt"
+
 [tool.ruff]
 line-length = 100
 src = ["src"]

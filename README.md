@@ -49,11 +49,15 @@ devcontainer, the shortest path to operational smoke is:
 uv venv && uv pip install -e ".[dev]"
 
 # 2. Run the canonical end-to-end operational scenario.
+#    --demo-corpus materialises a transient inbox under a fresh temp dir
+#    using two canonical fixtures shipped as package data, so the
+#    positional inbox path is ignored and the quickstart works from a
+#    fresh checkout with no owner-supplied inbox fixtures.
 #    Secrets (RUNPOD_API_KEY, etc.) are injected per-run by the broker into
 #    the child process environment; they never traverse stdout / argv.
 /workspaces/hermes-engineering/scripts/project-env.sh yomotsusaka -- \
     uv run python -m yomotsusaka.cli.operational_smoke ./inbox \
-        --vault-root ./vault
+        --vault-root ./vault --demo-corpus
 ```
 
 Use the nested-command form of `project-env.sh` (with the `--` separator)
