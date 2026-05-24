@@ -51,12 +51,18 @@ uv venv && uv pip install -e ".[dev]"
 #    --demo-corpus materialises a transient inbox under a fresh temp dir
 #    using two canonical fixtures shipped as package data, so the
 #    positional inbox path is ignored and the quickstart works from a
-#    fresh checkout with no caller-supplied inbox fixtures.
-#    Secrets (RUNPOD_API_KEY, etc.) are injected per-run into the child
-#    process environment; they never traverse stdout / argv.
+#    fresh checkout with no owner-supplied inbox fixtures.
+#    --emit-json captures a ScenarioResult JSON for downstream report
+#    rendering and preserves the CLI's exit code: the producer's $? is
+#    direct (no pipeline between the producer and `echo`), so a non-zero
+#    smoke exit is never masked.
+#    Secrets (RUNPOD_API_KEY, etc.) are injected per-run by the broker into
+#    the child process environment; they never traverse stdout / argv.
 /workspaces/hermes-engineering/scripts/project-env.sh yomotsusaka -- \
-    uv run python -m yomotsusaka.cli.operational_smoke ./inbox \
-        --vault-root ./vault --demo-corpus
+    uv run python -m yomotsusaka.cli.operational_smoke \
+        --emit-json /tmp/scenario.json \
+        ./inbox --vault-root ./vault --demo-corpus
+echo "exit=$?"
 ```
 
 Use the nested-command form of `project-env.sh` (with the `--` separator)
@@ -77,11 +83,11 @@ Bootstrap is intentionally narrow: preconfigure the RunPod account API
 key (and optionally tune `PodConfig` defaults) — nothing else is
 required to reach operational smoke.
 
-For a public-safe markdown report over a recorded scenario run, pipe a
-`ScenarioResult` JSON into:
+For a public-safe markdown report over the recorded scenario, pipe the
+`ScenarioResult` JSON captured above into the renderer:
 
 ```bash
-uv run python -m yomotsusaka.cli.operational_report < scenario.json
+uv run python -m yomotsusaka.cli.operational_report < /tmp/scenario.json
 ```
 
 The renderer is a fail-closed redacted sweep over the structured input
