@@ -200,10 +200,15 @@ Stopped or deleted state should be checked explicitly in the RunPod console afte
 
 For development only, it is acceptable to give an AI coding agent temporary RunPod access using:
 
-- a development API key;
-- `runpodctl`;
-- an existing Pod ID;
+- a development API key (**required** for the live managed lifecycle —
+  see `docs/runpod-agent-lifecycle.md` §2);
+- an existing Pod ID and endpoint URL (`attach` mode only);
 - SSH access if needed.
+
+`runpodctl` is **optional owner break-glass tooling** (issue #90 / MVP-5
+umbrella #89). The agent-managed lifecycle is REST end-to-end; install
+`runpodctl` only when you want a local CLI for manual recovery after a
+terminal `cleanup_failed` (see `docs/runpod-agent-lifecycle.md` §10.5).
 
 This should be treated separately from the production private-data firewall architecture.
 

@@ -22,7 +22,9 @@ The split is intentionally narrow and must be preserved.
 
 - Create a scoped RunPod **account API key** (NOT a vLLM bearer key —
   see §9), set it as `RUNPOD_API_KEY` in the dev container shell, and
-  rotate / disable it after the session (§10).
+  rotate / disable it after the session (§10). This is the **only
+  mandatory precondition** for the live managed lifecycle (issue #90 /
+  MVP-5 umbrella #89).
 - Choose the GPU type, disk size, and image (or accept the
   `PodConfig` defaults pinned in `docs/runpod.md`).
 - Decide policy: the default is create → wait → smoke → **delete**.
@@ -30,6 +32,10 @@ The split is intentionally narrow and must be preserved.
   `/workspace` after the run.
 - Spot-check the RunPod console after the agent reports `lifecycle:
   deleted`; the console is the source of truth for "Pod is gone".
+- Optionally install `runpodctl` for **break-glass debugging only** (see
+  §7 manual-cleanup steps). The lifecycle helper does NOT require it —
+  the live managed flow is REST end-to-end. When `runpodctl` is absent
+  the helper logs a single informational line and proceeds normally.
 
 ### Agent responsibilities
 
@@ -93,8 +99,13 @@ which records `{timestamp, request_id, category}` and nothing else.
 
 The helper runs the following sequence:
 
-1. **Preflight** — `runpodctl --version` and `RUNPOD_API_KEY` presence
-   checks. Either failure → exit code 2; no network call attempted.
+1. **Preflight** — `RUNPOD_API_KEY` presence check (the only mandatory
+   precondition; see issue #90 / MVP-5 umbrella #89). Missing API key
+   → exit code 2; no network call attempted. The helper additionally
+   probes `runpodctl --version` for diagnostic visibility, but a
+   missing `runpodctl` is informational only (single `logger.info`
+   line on the diagnostic surface); it does NOT abort the run and is
+   NOT recorded as a failure category in `lifecycle.jsonl`.
 2. **Create** — REST `POST https://rest.runpod.io/v1/pods` with the
    resolved `PodConfig`. The library raises
    `PodUnavailableError("create_failed")` on any failure, which the
@@ -110,11 +121,16 @@ The helper runs the following sequence:
    `diagnostic: <category>` stdout line is propagated as
    `lifecycle: smoke_passed` or `lifecycle: smoke_failed`. The smoke's
    stderr is discarded (it may carry `httpx` text).
-5. **Cleanup** — by default `DELETE /v1/pods/{podId}`. The cost-control
-   rationale matters: per `docs/runpod.md` §9, **stopped Pods continue
-   to bill for retained volume storage**. Delete is the only way to
-   stop billing entirely. `--keep-pod` skips this step and exits with
-   `lifecycle: kept`; the owner is then responsible for cleanup.
+5. **Cleanup** — by default `DELETE /v1/pods/{podId}` with a bounded
+   REST-based safe-retry on transient failure (issue #90): the
+   lifecycle issues one initial attempt, waits ~2 s on failure, then
+   issues exactly one more attempt before raising. The retry stays on
+   the REST mechanism (no `runpodctl` fall-back), so the public-safe
+   category vocabulary is unchanged. The cost-control rationale: per
+   `docs/runpod.md` §9, **stopped Pods continue to bill for retained
+   volume storage**. Delete is the only way to stop billing entirely.
+   `--keep-pod` skips this step and exits with `lifecycle: kept`; the
+   owner is then responsible for cleanup.
 
 The default flow guarantees that an agent run with no failures leaves no
 running Pod and no billing tail.
@@ -127,7 +143,7 @@ constants block at the top of the script):
 
 | Category             | Phase         | When                                                                  | Owner action                                                                       |
 | -------------------- | ------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `runpodctl_missing`  | preflight     | `runpodctl --version` not on PATH.                                    | Install via the link printed on stderr; rerun.                                     |
+| `runpodctl_missing`  | preflight     | **Reserved constant — not emitted on the default happy path** (issue #90). `runpodctl` is optional owner break-glass tooling; absence logs a single `logger.info` line and does NOT abort the run. Retained for any future `--strict-runpodctl` opt-in mode. | None under default mode. If the helper ever surfaces this category (strict mode), install via §10.5. |
 | `api_key_missing`    | preflight     | `RUNPOD_API_KEY` env var not set or empty.                            | Export the key per §3; rerun.                                                      |
 | `created`            | create        | Pod created successfully.                                             | (continues automatically)                                                          |
 | `create_failed`      | create        | REST `POST /v1/pods` returned non-2xx or the response body was unparseable. | Inspect the RunPod console; check the account API key still has Pods permission.   |
@@ -195,7 +211,14 @@ If you extend the helper or library, you **must** extend these tests.
 ## 7. Cleanup-failure surface
 
 When the DELETE call fails (e.g. RunPod returned 5xx, the network
-dropped), the helper:
+dropped), the library performs a bounded REST-based safe-retry: one
+extra `DELETE /v1/pods/{podId}` attempt after a short delay (issue
+#90). Only if the retry also fails does the lifecycle escalate to the
+terminal `cleanup_failed` surface. The retry stays on the REST
+mechanism — there is no `runpodctl` fall-back — so the public-safe
+category vocabulary is unchanged.
+
+When the retry budget is exhausted, the helper:
 
 1. Prints `lifecycle: cleanup_failed` to stdout (category-only).
 2. Prints one urgent line to **stderr**:
@@ -208,10 +231,11 @@ dropped), the helper:
 
 The `request_id` is a fresh UUID4 generated at the start of the run; it
 carries no information about the Pod itself. The owner uses it to
-correlate the stderr line with the JSONL row (e.g. to confirm timing),
-then runs `runpodctl pod list` in their own shell to identify which
-Pod was left behind, and deletes it manually (via `runpodctl pod
-remove <id>` or the RunPod console).
+correlate the stderr line with the JSONL row (e.g. to confirm timing).
+Manual recovery uses either the RunPod web console (always available)
+or — when installed as break-glass tooling per §10.5 — `runpodctl pod
+list` plus `runpodctl pod remove <id>` from the owner's shell to
+identify and delete the Pod that was left behind.
 
 Why the urgent line plus the JSONL row (both) — see the pinned
 decision in the source spec
@@ -272,6 +296,26 @@ After the session ends, the owner should:
 3. If `cleanup_failed` was reported, follow §7's manual-cleanup steps
    immediately. Do not assume the next agent run will clean up the
    leftover Pod.
+
+## 10.5. `runpodctl` as optional owner break-glass tooling
+
+Issue #90 / MVP-5 umbrella #89 demoted `runpodctl` from a mandatory
+preflight to **optional owner break-glass tooling**. The live managed
+lifecycle is REST end-to-end (`POST /v1/pods`, `GET /health`,
+`DELETE /v1/pods/{podId}`) and does NOT shell out to `runpodctl` on
+any code path — including the bounded cleanup safe-retry (§7).
+
+The agent therefore runs the helper with or without `runpodctl`
+present; absence is logged as a single informational `logger.info`
+line on the diagnostic surface and does not surface on the public
+`lifecycle:` channel, in `lifecycle.jsonl`, or in the exit code.
+
+The owner installs `runpodctl` only when they want a local CLI for
+manual recovery after a terminal `cleanup_failed` (see §7). The
+canonical install reference is
+<https://docs.runpod.io/cli/install-runpodctl>. Owners who prefer the
+RunPod web console for recovery do not need to install `runpodctl` at
+all.
 
 ## 11. Live owner-runnable test (L3)
 
