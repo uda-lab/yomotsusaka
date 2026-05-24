@@ -1,0 +1,11 @@
+{
+  "tenant_id": "_local",
+  "spans": [
+    {"start": 0, "end": 9, "kind": "PERSON"},
+    {"start": 44, "end": 50, "kind": "ID_NUMBER"}
+  ],
+  "expected_keys": [
+    "<PERSON_7e3d8981>",
+    "<ID_NUMBER_2a8610ae>"
+  ]
+}
