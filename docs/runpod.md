@@ -100,6 +100,12 @@ Container disk: 40GB
 Volume disk: 20GB
 ```
 
+<!-- spec-values target=PodConfig.disk_gb -->
+- min: 30
+- max: 50
+- practical: 40
+<!-- /spec-values -->
+
 If model cache reuse is important, increase volume disk to 30–50GB. Otherwise, keep persistent storage small.
 
 Principle:

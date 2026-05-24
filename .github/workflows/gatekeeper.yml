@@ -39,3 +39,16 @@ jobs:
       - name: check_vocab_drift (advisory)
         run: uv run python scripts/gatekeeper/check_vocab_drift.py
         continue-on-error: true
+
+      # Layer 2-5 rules (issue #128) — adopted after validation-first empirical review.
+      # G2: assert doc spec-values annotations match code constants.
+      - name: check_spec_values (G2, hard gate)
+        run: uv run python scripts/gatekeeper/check_spec_values.py
+
+      # G3: assert every documented env-var is wired in source.
+      - name: check_documented_env_vars (G3, hard gate)
+        run: uv run python scripts/gatekeeper/check_documented_env_vars.py
+
+      # G4: assert ManageRunPodLifecycle.start_pod has stop_pod on failure paths.
+      - name: check_lifecycle_invariant (G4, hard gate)
+        run: uv run python scripts/gatekeeper/check_lifecycle_invariant.py

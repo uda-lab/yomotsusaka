@@ -92,7 +92,7 @@ class PodConfig:
     gpu_type: str = "NVIDIA RTX A5000"
     image: str = "vllm/vllm-openai:latest"
     model_id: str = "Qwen/Qwen3-8B"
-    disk_gb: int = 20
+    disk_gb: int = 40
     extra: dict[str, Any] = field(default_factory=dict)
     template_id: str | None = field(default_factory=_default_template_id_from_env)
 

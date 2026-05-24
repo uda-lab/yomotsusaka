@@ -135,6 +135,34 @@ reviewer (human or LLM) can flag drift.
 - The scaffold-status table should classify every module under `src/yomotsusaka/` (excluding `__init__.py`) consistently with the module's current behavior, so a `deferred` classification never appears next to a module that already implements its MVP responsibility. [severity: advisory]
 - Sources under `src/yomotsusaka/` should never contain a top-level `import gate_keeper` or `from gate_keeper` statement, so the runtime guards stay independent of the repository-process guards. [severity: advisory]
 
+## Layer 2-5 runtime invariants (issue #128)
+
+```text
+The three rules below were validated empirically before adoption per the
+validation-first discipline in issue #128.  Each rule was tested against a
+deliberately-drifted fixture (true-positive), a legitimate-state fixture
+(true-negative), and the tip-of-main state (which must pass as a hard gate).
+Rejected candidates (G1, G5, G6) are documented in the PR #<128-pr> body.
+
+G2 (spec_values) — catches the #124-class precondition drift: disk_gb=20 was
+below the documented [30,50] range.  Fixed in the same PR by setting
+disk_gb=40.
+
+G3 (documented_env_vars) — catches the wrong-direction drift resolution that
+PR #117 applied: it deleted the RUNPOD_TEMPLATE_ID doc row instead of wiring
+the env-var in code.  After PR #126 restored the row and wired the variable,
+this gate passes.
+
+G4 (lifecycle_invariant) — catches the #124 root cause: ManageRunPodLifecycle.
+start_pod lacked a stop_pod call in its _wait_for_healthy exception handler,
+leaving orphan Pods on wait_timeout.  Fixed in PR #125; this gate verifies the
+fix is preserved.
+```
+
+- `docs/*.md` files must not carry a `<!-- spec-values target=X.y -->` block whose resolved attribute value falls outside the declared `[min, max]` range. [severity: error]
+- Every env-var documented in a `docs/*.md` pipe-table (as `` `VAR_NAME` ``) must have a corresponding `os.environ.get("VAR_NAME")` or `os.getenv("VAR_NAME")` call in `src/` or `scripts/`, unless the row carries an `(operator-only)` annotation. [severity: error]
+- `ManageRunPodLifecycle.start_pod` must call `stop_pod` in the exception handler that wraps `_wait_for_healthy`, so that a Pod that times out is cleaned up before the exception propagates. [severity: error]
+
 ## Validation modes
 
 ```text
