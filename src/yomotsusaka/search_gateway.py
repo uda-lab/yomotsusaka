@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +39,85 @@ logger = logging.getLogger(__name__)
 # projections only.
 _INDEX_SUBDIR = "index"
 _INDEX_FILENAME = "manifests.jsonl"
+
+
+# Snapshot bounded retry (MVP-5 child 04 / issue #93).
+#
+# The snapshot helper performs ONE bounded retry on a transient ``OSError``
+# from the underlying file operations (open/write/fsync/rename) before
+# re-raising. The retry is bounded and uses the same mechanism — no
+# fall-back path — so the public-safe surface contract is unchanged. The
+# bound is intentionally narrow (single retry) to keep worst-case snapshot
+# wall-clock predictable for the agent-runnable MVP-5 flow.
+#
+# Module-level so L1 tests can monkeypatch ``_SNAPSHOT_MAX_ATTEMPTS = 1``
+# (no retry baseline) and ``_SNAPSHOT_RETRY_DELAY_SECONDS = 0`` (no sleep)
+# without touching ``time.sleep`` mocks.
+_SNAPSHOT_MAX_ATTEMPTS = 2
+"""Total snapshot write attempts (1 original + 1 bounded retry on
+``OSError``). Set to 1 to disable the retry."""
+
+_SNAPSHOT_RETRY_DELAY_SECONDS = 0
+"""Sleep between the first and second snapshot attempts. ``0`` keeps the
+default-test wall-clock unchanged; production callers may patch upward."""
+
+
+def _snapshot_write_with_retry(
+    tmp_path: Path,
+    final_path: Path,
+    latest: "list[DocumentManifest]",
+) -> None:
+    """Atomic JSONL write with one bounded retry on ``OSError``.
+
+    Mirrors the original truncate-write-fsync-rename sequence verbatim;
+    the only difference is that on ``OSError`` the helper cleans up the
+    temp file, optionally sleeps, and tries again up to
+    :data:`_SNAPSHOT_MAX_ATTEMPTS` times. The final failure re-raises the
+    last ``OSError`` so the existing caller contract (the batch runner
+    records it on :class:`BatchSummary`) is unchanged.
+
+    Privacy notes (binding): the helper logs nothing about the underlying
+    OS error — exception text may contain absolute filesystem paths. The
+    diagnostic ``snapshot_retry`` marker is the only category emitted on
+    the intermediate retry, and it carries no path/identifier (mirrors
+    ``runpod_lifecycle._MANAGE_CLEANUP_*`` discipline).
+    """
+    last_exc: OSError | None = None
+    for attempt in range(_SNAPSHOT_MAX_ATTEMPTS):
+        try:
+            # Open with ``"w"`` (truncate) so a prior snapshot is replaced
+            # cleanly. JSONL is append-shaped on the wire but the file is
+            # rewritten in full each snapshot — this keeps the read path a
+            # one-shot ``readlines`` and avoids any need for compaction.
+            with tmp_path.open("w", encoding="utf-8", newline="\n") as fh:
+                for manifest in latest:
+                    line = manifest.model_dump_json()
+                    fh.write(line)
+                    fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, final_path)
+            return
+        except OSError as exc:
+            last_exc = exc
+            # Best-effort cleanup of the temp file on failure. Suppress
+            # any secondary OSError from the cleanup so the original
+            # (more informative) exception propagates unmodified.
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:  # pragma: no cover - defensive
+                pass
+            if attempt < _SNAPSHOT_MAX_ATTEMPTS - 1:
+                # Diagnostic-only marker — no path / no exception text.
+                logger.info("snapshot_retry")
+                if _SNAPSHOT_RETRY_DELAY_SECONDS > 0:
+                    time.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS)
+
+    # All attempts exhausted — re-raise the last OSError so callers
+    # observe the same failure shape as before the retry was added.
+    assert last_exc is not None  # always set after the loop above
+    raise last_exc
 
 
 @dataclass(frozen=True)
@@ -358,29 +438,13 @@ class SearchGateway:
             latest.append(manifest)
         latest.reverse()
 
-        try:
-            # Open with ``"w"`` (truncate) so a prior snapshot is replaced
-            # cleanly. JSONL is append-shaped on the wire but the file is
-            # rewritten in full each snapshot — this keeps the read path a
-            # one-shot ``readlines`` and avoids any need for compaction.
-            with tmp_path.open("w", encoding="utf-8", newline="\n") as fh:
-                for manifest in latest:
-                    line = manifest.model_dump_json()
-                    fh.write(line)
-                    fh.write("\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp_path, final_path)
-        except OSError:
-            # Best-effort cleanup of the temp file on failure. Suppress any
-            # secondary OSError from the cleanup so the original (more
-            # informative) exception propagates unmodified.
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except OSError:  # pragma: no cover - defensive
-                pass
-            raise
+        # Bounded retry loop (MVP-5 child 04 / issue #93). On transient
+        # ``OSError`` (e.g. brief filesystem hiccup, fsync flake) the helper
+        # cleans up the temp file and retries once before re-raising. The
+        # retry preserves the original raise-on-failure contract: the
+        # batch runner still records the OSError on ``BatchSummary`` if
+        # both attempts fail (same surface, just one extra try first).
+        _snapshot_write_with_retry(tmp_path, final_path, latest)
 
         # Count-only log line per privacy discipline (no content echo).
         # Report the number of unique manifests actually persisted (post-

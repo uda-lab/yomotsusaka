@@ -78,6 +78,15 @@ EXIT_CLEANUP_FAILED = 3
 # a hard preflight failure. The constant can be re-asserted behind a
 # future ``--strict-runpodctl`` opt-in flag if owner-side debugging needs
 # the old behaviour back.
+#
+# Cross-reference (issue #93 / MVP-5 child 04): the operational-layer
+# wrap of these literals lives in
+# :mod:`yomotsusaka.operational_taxonomy.OperationalCategory`
+# (``runpod_lifecycle_ok`` / ``runpod_lifecycle_failed_cleaned`` /
+# ``runpod_lifecycle_failed_owner_action``). The script-local literals
+# below are the **wire** vocabulary on stdout and remain unchanged; the
+# operational taxonomy aggregates them for the agent-facing recovery
+# instruction table without redefining them.
 _CATEGORY_PREFLIGHT_RUNPODCTL = "runpodctl_missing"
 _CATEGORY_PREFLIGHT_APIKEY = "api_key_missing"
 _CATEGORY_CREATED = "created"
