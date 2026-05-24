@@ -81,7 +81,51 @@ The LLM-rubric backend is opt-in via host dotenv and fails closed when
 unconfigured. Semantic rules therefore stay advisory in the first MVP of
 the policy.
 
-## Local-first invocation
+## Local invocation
+
+Two doc-governance helpers ship under `scripts/gatekeeper/` (issue
+#115). They scan repository docs and the operational CLI surface for
+canonical-vocabulary drift and broken internal links. Both run as
+ordinary Python scripts under `uv run`; neither imports `gate-keeper`,
+neither writes to the vault, and both honor the
+public/private-boundary discipline that the runtime guards enforce.
+
+```sh
+# docs-to-docs link health (family C): scans README.md, AGENTS.md,
+# and docs/*.md for unresolvable internal links and inverted
+# precedence claims, plus an advisory stale-umbrella sub-check that
+# consults `gh issue view` for referenced #NNN.
+uv run python scripts/gatekeeper/check_docs_links.py
+
+# Offline / CI-safe variant: skip the `gh`-backed stale-umbrella
+# sub-check entirely. Exit codes are 0 or 1 only.
+uv run python scripts/gatekeeper/check_docs_links.py --no-gh
+
+# Canonical-vocabulary drift (family D): asserts every backtick-quoted
+# OperationalCategory-shaped token is a canonical enum member (D1)
+# and that boundary.EXPOSURE_CLASSES stays in two-way sync with the
+# docs (D2).
+uv run python scripts/gatekeeper/check_vocab_drift.py
+```
+
+Exit codes (shared contract):
+
+- `0` — all checks pass.
+- `1` — at least one **error** finding (link unresolvable,
+  precedence contradiction, non-canonical category token, dropped
+  exposure class still referenced in docs).
+- `2` — only **warning** findings (stale closed-umbrella prose,
+  `gh` cache miss / offline lookup failure, exposure class defined
+  in code but absent from docs). The `--no-gh` mode never emits
+  exit 2; warning-class findings are suppressed there.
+
+Both scripts accept `--json <path>` to write the structured
+`{findings: [...]}` report alongside the human-readable summary.
+The stale-umbrella check caches `gh issue view` results in
+`/tmp/gatekeeper-issue-cache.json` (1 h TTL) so repeated invocations
+in a developer session do not re-issue API calls.
+
+## Local-first invocation (gate-keeper CLI)
 
 The intended local workflow uses the filesystem backend against the
 current working tree. No network access, no credentials, no hosted LLM

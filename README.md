@@ -147,7 +147,7 @@ cp config/model.example.yaml config/model.yaml
 
 ### Governance cross-reference
 
-The MVP-5 umbrella (#89) operationalizes the agent-runnable, public-safe
+The MVP-5 umbrella (closed: #89) shipped the agent-runnable, public-safe
 operational surface; the sister governance umbrella #63 (operational
 governance) is **superseded in spirit** by MVP-5 (child 06 / #95 ships
 the operational trust-boundary registry, child 04 / #93 closes the
