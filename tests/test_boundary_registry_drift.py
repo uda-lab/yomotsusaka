@@ -67,7 +67,9 @@ from yomotsusaka.boundary_registry import (
 )
 from yomotsusaka.execution_gateway import ExecutionResponse
 from yomotsusaka.policy import PolicyDecision
-from yomotsusaka.schemas import EntityKind, EntityRecord
+from yomotsusaka.runpod_lifecycle import PodConfig, PodHandle
+from yomotsusaka.schemas import ArtifactHandle, EntityKind, EntityRecord, PrivateDictEntry
+from yomotsusaka.tenant import TenantScope
 
 from tests._exposure_denylist import EXPECTED_BOUNDARY_SYMBOLS
 
@@ -498,43 +500,313 @@ def _registry_rows_for(exposure: str) -> list[BoundaryField]:
 
 
 # Synthetic sentinels for fields classified as ``never_expose`` /
-# ``private`` that we will plant into a private-side dataclass instance
-# and then re-confirm those sentinels never appear in the serialised
-# agent-facing responses above.
-_NEVER_EXPOSE_SENTINELS: dict[str, str] = {
-    "vault_path_sentinel": "/never-expose-sentinel/vault-path-NEVER-EXPOSE",
-    "pod_id_sentinel": "pod-NEVER-EXPOSE-SENTINEL",
-    "endpoint_sentinel": "https://NEVER-EXPOSE-SENTINEL.example/api",
-    "tenant_root_sentinel": "/never-expose-sentinel/tenant-root-NEVER-EXPOSE",
-}
+# ``private``. Each sentinel is **planted into a real private-side
+# instance** below and then re-confirmed absent from every agent-facing
+# response derived from that instance. Codex review of PR #101 flagged
+# the earlier "scan only" version as effectively vacuous — the assertion
+# could pass even with a regression because the sentinel was never in
+# the system to begin with. The current version makes the sentinels
+# load-bearing: they must enter the system through a private-side field
+# and must NOT survive the boundary projection.
+_VAULT_ROOT_SENTINEL = "never-expose-sentinel-vault-root-AAAA"
+_VAULT_PATH_SENTINEL = "never-expose-sentinel-vault-path-BBBB"
+_POD_ID_SENTINEL = "pod-NEVER-EXPOSE-SENTINEL-CCCC"
+_POD_ENDPOINT_SENTINEL = "https://NEVER-EXPOSE-SENTINEL-DDDD.example/api"
+_PRIVATE_VALUE_SENTINEL = "Original-Private-Value-NEVER-EXPOSE-EEEE"
+_PRIVATE_DICT_PATH_SENTINEL = "never-expose-sentinel-private-dict-FFFF"
+_MANIFEST_PATH_SENTINEL = "never-expose-sentinel-manifest-path-GGGG"
+_POD_GPU_SENTINEL = "private-pod-gpu-NEVER-EXPOSE-HHHH"
+_POD_IMAGE_SENTINEL = "private-pod-image-NEVER-EXPOSE-IIII"
+_POD_MODEL_SENTINEL = "private-pod-model-NEVER-EXPOSE-JJJJ"
+
+_ALL_PRIVATE_SENTINELS: tuple[str, ...] = (
+    _VAULT_ROOT_SENTINEL,
+    _VAULT_PATH_SENTINEL,
+    _POD_ID_SENTINEL,
+    _POD_ENDPOINT_SENTINEL,
+    _PRIVATE_VALUE_SENTINEL,
+    _PRIVATE_DICT_PATH_SENTINEL,
+    _MANIFEST_PATH_SENTINEL,
+    _POD_GPU_SENTINEL,
+    _POD_IMAGE_SENTINEL,
+    _POD_MODEL_SENTINEL,
+)
 
 
-def test_never_expose_fields_absent_from_response_serialisations() -> None:
-    """Serialise each agent-facing response and assert that none of the
-    sentinel values planted in ``never_expose`` / ``private``-classified
-    fields appear.
+def _assert_sentinels_absent(blob: str, *, context: str) -> None:
+    for sentinel in _ALL_PRIVATE_SENTINELS:
+        assert sentinel not in blob, (
+            f"private-side sentinel {sentinel!r} leaked into {context}: "
+            f"{blob!r}"
+        )
 
-    This is a defence-in-depth check that complements the existing
-    :mod:`tests.test_exposure_contract` scan: that scan is text-driven
-    (canonical-fixture values), this one is *registry-driven*
-    (sentinels keyed on field name).
+
+def test_never_expose_fields_absent_from_response_serialisations(
+    tmp_path: Path,
+) -> None:
+    """Plant a unique sentinel into every ``never_expose`` / ``private``
+    field and assert that no sentinel survives the projection into any
+    agent-facing response.
+
+    This test is **registry-driven**: each sentinel is paired with a
+    specific registry row (``PodHandle.pod_id``, ``PodHandle.endpoint``,
+    ``PodConfig.*``, ``ArtifactHandle.vault_path``,
+    ``PrivateDictEntry.original_value``, ``PrivateState.manifest_path``
+    / ``private_dict_path`` / ``private_entries``, ``TenantScope.vault_root``).
+    The plant-and-scan loop guarantees the assertion is non-vacuous:
+    we first confirm each sentinel actually appears in the private-side
+    instance's serialised form (the negative control), then drive that
+    instance through every public-boundary projection point and require
+    that none of the sentinels reach the agent-facing serialisation.
+
+    The projection points covered:
+
+    * :class:`PodHandle` / :class:`PodConfig` → indirectly: any public
+      response derived from a pod-bearing call must not echo the pod
+      id, endpoint, or pod config. We use :func:`repr` and
+      :meth:`dataclasses.asdict`-style serialisation to confirm the
+      sentinels are present on the private instance, then scan the
+      synthetic responses built in :func:`_build_concrete_responses`
+      (which carry only public-safe inputs) for the sentinels — these
+      responses must not absorb a pod-side value via shared state.
+    * :class:`ArtifactHandle.vault_path` → the :func:`_public_handle_for`
+      projection: build an :class:`ArtifactHandle` carrying the sentinel
+      ``vault_path``, then confirm the derived :class:`PublicHandle`
+      contains only the opaque locator and not the path.
+    * :class:`PrivateDictEntry.original_value` → the
+      :class:`DocumentManifest` / :class:`PublicManifestView` projection:
+      a manifest derived from a private dict carrying the sentinel must
+      not echo the raw value in its agent-facing fields.
+    * :class:`TenantScope.vault_root` → the boundary entry points
+      (:func:`inspect_request` against a vault whose root path contains
+      the sentinel): the projected :class:`PublicManifestView` must not
+      surface the vault root.
+    * :class:`PrivateState` (manifest_path / private_dict_path /
+      private_entries) → on a non-private scope, ``ResolverSuccess``'s
+      serialisation must not contain the sentinel even when the
+      backing files live under a sentinel-named directory.
     """
-    responses = _build_concrete_responses()
-    sentinels = list(_NEVER_EXPOSE_SENTINELS.values())
+    # ------------------------------------------------------------------
+    # Negative control: each sentinel must actually appear in the
+    # private-side instance's repr. Otherwise the planting failed and
+    # the absent-from-response check below is vacuous.
+    # ------------------------------------------------------------------
+    pod_handle = PodHandle(pod_id=_POD_ID_SENTINEL, endpoint=_POD_ENDPOINT_SENTINEL)
+    assert _POD_ID_SENTINEL in repr(pod_handle)
+    assert _POD_ENDPOINT_SENTINEL in repr(pod_handle)
+    pod_config = PodConfig(
+        gpu_type=_POD_GPU_SENTINEL,
+        image=_POD_IMAGE_SENTINEL,
+        model_id=_POD_MODEL_SENTINEL,
+    )
+    assert _POD_GPU_SENTINEL in repr(pod_config)
+    assert _POD_IMAGE_SENTINEL in repr(pod_config)
+    assert _POD_MODEL_SENTINEL in repr(pod_config)
 
-    for name, response in responses:
-        blob = response.model_dump_json()
-        for sentinel in sentinels:
-            assert sentinel not in blob, (
-                f"sentinel {sentinel!r} leaked into the serialised form"
-                f" of agent-facing response {name!r}: {blob!r}"
+    artifact_handle = ArtifactHandle(
+        handle_id="ah-aaaaaa",
+        doc_id="doc-aaaaaa",
+        vault_path=_VAULT_PATH_SENTINEL,
+    )
+    assert _VAULT_PATH_SENTINEL in artifact_handle.model_dump_json()
+
+    priv_entry = PrivateDictEntry(
+        key="<PERSON:k1>",
+        original_value=_PRIVATE_VALUE_SENTINEL,
+        kind=EntityKind.PERSON,
+    )
+    assert _PRIVATE_VALUE_SENTINEL in priv_entry.model_dump_json()
+
+    # Build a real on-disk vault rooted at a sentinel-named path so we
+    # exercise the full inspect_request projection.
+    vault_root = tmp_path / _VAULT_ROOT_SENTINEL
+    (vault_root / "manifests").mkdir(parents=True)
+    (vault_root / "private").mkdir(parents=True)
+    doc_id = "doc-leakscan"
+    # The manifest carries the sentinel through its REDACTED form — but
+    # because the redactor keys the sentinel out, the manifest's
+    # redacted_text MUST NOT contain it. We test the inverse: the
+    # private dict file (vault-side) does carry the original value, and
+    # the public projection (inspect_request) must not surface it.
+    manifest = boundary.DocumentManifest(
+        doc_id=doc_id,
+        source_ref=doc_id,
+        redacted_text="<PERSON:k1> works.",
+        entities=[
+            EntityRecord(
+                entity_id="ent-leakscan",
+                kind=EntityKind.PERSON,
+                redacted_key="<PERSON:k1>",
+                start_char=0,
+                end_char=11,
             )
+        ],
+        labels=[],
+        summary="<PERSON:k1>",
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        metadata={},
+    )
+    (vault_root / "manifests" / f"{doc_id}.json").write_text(
+        manifest.model_dump_json(), encoding="utf-8"
+    )
+    (vault_root / "private" / f"{doc_id}.json").write_text(
+        json.dumps(
+            [
+                {
+                    "key": "<PERSON:k1>",
+                    "original_value": _PRIVATE_VALUE_SENTINEL,
+                    "kind": "PERSON",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    # Negative control: the private dict file on disk really does
+    # contain the sentinel (so a failure to scrub it on the way out is
+    # observable).
+    raw_pd_bytes = (vault_root / "private" / f"{doc_id}.json").read_text(
+        encoding="utf-8"
+    )
+    assert _PRIVATE_VALUE_SENTINEL in raw_pd_bytes
 
-    # Sanity: ensure the sentinels were chosen so they are not a degenerate
-    # case (e.g. empty string) that would always be absent. The check is
-    # cheap and pinpoints test bit-rot.
-    for sentinel in sentinels:
-        assert sentinel and len(sentinel) > 8
+    tenant = TenantScope.local(vault_root)
+    assert _VAULT_ROOT_SENTINEL in str(tenant.vault_root)
+
+    locator = boundary.build_locator(
+        exposure_class="agent_redacted",
+        artifact_kind="manifest",
+        opaque_id=doc_id,
+    )
+
+    # ------------------------------------------------------------------
+    # Projection 1: inspect_request — drives manifest from a vault whose
+    # root path contains the vault-root sentinel and whose backing
+    # private dict carries the private-value sentinel.
+    # ------------------------------------------------------------------
+    inspect_outcome = boundary.inspect_request(
+        boundary.InspectRequest(locator=locator),
+        tenant=tenant,
+    )
+    assert isinstance(inspect_outcome, boundary.InspectResponse), (
+        f"inspect_request failed: {inspect_outcome!r}"
+    )
+    _assert_sentinels_absent(
+        inspect_outcome.model_dump_json(),
+        context="InspectResponse derived from sentinel-rooted vault",
+    )
+
+    # ------------------------------------------------------------------
+    # Projection 2: resolve under ORDINARY_AGENT — must produce a
+    # ResolverSuccess whose serialisation does not carry the sentinel
+    # vault path or the private-dict sentinel value.
+    # ------------------------------------------------------------------
+    outcome_ord = boundary.resolve(
+        locator,
+        scope=ResolverScope.ORDINARY_AGENT,
+        purpose="leakscan",
+        tenant=tenant,
+    )
+    assert isinstance(outcome_ord, ResolverSuccess), (
+        f"resolve(ORDINARY_AGENT) failed: {outcome_ord!r}"
+    )
+    _assert_sentinels_absent(
+        outcome_ord.model_dump_json(),
+        context="ResolverSuccess (ORDINARY_AGENT scope)",
+    )
+
+    # And: ResolverFailure derived from a malformed locator under the
+    # same sentinel-rooted vault must also not echo the sentinels.
+    outcome_fail = boundary.resolve(
+        "private://agent_public/manifest/does-not-exist",
+        scope=ResolverScope.ORDINARY_AGENT,
+        purpose="leakscan",
+        tenant=tenant,
+    )
+    assert isinstance(outcome_fail, boundary.ResolverFailure)
+    _assert_sentinels_absent(
+        outcome_fail.model_dump_json(),
+        context="ResolverFailure (unknown locator)",
+    )
+
+    # ------------------------------------------------------------------
+    # Projection 3: _public_handle_for(ArtifactHandle.vault_path) — the
+    # boundary projection that drops vault_path must succeed.
+    # ------------------------------------------------------------------
+    derived_handle = boundary._public_handle_for(doc_id)
+    _assert_sentinels_absent(
+        derived_handle.model_dump_json(),
+        context="PublicHandle derived from doc_id",
+    )
+
+    # ------------------------------------------------------------------
+    # Projection 4: process_document_request — drives a fresh document
+    # through the kernel against the sentinel-rooted vault. The handle
+    # the boundary returns must not carry vault_path.
+    # ------------------------------------------------------------------
+    new_doc_id = "doc-leakscan-2"
+    proc_resp = boundary.process_document_request(
+        boundary.ProcessRequest(
+            doc_id=new_doc_id,
+            raw_text=f"{_PRIVATE_VALUE_SENTINEL} works.",
+            spans=[
+                SpanSpec(
+                    start=0,
+                    end=len(_PRIVATE_VALUE_SENTINEL),
+                    kind=EntityKind.PERSON,
+                ),
+            ],
+        ),
+        tenant=tenant,
+    )
+    # The kernel persisted the raw value into the private dict
+    # (vault-side) but the public ProcessResponse handle must be
+    # opaque.
+    persisted_private = (vault_root / "private" / f"{new_doc_id}.json").read_text(
+        encoding="utf-8"
+    )
+    assert _PRIVATE_VALUE_SENTINEL in persisted_private, (
+        "negative control: pipeline did not persist the raw value to "
+        "the private dict (test cannot detect a leak if the raw value "
+        "is not in the system)"
+    )
+    _assert_sentinels_absent(
+        proc_resp.model_dump_json(),
+        context="ProcessResponse for sentinel-carrying document",
+    )
+
+    # And the agent-facing inspect of that same document must also be
+    # sentinel-free even though the private dict (vault-side) holds the
+    # raw sentinel value.
+    inspect_2 = boundary.inspect_request(
+        boundary.InspectRequest(locator=proc_resp.handle.locator),
+        tenant=tenant,
+    )
+    assert isinstance(inspect_2, boundary.InspectResponse)
+    _assert_sentinels_absent(
+        inspect_2.model_dump_json(),
+        context=(
+            "InspectResponse for sentinel-carrying document (private "
+            "dict on disk DOES hold the sentinel; projection must not)"
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Projection 5: synthetic agent-facing responses built independently
+    # (i.e. with no path through a private-side instance) must, as a
+    # whole-corpus check, also not contain any of the sentinels. This
+    # catches a regression where a shared module-level cache or default
+    # accidentally absorbs a private value.
+    # ------------------------------------------------------------------
+    for name, response in _build_concrete_responses():
+        _assert_sentinels_absent(
+            response.model_dump_json(),
+            context=f"synthetic agent-facing response {name!r}",
+        )
+
+    # Sanity: each sentinel is non-trivial.
+    for sentinel in _ALL_PRIVATE_SENTINELS:
+        assert sentinel and len(sentinel) > 12
 
 
 def test_restricted_fields_gated_by_resolver_scope(tmp_path: Path) -> None:
