@@ -1159,6 +1159,13 @@ REGISTRY: tuple[BoundaryField, ...] = (
         scrub_mechanism="never_emitted",
         note="operator-supplied config; vault-side",
     ),
+    BoundaryField(
+        module="yomotsusaka.runpod_lifecycle",
+        qualname="PodConfig.template_id",
+        exposure="private",
+        scrub_mechanism="never_emitted",
+        note="owner-pinned RunPod template ID; vault-side config; never logged or emitted",
+    ),
     # -- yomotsusaka.tenant -------------------------------------------------
     BoundaryField(
         module="yomotsusaka.tenant",

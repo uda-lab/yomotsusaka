@@ -56,12 +56,37 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _default_template_id_from_env() -> str | None:
+    """Read ``RUNPOD_TEMPLATE_ID`` from the env, treating empty as unset.
+
+    Used as the ``default_factory`` for :attr:`PodConfig.template_id` so
+    that **every** ``PodConfig()`` construction — including the explicit
+    ``PodConfig()`` calls in ``scripts/manage_runpod.py`` — picks up the
+    owner-pinned template via env without each caller threading it
+    through. Explicit ``PodConfig(template_id=...)`` still overrides the
+    env (issue #126; codex P1 fixup on PR #131).
+    """
+    value = os.environ.get("RUNPOD_TEMPLATE_ID")
+    return value if value else None
+
+
 @dataclass
 class PodConfig:
     """Configuration for a RunPod pod.
 
     ``model_id`` defaults to the MVP-3 pin ``"Qwen/Qwen3-8B"`` per
     ``docs/runpod.md`` §4 and metaplan Fork 5.
+
+    ``template_id`` is the optional owner-pinned RunPod template ID. Its
+    default factory reads ``RUNPOD_TEMPLATE_ID`` from the environment at
+    each ``PodConfig()`` construction, so callers that build their own
+    ``PodConfig()`` (notably ``scripts/manage_runpod.py``) honour the
+    owner-configured cheap template without explicit threading. Explicit
+    ``PodConfig(template_id=...)`` overrides the env. When the resolved
+    value is not ``None``, ``_create_payload`` includes ``"templateId"``
+    in the REST body so the owner-configured cheap template (community
+    cloud, spot price, etc.) is honoured by the agent-managed lifecycle
+    (issue #126).
     """
 
     gpu_type: str = "NVIDIA RTX A5000"
@@ -69,6 +94,7 @@ class PodConfig:
     model_id: str = "Qwen/Qwen3-8B"
     disk_gb: int = 20
     extra: dict[str, Any] = field(default_factory=dict)
+    template_id: str | None = field(default_factory=_default_template_id_from_env)
 
 
 @dataclass
@@ -350,6 +376,10 @@ class ManageRunPodLifecycle(RunPodLifecycle):
             )
 
         self._api_key = resolved_api_key
+        # ``PodConfig()`` reads ``RUNPOD_TEMPLATE_ID`` via its default
+        # factory (issue #126; codex P1 fixup on PR #131), so the env-var
+        # hook is honoured uniformly whether the caller passes an explicit
+        # ``pod_config`` or not. No additional env-threading here.
         self._pod_config = pod_config or PodConfig()
         self._transport = transport
         self._bypass_pod_id = pod_id
@@ -589,13 +619,22 @@ class ManageRunPodLifecycle(RunPodLifecycle):
         Field names follow the public RunPod REST schema. The payload is
         constructed here (not in :meth:`start_pod`) so the test seam can
         inspect it via a :class:`httpx.MockTransport` handler.
+
+        ``templateId`` is included ONLY when ``config.template_id`` is not
+        ``None`` (issue #126). This lets the owner pin a RunPod template
+        (community cloud type, spot-price ceiling, data-center, image, env
+        vars, ports, volume) via ``RUNPOD_TEMPLATE_ID`` without requiring
+        every caller to supply it.
         """
-        return {
+        payload: dict[str, Any] = {
             "gpuTypeIds": [config.gpu_type],
             "imageName": config.image,
             "containerDiskInGb": config.disk_gb,
             "env": {"MODEL_ID": config.model_id, **config.extra},
         }
+        if config.template_id is not None:
+            payload["templateId"] = config.template_id
+        return payload
 
     @staticmethod
     def _extract_pod_identity(data: Any) -> tuple[str | None, str | None]:

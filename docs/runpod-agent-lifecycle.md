@@ -59,13 +59,10 @@ The agent runs inside the dev container after the owner has injected
 The agreed injection mechanism is **environment variables set by the
 owner in the dev container shell session**. The agent reads:
 
-| Variable             | Required | Source                                                                                       |
-| -------------------- | -------- | -------------------------------------------------------------------------------------------- |
-| `RUNPOD_API_KEY`     | yes      | Owner-issued scoped RunPod account API key (§3). Presence-checked only; value never logged.  |
-
-(Template selection is baked into `PodConfig` defaults; no env-var hook
-is wired yet. A future issue may add an owner-pinned template-id env var
-once that becomes a real requirement.)
+| Variable               | Required | Source                                                                                                                                                               |
+| ---------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RUNPOD_API_KEY`       | yes      | Owner-issued scoped RunPod account API key (§3). Presence-checked only; value never logged.                                                                          |
+| `RUNPOD_TEMPLATE_ID`   | optional | Owner-pinned RunPod template; when set, `ManageRunPodLifecycle` includes `templateId` in the `POST /v1/pods` body so the owner-configured cheap template is honored. |
 
 The owner sets these in their dev-container shell (e.g. by `export`-ing
 them before launching the agent, or by writing them into a
