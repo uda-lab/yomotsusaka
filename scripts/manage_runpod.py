@@ -6,11 +6,17 @@ Default policy — create → wait for ``/health`` → run sanitised smoke →
 :class:`yomotsusaka.runpod_lifecycle.ManageRunPodLifecycle` and the
 :mod:`scripts.smoke_runpod` diagnostic mode, and adds:
 
-* A preflight ``runpodctl --version`` presence check that produces a
-  friendlier owner-facing install hint without making a network call.
 * Sanitised category-only stdout (``lifecycle: <category>``) per phase.
 * A urgent stderr line + per-run lifecycle JSONL row on cleanup failure
   so the owner can identify the orphaned Pod manually.
+
+The only mandatory precondition for the live managed lifecycle is the
+preconfigured ``RUNPOD_API_KEY`` environment credential (issue #90 /
+MVP-5 umbrella #89). ``runpodctl`` is **optional owner break-glass
+tooling**: when present it is probed for diagnostic purposes only; when
+absent the helper logs an informational line and proceeds with the REST
+lifecycle. Missing ``runpodctl`` is NOT a preflight failure under the
+default mode.
 
 See ``docs/runpod-agent-lifecycle.md`` for the owner/agent split and the
 sanitisation invariant. Decision sources: source spec at
@@ -63,6 +69,15 @@ EXIT_CLEANUP_FAILED = 3
 # Category literals — the ONLY values that may appear after the
 # ``lifecycle:`` prefix on stdout. Mirrors the table in
 # ``docs/runpod-agent-lifecycle.md`` §5.
+#
+# Note (issue #90 / MVP-5): ``_CATEGORY_PREFLIGHT_RUNPODCTL`` is retained
+# as a stable public-safe constant for downstream consumers, but is no
+# longer emitted on the default happy path. Missing ``runpodctl`` is now
+# informational only (a single ``logger.info('runpodctl_missing')`` line
+# on the diagnostic surface); only ``_CATEGORY_PREFLIGHT_APIKEY`` remains
+# a hard preflight failure. The constant can be re-asserted behind a
+# future ``--strict-runpodctl`` opt-in flag if owner-side debugging needs
+# the old behaviour back.
 _CATEGORY_PREFLIGHT_RUNPODCTL = "runpodctl_missing"
 _CATEGORY_PREFLIGHT_APIKEY = "api_key_missing"
 _CATEGORY_CREATED = "created"
@@ -75,9 +90,12 @@ _CATEGORY_DELETED = "deleted"
 _CATEGORY_KEPT = "kept"
 _CATEGORY_CLEANUP_FAILED = "cleanup_failed"
 
-# The runpodctl docs URL the preflight points the owner at. Single
-# constant so a future URL change is a one-line edit (low-impact;
-# Decision-3 / Improvement-Findings note in the tightened plan).
+# The runpodctl docs URL referenced from the break-glass docs only
+# (``docs/runpod-agent-lifecycle.md`` §10 / ``docs/runpod.md`` §10).
+# Retained as a module-level constant in case a future opt-in strict
+# mode wants to surface it again, but the default happy path does NOT
+# print it — owners who want ``runpodctl`` install themselves out-of-
+# band. Single constant so a future URL change is a one-line edit.
 _RUNPODCTL_INSTALL_URL = "https://docs.runpod.io/cli/install-runpodctl"
 
 # JSONL file under the user's local cache (NOT in repo). The path is
@@ -364,18 +382,17 @@ def run_lifecycle(
     # Generated upfront so the same id covers stdout, stderr, and JSONL.
     request_id = str(uuid.uuid4())
 
+    # Issue #90 / MVP-5 umbrella #89: missing ``runpodctl`` is NO LONGER a
+    # hard preflight failure. The live managed lifecycle uses REST end-to-
+    # end; ``runpodctl`` is optional owner break-glass tooling. We probe
+    # for diagnostic visibility only and emit a single informational
+    # ``logger.info`` line on the diagnostic surface — never the public
+    # ``lifecycle: <category>`` channel, never the JSONL row, never a
+    # non-zero exit code. The only mandatory precondition for the live
+    # managed lifecycle remains the ``RUNPOD_API_KEY`` environment
+    # credential (checked next).
     if not runpodctl_present:
-        _emit_category(_CATEGORY_PREFLIGHT_RUNPODCTL)
-        print(
-            f"hint: install runpodctl from {_RUNPODCTL_INSTALL_URL}",
-            file=sys.stderr,
-        )
-        _append_lifecycle_row(
-            request_id=request_id,
-            category=_CATEGORY_PREFLIGHT_RUNPODCTL,
-            log_path=lifecycle_log,
-        )
-        return EXIT_PREFLIGHT_FAILED
+        logger.info("runpodctl_missing")
 
     if not _api_key_available(env_dict):
         _emit_category(_CATEGORY_PREFLIGHT_APIKEY)
