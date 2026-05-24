@@ -41,6 +41,22 @@ docs/runpod-notes.md filename is the deleted predecessor.
 
 - `docs/runpod-notes.md` must not exist in the repository. [severity: error]
 
+## AGENTS.md hygiene
+
+```text
+AGENTS.md is the single short, durable control surface for coding
+agents. It becomes harmful when it duplicates README/docs content,
+records issue/PR/MVP provenance, or carries stale operational claims.
+The deterministic rules below pin AGENTS.md to a minimal, stale-resistant
+shape; the script scripts/gatekeeper/check_agents_md.py evaluates each
+rule against the live AGENTS.md at the repository root and exits
+non-zero on any violation.
+```
+
+- `AGENTS.md` visible-line count (non-blank, non-HTML-comment lines) must be at most 15. [severity: error]
+- `AGENTS.md` must not contain issue, PR, or MVP provenance tokens (`#<digits>`, `MVP-<digits>`, `PR <digits>`, `PR #<digits>`). [severity: error]
+- Every `docs/<file>` reference in `AGENTS.md` must resolve to an existing path on disk. [severity: error]
+
 ## Boundary repository hygiene
 
 ```text
