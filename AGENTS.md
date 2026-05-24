@@ -15,6 +15,7 @@ uv pip install -e ".[dev]"
 uv run pytest
 uv run ruff check src tests
 uv run python -m yomotsusaka.cli.run_batch ./inbox --vault-root ./vault  # quick end-to-end check
+uv run python scripts/gatekeeper/check_docs_commands.py  # docs-to-source drift gate (#114)
 ~~~
 
 ## Operational smoke
