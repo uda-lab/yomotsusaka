@@ -277,6 +277,49 @@ def test_fenced_block_is_exempt(crp, tmp_path):
     assert findings == [], f"unexpected findings inside fence: {findings}"
 
 
+def test_indented_fenced_block_is_exempt(crp, tmp_path):
+    """List-embedded fenced blocks (up to 3 spaces of indent) are exempt.
+
+    Regression for the codex P2 finding on PR #121: the fence regex
+    previously only matched column-0 fences, so a fenced block embedded
+    inside a list item leaked into prose scanning and produced spurious
+    ``README_PROVENANCE_*`` errors. CommonMark allows the fence to be
+    indented up to three spaces.
+    """
+
+    body = (
+        "# Title\n\n"
+        "1. Run the example:\n\n"
+        "   ```sh\n"
+        "   # example payload referencing issue #90 — allowed inside fence\n"
+        "   ```\n\n"
+        "2. Then verify.\n"
+    )
+    readme = _write_readme(tmp_path, body)
+    findings = crp.scan_readme(readme)
+    assert findings == [], (
+        f"indented fenced block should be exempt; got findings: {findings}"
+    )
+
+
+def test_fence_indented_two_spaces_with_tilde(crp, tmp_path):
+    """Tilde fences with 2-space indent also close correctly."""
+
+    body = (
+        "# Title\n\n"
+        "- Step:\n\n"
+        "  ~~~\n"
+        "  This block references PR #289 inside fence.\n"
+        "  ~~~\n\n"
+        "Closing prose has no forbidden tokens.\n"
+    )
+    readme = _write_readme(tmp_path, body)
+    findings = crp.scan_readme(readme)
+    assert findings == [], (
+        f"tilde-fenced indented block should be exempt; got: {findings}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Exit-code contract
 # ---------------------------------------------------------------------------

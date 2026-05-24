@@ -196,7 +196,21 @@ _ANY_HEADING_RE = re.compile(r"^#{1,6}\s+\S")
 # Fenced code blocks are excluded from scanning. The README's prose is
 # the audience surface; example commands and JSON payloads inside
 # fences are allowed to reference numbers freely.
-_FENCE_RE = re.compile(r"^(?P<fence>```|~~~)")
+#
+# Per CommonMark, a fence may be indented up to three spaces — common
+# inside list-item continuation lines such as:
+#
+#     1. Run this:
+#
+#        ```sh
+#        # example payload references issue #99 — allowed inside fence
+#        ```
+#
+# The regex therefore accepts a leading ``{0,3}`` whitespace prefix
+# before the fence characters. The captured ``fence`` group is the
+# fence string itself (``` ``` ``` or ``~~~``) so the closing-fence
+# matcher can compare against it directly.
+_FENCE_RE = re.compile(r"^[ \t]{0,3}(?P<fence>```|~~~)")
 
 
 # ---------------------------------------------------------------------------
@@ -227,11 +241,16 @@ def scan_readme(readme_path: Path) -> list[Finding]:
     for line_no, raw in enumerate(readme_path.read_text().splitlines(), start=1):
         fence_match = _FENCE_RE.match(raw)
         if fence_match:
+            matched_fence = fence_match.group("fence")
             if not in_fence:
                 in_fence = True
-                fence_char = fence_match.group("fence")
+                fence_char = matched_fence
                 continue
-            if fence_char and raw.startswith(fence_char):
+            if fence_char and matched_fence == fence_char:
+                # Close on a same-character fence. CommonMark allows the
+                # closing fence to use a different leading indent than
+                # the opener; the regex already permits 0–3 spaces, so
+                # comparing the captured fence string suffices.
                 in_fence = False
                 fence_char = None
                 continue
