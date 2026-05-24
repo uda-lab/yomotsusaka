@@ -45,6 +45,13 @@ _CHECKS: list[tuple[str, list[str], bool]] = [
     # vocab_drift has 2 pre-existing failures on tip-of-main (MVP-6
     # deferred follow-up).  Run advisory only.
     ("check_vocab_drift.py", [], True),
+    # Layer 2-5 rules (issue #128) — adopted after validation-first review.
+    # G2: Doc numeric spec vs code constants (hard gate; disk_gb drift fixed).
+    ("check_spec_values.py", [], False),
+    # G3: Documented env-var must be wired in source (hard gate; post-#126).
+    ("check_documented_env_vars.py", [], False),
+    # G4: Lifecycle invariant — start_pod has paired stop_pod (hard gate; post-#125).
+    ("check_lifecycle_invariant.py", [], False),
 ]
 
 
