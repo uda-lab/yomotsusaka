@@ -45,16 +45,22 @@ For an agent picking the project up in a fresh Hermes-managed
 devcontainer, the shortest path to operational smoke is:
 
 ```bash
-# 1. Bootstrap the project environment (broker-mediated).
-eval "$(/workspaces/hermes-engineering/scripts/project-env.sh yomotsusaka)"
-
-# 2. Install dependencies (one-shot per worktree).
+# 1. Install dependencies (one-shot per worktree).
 uv venv && uv pip install -e ".[dev]"
 
-# 3. Run the canonical end-to-end operational scenario.
-uv run python -m yomotsusaka.cli.operational_smoke ./inbox \
-    --vault-root ./vault
+# 2. Run the canonical end-to-end operational scenario.
+#    Secrets (RUNPOD_API_KEY, etc.) are injected per-run by the broker into
+#    the child process environment; they never traverse stdout / argv.
+/workspaces/hermes-engineering/scripts/project-env.sh yomotsusaka -- \
+    uv run python -m yomotsusaka.cli.operational_smoke ./inbox \
+        --vault-root ./vault
 ```
+
+Use the nested-command form of `project-env.sh` (with the `--` separator)
+rather than the legacy `eval "$(…)"` shape; the latter is deprecated upstream
+because it prints `export KEY=val` lines to stdout, where an agent shell
+transcript or CI log would capture the live value (hermes-engineering PR
+#289).
 
 The smoke CLI exercises the full batch → index → reload → search →
 restoration-request → audit backbone in a single command and emits one
