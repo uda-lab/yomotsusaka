@@ -93,6 +93,11 @@ _CATEGORY_CREATED = "created"
 _CATEGORY_CREATE_FAILED = "create_failed"
 _CATEGORY_HEALTHY = "healthy"
 _CATEGORY_WAIT_TIMEOUT = "wait_timeout"
+# Pod was created, health-check timed out, AND the subsequent best-effort
+# cleanup also failed — the Pod may still be running and billing. The
+# library raises this category when both _wait_for_healthy and stop_pod
+# raise PodUnavailableError in the same start_pod call (issue #125).
+_CATEGORY_WAIT_TIMEOUT_CLEANUP_FAILED = "wait_timeout_cleanup_failed"
 _CATEGORY_SMOKE_PASSED = "smoke_passed"
 _CATEGORY_SMOKE_FAILED = "smoke_failed"
 _CATEGORY_DELETED = "deleted"
@@ -115,6 +120,7 @@ PUBLIC_SAFE_CATEGORIES: frozenset[str] = frozenset(
         _CATEGORY_CREATE_FAILED,
         _CATEGORY_HEALTHY,
         _CATEGORY_WAIT_TIMEOUT,
+        _CATEGORY_WAIT_TIMEOUT_CLEANUP_FAILED,
         _CATEGORY_SMOKE_PASSED,
         _CATEGORY_SMOKE_FAILED,
         _CATEGORY_DELETED,
@@ -470,11 +476,24 @@ def run_lifecycle(
         handle = lifecycle.start_pod(pod_config)
     except PodUnavailableError as exc:
         # The exception's ``args[0]`` carries the category literal that
-        # the library raised — Seam S2 in the tightened plan. Only
-        # ``create_failed`` and ``wait_timeout`` are produced by
-        # ``ManageRunPodLifecycle.start_pod``; treat anything else as
-        # ``create_failed`` defensively.
+        # the library raised — Seam S2 in the tightened plan.
+        # ``create_failed`` and ``wait_timeout`` are the normal failure
+        # paths; ``wait_timeout_cleanup_failed`` means the library already
+        # attempted cleanup but that also failed (Pod may still exist);
+        # treat anything else as ``create_failed`` defensively.
         raw = exc.args[0] if exc.args else _CATEGORY_CREATE_FAILED
+        if raw == _CATEGORY_WAIT_TIMEOUT_CLEANUP_FAILED:
+            # Cleanup already attempted by the library and failed — the Pod
+            # may still be running. Route to the EXIT_CLEANUP_FAILED path
+            # and emit the urgent marker so the owner can manually clean up.
+            _emit_category(_CATEGORY_WAIT_TIMEOUT_CLEANUP_FAILED)
+            _emit_urgent(request_id, log_path=lifecycle_log)
+            _append_lifecycle_row(
+                request_id=request_id,
+                category=_CATEGORY_WAIT_TIMEOUT_CLEANUP_FAILED,
+                log_path=lifecycle_log,
+            )
+            return EXIT_CLEANUP_FAILED
         if raw in (_CATEGORY_CREATE_FAILED, _CATEGORY_WAIT_TIMEOUT):
             category = raw
         else:

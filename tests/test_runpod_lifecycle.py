@@ -368,20 +368,65 @@ def test_manage_lifecycle_wait_timeout_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Decision 5 — the wait phase polls up to MAX_ATTEMPTS and then
-    raises ``wait_timeout``."""
+    raises ``wait_timeout`` (after cleaning up the Pod — issue #125).
+
+    When the DELETE succeeds, the exception category is ``wait_timeout``
+    (honest: cleanup was attempted and succeeded before re-raising).
+    """
     monkeypatch.setattr(
         runpod_lifecycle_module, "_MANAGE_HEALTH_POLL_INTERVAL_SECONDS", 0
     )
     monkeypatch.setattr(
         runpod_lifecycle_module, "_MANAGE_HEALTH_POLL_MAX_ATTEMPTS", 3
     )
-    handler = _make_lifecycle_handler(health_status=503)
+    record: dict[str, list[httpx.Request]] = {}
+    handler = _make_lifecycle_handler(health_status=503, record=record)
     lifecycle = ManageRunPodLifecycle(
         api_key="sk-test", transport=httpx.MockTransport(handler)
     )
     with pytest.raises(PodUnavailableError) as excinfo:
         lifecycle.start_pod(PodConfig())
     assert excinfo.value.args[0] == "wait_timeout"
+    # Issue #125: the library must have called stop_pod (DELETE) before
+    # re-raising — the delete-after-use invariant applies on the wait_timeout
+    # path.
+    assert len(record.get("DELETE", [])) == 1, (
+        "expected exactly one DELETE attempt (best-effort cleanup before "
+        f"re-raising wait_timeout); got {record.get('DELETE', [])}"
+    )
+
+
+def test_manage_lifecycle_wait_timeout_cleanup_failed_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #125 — double-failure path: _wait_for_healthy raises AND
+    the subsequent best-effort stop_pod also fails.
+
+    In this case the library must raise ``PodUnavailableError`` with
+    category ``wait_timeout_cleanup_failed`` so callers can distinguish
+    "Pod cleaned after wait_timeout" from "Pod may still be running."
+    """
+    monkeypatch.setattr(
+        runpod_lifecycle_module, "_MANAGE_HEALTH_POLL_INTERVAL_SECONDS", 0
+    )
+    monkeypatch.setattr(
+        runpod_lifecycle_module, "_MANAGE_CLEANUP_RETRY_DELAY_SECONDS", 0
+    )
+    monkeypatch.setattr(
+        runpod_lifecycle_module, "_MANAGE_HEALTH_POLL_MAX_ATTEMPTS", 1
+    )
+    # Health never returns 200; DELETE always fails.
+    handler = _make_lifecycle_handler(
+        health_status=503, fail_on_delete=True
+    )
+    lifecycle = ManageRunPodLifecycle(
+        api_key="sk-test", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(PodUnavailableError) as excinfo:
+        lifecycle.start_pod(PodConfig())
+    assert excinfo.value.args[0] == "wait_timeout_cleanup_failed", (
+        f"expected wait_timeout_cleanup_failed; got {excinfo.value.args[0]!r}"
+    )
 
 
 def test_manage_lifecycle_stop_pod_failure_raises_cleanup_failed(
@@ -1143,6 +1188,98 @@ def test_manage_helper_create_failure_no_cleanup_attempted(
     assert "lifecycle: create_failed" in out.out
     assert fake.stop_calls == [], "no cleanup when create failed"
     assert "lifecycle: deleted" not in out.out
+
+
+def test_manage_helper_wait_timeout_exits_phase_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Issue #125 — wait_timeout (library cleaned up) → EXIT_PHASE_FAILED.
+
+    The fake lifecycle raises PodUnavailableError("wait_timeout") directly
+    (simulating the post-fix library that cleaned up before re-raising).
+    manage_runpod must emit the category and exit EXIT_PHASE_FAILED.
+    The library's internal stop_pod call is not visible to this test because
+    _make_fake_lifecycle.start_pod raises directly; the integration is
+    covered by the library-level test above.
+    """
+    fake = _make_fake_lifecycle(wait_should_fail=True)
+    runner, _captured = _make_fake_smoke_runner(success=True)
+    rc = manage_runpod.run_lifecycle(
+        keep_pod=False,
+        pod_config=PodConfig(),
+        lifecycle_factory=lambda: fake,
+        smoke_runner=runner,
+        lifecycle_log=tmp_path / "lifecycle.jsonl",
+        env={"RUNPOD_API_KEY": "sk-test"},
+        runpodctl_check=lambda: True,
+    )
+    out = capsys.readouterr()
+    assert rc == manage_runpod.EXIT_PHASE_FAILED
+    assert "lifecycle: wait_timeout" in out.out
+    # The caller must NOT call stop_pod again — library already handled it.
+    assert fake.stop_calls == [], (
+        "manage_runpod must not call stop_pod after wait_timeout; "
+        "the library already performed best-effort cleanup before raising"
+    )
+
+
+def test_manage_helper_wait_timeout_cleanup_failed_exits_cleanup_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Issue #125 — wait_timeout_cleanup_failed → EXIT_CLEANUP_FAILED + urgent.
+
+    When the library raises PodUnavailableError("wait_timeout_cleanup_failed"),
+    manage_runpod must route to EXIT_CLEANUP_FAILED (not EXIT_PHASE_FAILED)
+    and emit the urgent marker so the owner can manually clean up the orphan
+    Pod.
+    """
+    def _fake_lifecycle_factory():
+        class _DoubleFailLifecycle:
+            def __init__(self) -> None:
+                self.stop_calls: list[PodHandle] = []
+                self.start_calls = 0
+
+            def start_pod(self, _config: PodConfig) -> PodHandle:
+                self.start_calls += 1
+                raise PodUnavailableError("wait_timeout_cleanup_failed")
+
+            def stop_pod(self, handle: PodHandle, *, terminate: bool = True) -> None:
+                self.stop_calls.append(handle)
+
+        return _DoubleFailLifecycle()
+
+    fake = _fake_lifecycle_factory()
+    runner, _captured = _make_fake_smoke_runner(success=True)
+    log_path = tmp_path / "lifecycle.jsonl"
+    rc = manage_runpod.run_lifecycle(
+        keep_pod=False,
+        pod_config=PodConfig(),
+        lifecycle_factory=lambda: fake,
+        smoke_runner=runner,
+        lifecycle_log=log_path,
+        env={"RUNPOD_API_KEY": "sk-test"},
+        runpodctl_check=lambda: True,
+    )
+    out = capsys.readouterr()
+    # Must exit with cleanup-failed semantics (not merely phase-failed)
+    # because the Pod may still be running.
+    assert rc == manage_runpod.EXIT_CLEANUP_FAILED, (
+        f"expected EXIT_CLEANUP_FAILED; got rc={rc}"
+    )
+    assert "lifecycle: wait_timeout_cleanup_failed" in out.out
+    # Urgent marker must be emitted so the owner can manually clean up.
+    assert "URGENT: manual Pod cleanup required" in out.err
+    assert "request_id=" in out.err
+    # JSONL row must record the category.
+    rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+    categories = [r["category"] for r in rows]
+    assert "wait_timeout_cleanup_failed" in categories, (
+        f"expected wait_timeout_cleanup_failed in lifecycle log; got {categories}"
+    )
 
 
 def test_manage_helper_no_secret_leak_in_any_surface(

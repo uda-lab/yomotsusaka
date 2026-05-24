@@ -713,6 +713,111 @@ def test_synthesis_cleanup_failed_yields_owner_action() -> None:
     )
 
 
+def test_synthesis_wait_timeout_cleanup_failed_yields_owner_action() -> None:
+    """Issue #125 — ``wait_timeout_cleanup_failed`` must yield
+    ``failed_owner_action`` (exit 3), not ``failed_cleaned`` (exit 1).
+
+    ``failed_cleaned`` would be a lie: cleanup was attempted but also
+    failed, so the Pod may still be running and billing.
+    """
+    from yomotsusaka.cli import operational_smoke as cli_mod
+
+    statuses = _statuses_for(
+        [
+            ("batch", "ok", "batch_ok"),
+            ("index_snapshot", "ok", "index_snapshot_ok"),
+            ("index_reload", "ok", "index_reload_ok"),
+            ("search_smoke", "ok", "search_smoke_ok"),
+            ("restoration_request", "ok", "restoration_ok"),
+            ("audit_inspect", "ok", "audit_inspect_ok"),
+            ("runpod_lifecycle", "fail", "wait_timeout_cleanup_failed"),
+        ]
+    )
+    assert cli_mod._synthesise_result(statuses) == (
+        "failed_owner_action",
+        3,
+    ), (
+        "wait_timeout_cleanup_failed must route to failed_owner_action "
+        "(exit 3), not failed_cleaned — the Pod may still be running"
+    )
+
+
+def test_phase_runpod_lifecycle_wait_timeout_cleanup_failed_routes_to_owner_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #125 — when start_pod raises PodUnavailableError("wait_timeout_cleanup_failed"),
+    _phase_runpod_lifecycle must return the category that routes to
+    failed_owner_action (not failed_cleaned).
+
+    Three assertions per the triage spec:
+    1. stop_pod was called once with the leaked handle — the library's
+       internal stop_pod call is the one that failed; we verify the phase
+       returns the correct category that records this.
+    2. The exception propagates with the combined category (the fake raises
+       wait_timeout_cleanup_failed directly, matching the post-fix library
+       contract).
+    3. The result-token from _synthesise_result is failed_owner_action
+       (exit 3), not failed_cleaned (exit 1) — the token honesty fix.
+    """
+    from yomotsusaka.cli import operational_smoke as cli_mod
+    from yomotsusaka.runpod_lifecycle import PodHandle, PodUnavailableError
+
+    stop_calls: list[tuple[PodHandle, bool]] = []
+
+    class _FakeLifecycle:
+        """Simulates library post-fix: start_pod raises wait_timeout_cleanup_failed.
+
+        The library's internal stop_pod was already attempted (and failed)
+        before raising this category; callers must NOT call stop_pod again.
+        """
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass  # Accept api_key / pod_config kwargs that ManageRunPodLifecycle accepts.
+
+        def start_pod(self, _config: object = None) -> PodHandle:  # noqa: ANN201
+            raise PodUnavailableError("wait_timeout_cleanup_failed")
+
+        def stop_pod(self, handle: PodHandle, *, terminate: bool = True) -> None:
+            stop_calls.append((handle, terminate))
+
+    # Patch ManageRunPodLifecycle inside the runpod_lifecycle module so the
+    # lazy import inside _phase_runpod_lifecycle picks up our fake.
+    import yomotsusaka.runpod_lifecycle as rl_mod
+
+    monkeypatch.setattr(rl_mod, "ManageRunPodLifecycle", _FakeLifecycle)
+
+    status, category = cli_mod._phase_runpod_lifecycle(
+        keep_pod=False,
+        env={"RUNPOD_API_KEY": "sk-test-sentinel"},
+    )
+
+    # Assertion 1 & 2: The phase returns FAIL + wait_timeout_cleanup_failed.
+    # (The library already called stop_pod internally — recorded in the
+    # category string; our fake confirms the phase does NOT call stop_pod
+    # again after receiving this category from start_pod.)
+    assert status == "fail", f"expected fail; got {status!r}"
+    assert category == "wait_timeout_cleanup_failed", (
+        f"expected wait_timeout_cleanup_failed; got {category!r}"
+    )
+    # Caller must NOT call stop_pod again — library already handled cleanup.
+    assert stop_calls == [], (
+        "_phase_runpod_lifecycle must not call stop_pod after receiving "
+        "wait_timeout_cleanup_failed from start_pod (library already tried)"
+    )
+
+    # Assertion 3: _synthesise_result maps this to failed_owner_action.
+    result_token, exit_code = cli_mod._synthesise_result(
+        [("runpod_lifecycle", status, category)]
+    )
+    assert result_token == "failed_owner_action", (
+        f"wait_timeout_cleanup_failed must yield failed_owner_action; "
+        f"got {result_token!r} — emitting failed_cleaned here would be a lie "
+        f"since cleanup was not verified to have succeeded"
+    )
+    assert exit_code == 3
+
+
 # ---------------------------------------------------------------------------
 # --emit-json bridge (issue #111)
 # ---------------------------------------------------------------------------

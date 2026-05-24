@@ -148,6 +148,10 @@ _CAT_FAIL_AUDIT_MISSING = OperationalCategory.AuditFileMissing.value
 _CAT_FAIL_AUDIT_NO_MATCH = OperationalCategory.AuditRecordNotFound.value
 _CAT_FAIL_RUNPOD_CREATE = OperationalCategory.CreateFailed.value
 _CAT_FAIL_RUNPOD_WAIT = OperationalCategory.WaitTimeout.value
+# Pod created, health-check timed out, cleanup also failed — Pod may still
+# exist and bill. The library raises PodUnavailableError("wait_timeout_cleanup_failed")
+# in this case (issue #125). Maps to failed_owner_action via _synthesise_result.
+_CAT_FAIL_RUNPOD_WAIT_TIMEOUT_CLEANUP_FAILED = OperationalCategory.WaitTimeoutCleanupFailed.value
 _CAT_FAIL_RUNPOD_PREFLIGHT_APIKEY = OperationalCategory.ApiKeyMissing.value
 _CAT_FAIL_RUNPOD_CLEANUP = OperationalCategory.CleanupFailed.value
 
@@ -580,7 +584,13 @@ def _phase_runpod_lifecycle(
     except PodUnavailableError as exc:
         raw = exc.args[0] if exc.args else _CAT_FAIL_RUNPOD_CREATE
         if raw == "wait_timeout":
+            # Library cleaned up the Pod before re-raising — honest token.
             return _STATUS_FAIL, _CAT_FAIL_RUNPOD_WAIT
+        if raw == "wait_timeout_cleanup_failed":
+            # Library attempted cleanup but it also failed — Pod may still
+            # exist and bill. Route to _CAT_FAIL_RUNPOD_CLEANUP so
+            # _synthesise_result maps this to failed_owner_action (exit 3).
+            return _STATUS_FAIL, _CAT_FAIL_RUNPOD_WAIT_TIMEOUT_CLEANUP_FAILED
         return _STATUS_FAIL, _CAT_FAIL_RUNPOD_CREATE
 
     if keep_pod:
@@ -616,15 +626,25 @@ def _synthesise_result(
 
     Precedence (highest first):
 
-    1. Any phase with status ``fail`` and category ``cleanup_failed`` →
-       ``failed_owner_action`` (exit 3).
-    2. Any phase with status ``fail`` → ``failed_cleaned`` (exit 1).
+    1. Any phase with status ``fail`` and category ``cleanup_failed`` OR
+       ``wait_timeout_cleanup_failed`` → ``failed_owner_action`` (exit 3).
+       Both categories indicate a Pod that may still be running and billing.
+       ``failed_cleaned`` MUST NOT be emitted for these categories: doing so
+       would falsely claim cleanup succeeded when it did not (issue #125).
+    2. Any phase with status ``fail`` → ``failed_cleaned`` (exit 1). This
+       path is only reached when NO Pod exists that requires owner cleanup.
+       When the library raises ``wait_timeout``, it has already deleted the
+       Pod before re-raising — so ``failed_cleaned`` is accurate here.
     3. Any phase with status ``warn`` → ``completed_with_warnings``
        (exit 0).
     4. All phases ``ok`` or ``skipped`` → ``completed`` (exit 0).
     """
+    _owner_action_categories = {
+        _CAT_FAIL_RUNPOD_CLEANUP,
+        _CAT_FAIL_RUNPOD_WAIT_TIMEOUT_CLEANUP_FAILED,
+    }
     if any(
-        s == _STATUS_FAIL and c == _CAT_FAIL_RUNPOD_CLEANUP
+        s == _STATUS_FAIL and c in _owner_action_categories
         for _, s, c in statuses
     ):
         return _RESULT_FAILED_OWNER_ACTION, _EXIT_FAILED_OWNER_ACTION
