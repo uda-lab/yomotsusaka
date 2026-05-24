@@ -574,3 +574,119 @@ def test_default_proposer_is_used_when_none_supplied(
     )
     # Equality on the pydantic model checks every field.
     assert explicit == in_repo_report
+
+
+# ---------------------------------------------------------------------------
+# Agent-runnable CLI (#105 finding F1)
+# ---------------------------------------------------------------------------
+#
+# These tests cover the ``python -m yomotsusaka.eval.redaction_quality``
+# entry point added to fix F1 (umbrella #105) — prior to that fix the
+# documented invocation exited 0 with zero bytes on stdout/stderr,
+# making the harness silently no-op for any agent following the docs.
+
+
+import io  # noqa: E402  - placed near CLI-only tests to keep top short
+
+
+def test_cli_passes_on_clean_corpus() -> None:
+    """The CLI must emit a non-empty PASS summary and exit 0 on the
+    in-repo synthetic corpus (which is the binding "clean" reference).
+    """
+    from yomotsusaka.eval.redaction_quality import main
+
+    out = io.StringIO()
+    err = io.StringIO()
+    rc = main(
+        ["--corpus", str(_REPO_FIXTURES)],
+        stdout=out,
+        stderr=err,
+    )
+    assert rc == 0
+    text = out.getvalue()
+    assert text, "CLI must not produce a silent no-op"
+    # First line must carry the stable PASS/FAIL verdict so grep-based
+    # callers can pattern-match without parsing the table.
+    first_line = text.splitlines()[0]
+    assert first_line == "redaction_quality: PASS"
+    # The summary must surface the binding totals so downstream callers
+    # have a public-safe signal even in the PASS path.
+    assert "false_negative_total=0" in text
+    assert "false_positive_total=0" in text
+    assert "placeholder_consistency=1.0" in text
+    assert err.getvalue() == ""
+
+
+def test_cli_fails_on_planted_miss(tmp_path: Path) -> None:
+    """A planted false negative must surface as exit=1 and a FAIL
+    summary so a docile agent gets a loud, parseable signal.
+    """
+    from yomotsusaka.eval.redaction_quality import main
+
+    body = "A document with no proposable spans."
+    expected = {
+        "tenant_id": "_local",
+        "spans": [{"start": 0, "end": 1, "kind": "PERSON"}],
+        "expected_keys": ["<PERSON_xyz>"],
+    }
+    (tmp_path / "planted.txt").write_text(body, encoding="utf-8")
+    (tmp_path / "planted.expected.json").write_text(
+        json.dumps(expected), encoding="utf-8"
+    )
+
+    out = io.StringIO()
+    err = io.StringIO()
+    rc = main(
+        ["--corpus", str(tmp_path)],
+        stdout=out,
+        stderr=err,
+    )
+    assert rc == 1
+    text = out.getvalue()
+    assert text.startswith("redaction_quality: FAIL\n")
+    # The structural triple must appear public-safe (no raw text).
+    assert "false_negative_spans: 0:1:PERSON" in text
+    # No raw fixture body should leak into either stream.
+    assert "proposable spans" not in text
+    assert "proposable spans" not in err.getvalue()
+
+
+def test_cli_input_error_returns_2(tmp_path: Path) -> None:
+    """A missing corpus directory must yield exit=2 (input error) with
+    an empty stdout and a single-line stderr diagnostic.
+    """
+    from yomotsusaka.eval.redaction_quality import main
+
+    missing = tmp_path / "no-such-dir"
+    out = io.StringIO()
+    err = io.StringIO()
+    rc = main(
+        ["--corpus", str(missing)],
+        stdout=out,
+        stderr=err,
+    )
+    assert rc == 2
+    assert out.getvalue() == ""
+    assert err.getvalue().startswith("error:")
+    assert str(missing) in err.getvalue()
+
+
+def test_cli_json_mode_emits_structured_payload() -> None:
+    """``--json`` must emit a single-line JSON envelope containing the
+    verdict and the pydantic-public-safe report dump.
+    """
+    from yomotsusaka.eval.redaction_quality import main
+
+    out = io.StringIO()
+    err = io.StringIO()
+    rc = main(
+        ["--corpus", str(_REPO_FIXTURES), "--json"],
+        stdout=out,
+        stderr=err,
+    )
+    assert rc == 0
+    payload = json.loads(out.getvalue())
+    assert payload["verdict"] == "PASS"
+    assert payload["corpus_dir"] == str(_REPO_FIXTURES)
+    assert payload["report"]["false_negative_total"] == 0
+    assert payload["report"]["placeholder_consistency"] == 1.0

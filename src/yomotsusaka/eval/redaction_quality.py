@@ -18,6 +18,23 @@ self-test exercises the harness on a synthetic "known miss" corpus to
 verify the harness reports the failure rather than silently swallowing
 it.
 
+Agent-runnable CLI (issue #105 finding F1)
+==========================================
+
+The module also exposes a thin ``python -m`` entry point that wraps
+:func:`evaluate_corpus` against the in-repo fixture corpus (or a caller-
+supplied directory) and emits a public-safe one-line pass/fail summary
+plus a per-document phase block. Exit codes follow the same convention
+as the other ``yomotsusaka.cli.*`` shims: ``0`` on a fully clean run,
+non-zero when any finding (false negative, false positive, or
+placeholder inconsistency) is present, and a distinct code for input
+errors so callers can branch on the failure shape.
+
+Only public-safe values appear on stdout: counts, rates, document
+stems, :class:`yomotsusaka.schemas.EntityKind` enum tokens, and
+``(start, end, kind)`` triples. The raw text of the corpus is never
+echoed by this CLI.
+
 Privacy discipline (binding, see ``docs/architecture.md`` §Capability
 and exposure model and issue #94 §Public-safe discipline)
 =========================================================
@@ -57,12 +74,15 @@ Module exports
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
+import sys
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -82,7 +102,33 @@ __all__ = [
     "load_corpus",
     "evaluate_corpus",
     "CorpusLoadError",
+    "main",
 ]
+
+
+# ---------------------------------------------------------------------------
+# CLI exit codes
+# ---------------------------------------------------------------------------
+#
+# Stable codes the agent-runnable CLI returns. Other shims in
+# ``yomotsusaka.cli`` use the same 0 / 1 / 2 split for clean run /
+# findings present / input error so the wrapping orchestration scripts
+# can pattern-match consistently.
+_CLI_EXIT_CLEAN = 0
+_CLI_EXIT_FINDINGS = 1
+_CLI_EXIT_INPUT_ERROR = 2
+
+
+# Default corpus directory — the in-repo synthetic fixture set used by
+# both ``tests/eval/test_redaction_quality.py`` and (by default) the
+# agent-runnable CLI below. Resolved off the package source tree at
+# import time so the CLI works regardless of the caller's cwd.
+_DEFAULT_CORPUS = (
+    Path(__file__).resolve().parents[3]
+    / "tests"
+    / "fixtures"
+    / "redaction_corpus"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -669,3 +715,210 @@ def evaluate_corpus(
         placeholder_consistency=consistency,
         placeholder_inconsistencies=violations,
     )
+
+
+# ---------------------------------------------------------------------------
+# Agent-runnable CLI (issue #105 finding F1)
+# ---------------------------------------------------------------------------
+#
+# Prior to this entry point, ``python -m yomotsusaka.eval.redaction_quality``
+# exited 0 with zero bytes on stdout/stderr because the module had no
+# ``__main__`` block — a docile agent following the docs got a silent
+# pass with no signal. The CLI below wraps :func:`evaluate_corpus`,
+# emits a public-safe summary, and maps findings to a non-zero exit
+# code so the failure mode is loud, not silent.
+#
+# Privacy posture: every value the CLI prints is either a count, a rate,
+# a document stem, an :class:`EntityKind` token, or a ``(start, end,
+# kind)`` triple. Raw corpus text never appears. The renderer is
+# defensive about the structural fields too: triples are formatted as
+# ``start:end:kind`` so a future field-shape change cannot accidentally
+# stringify a pydantic model that grows a raw-text member.
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m yomotsusaka.eval.redaction_quality",
+        description=(
+            "Run the redaction-quality harness against a fixture "
+            "corpus and emit a public-safe pass/fail summary on "
+            "stdout. Exits 0 on a fully clean run, 1 when any "
+            "finding (FN / FP / placeholder inconsistency) is "
+            "present, and 2 on input error."
+        ),
+    )
+    parser.add_argument(
+        "--corpus",
+        type=Path,
+        default=_DEFAULT_CORPUS,
+        help=(
+            "Corpus directory containing one or more "
+            "``<name>.txt`` / ``<name>.expected.json`` fixture "
+            "pairs. Defaults to the in-repo synthetic corpus at "
+            "``tests/fixtures/redaction_corpus``."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit the public-safe report as a single JSON object "
+            "instead of the default human-readable text summary. "
+            "Useful when piping into another tool."
+        ),
+    )
+    return parser
+
+
+def _format_span_coord(coord: SpanCoord) -> str:
+    """Render a :class:`SpanCoord` as ``start:end:kind``.
+
+    Public-safe by construction — the triple carries no raw text. The
+    explicit formatter (rather than ``repr`` or pydantic dump) is
+    defensive against future shape drift.
+    """
+    return f"{coord.start}:{coord.end}:{coord.kind.value}"
+
+
+def _render_text_summary(
+    report: RedactionQualityReport,
+    *,
+    corpus_dir: Path,
+) -> str:
+    """Render the human-readable summary for a
+    :class:`RedactionQualityReport`.
+
+    The first line is a stable single-token verdict (``PASS`` or
+    ``FAIL``) so callers grepping the output can pattern-match cleanly
+    without parsing the table.
+    """
+    verdict = "FAIL" if report.has_failures else "PASS"
+    lines: list[str] = []
+    lines.append(f"redaction_quality: {verdict}")
+    lines.append(f"corpus: {corpus_dir}")
+    lines.append(f"documents: {len(report.documents)}")
+    lines.append(
+        f"expected_spans_total={report.expected_spans_total}"
+        f" proposed_spans_total={report.proposed_spans_total}"
+    )
+    lines.append(
+        f"false_negative_total={report.false_negative_total}"
+        f" false_negative_rate={report.false_negative_rate}"
+    )
+    lines.append(
+        f"false_positive_total={report.false_positive_total}"
+        f" false_positive_rate={report.false_positive_rate}"
+    )
+    lines.append(
+        f"placeholder_consistency={report.placeholder_consistency}"
+        f" placeholder_inconsistencies={len(report.placeholder_inconsistencies)}"
+    )
+    if report.has_failures:
+        lines.append("")
+        lines.append("findings:")
+        for doc in report.documents:
+            if (
+                doc.false_negative_count == 0
+                and doc.false_positive_count == 0
+                and doc.key_match
+            ):
+                continue
+            lines.append(
+                f"  doc={doc.doc_name} tenant={doc.tenant_id}"
+                f" fn={doc.false_negative_count}"
+                f" fp={doc.false_positive_count}"
+                f" key_match={doc.key_match}"
+            )
+            if doc.false_negative_spans:
+                joined = ",".join(
+                    _format_span_coord(c) for c in doc.false_negative_spans
+                )
+                lines.append(f"    false_negative_spans: {joined}")
+            if doc.false_positive_spans:
+                joined = ",".join(
+                    _format_span_coord(c) for c in doc.false_positive_spans
+                )
+                lines.append(f"    false_positive_spans: {joined}")
+            if doc.missing_keys:
+                joined = ",".join(sorted(doc.missing_keys))
+                lines.append(f"    missing_keys: {joined}")
+            if doc.extra_keys:
+                joined = ",".join(sorted(doc.extra_keys))
+                lines.append(f"    extra_keys: {joined}")
+        for inc in report.placeholder_inconsistencies:
+            joined_keys = ",".join(sorted(inc.conflicting_keys))
+            joined_docs = ",".join(inc.observed_docs)
+            lines.append(
+                f"  placeholder_inconsistency tenant={inc.tenant_id}"
+                f" kind={inc.kind.value}"
+                f" keys=[{joined_keys}]"
+                f" observed_docs=[{joined_docs}]"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _render_json_summary(
+    report: RedactionQualityReport,
+    *,
+    corpus_dir: Path,
+) -> str:
+    """Render the report as a single-line JSON object.
+
+    Uses ``model_dump`` (pydantic-public-safe by construction) plus a
+    couple of envelope fields so the CLI shape is self-describing.
+    """
+    payload = {
+        "verdict": "FAIL" if report.has_failures else "PASS",
+        "corpus_dir": str(corpus_dir),
+        "report": report.model_dump(mode="json"),
+    }
+    return json.dumps(payload, sort_keys=True) + "\n"
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    stdout: IO[str] | None = None,
+    stderr: IO[str] | None = None,
+) -> int:
+    """Entry point. Returns the process exit code.
+
+    Exit codes
+    ----------
+    0
+        Corpus evaluated cleanly — zero false negatives, zero false
+        positives, no placeholder inconsistencies.
+    1
+        Evaluation completed but at least one finding is present.
+        Stdout still carries the full summary; callers can grep it.
+    2
+        Input error (corpus directory missing or malformed). Stdout is
+        empty; stderr carries a single-line diagnostic.
+    """
+    out = stdout if stdout is not None else sys.stdout
+    err = stderr if stderr is not None else sys.stderr
+
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    corpus_dir: Path = args.corpus
+
+    try:
+        report = evaluate_corpus(corpus_dir)
+    except CorpusLoadError as exc:
+        # The CorpusLoadError message references the offending fixture
+        # path and shape — public-safe by construction (see the class
+        # docstring). No raw corpus body can reach this surface.
+        err.write(f"error: {exc}\n")
+        return _CLI_EXIT_INPUT_ERROR
+
+    if args.json:
+        out.write(_render_json_summary(report, corpus_dir=corpus_dir))
+    else:
+        out.write(_render_text_summary(report, corpus_dir=corpus_dir))
+    out.flush()
+
+    return _CLI_EXIT_FINDINGS if report.has_failures else _CLI_EXIT_CLEAN
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
