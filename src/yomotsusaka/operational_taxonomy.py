@@ -190,6 +190,10 @@ class OperationalCategory(str, Enum):
     # module docstring's "Mirror-not-redefine" clause.
     CreateFailed = "create_failed"
     WaitTimeout = "wait_timeout"
+    # Pod was created and became unhealthy (wait_timeout) AND the subsequent
+    # best-effort cleanup attempt also failed — the Pod may still be running
+    # and billing. Callers should treat this as requiring owner action.
+    WaitTimeoutCleanupFailed = "wait_timeout_cleanup_failed"
     ApiKeyMissing = "api_key_missing"
     CleanupFailed = "cleanup_failed"
 
@@ -651,12 +655,28 @@ _RECOVERY_TABLE_DATA: tuple[RecoveryInstruction, ...] = (
         category=OperationalCategory.WaitTimeout,
         agent_action=(
             "Report wait_timeout; the Pod was created but did not become "
-            "healthy within the configured wait budget. The bounded "
-            "cleanup helper deletes the Pod. Owner may inspect RunPod "
+            "healthy within the configured wait budget. The library "
+            "performed best-effort cleanup (stop_pod) before re-raising; "
+            "the Pod was successfully deleted. Owner may inspect RunPod "
             "console; no further agent action is required."
         ),
         safe_retry_condition="<= 1 retries",
         owner_escalate_when="after retries exhausted",
+        safe_evidence=("counter:runpod_lifecycle_category",),
+        forbidden_evidence=_BASELINE + ("bearer_token", "api_key"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.WaitTimeoutCleanupFailed,
+        agent_action=(
+            "Report wait_timeout_cleanup_failed; the Pod was created but "
+            "did not become healthy AND the subsequent best-effort cleanup "
+            "also failed — the Pod may still be running and billing. "
+            "Owner must manually delete the Pod via the RunPod console or "
+            "runpodctl; agent does not invoke runpodctl."
+        ),
+        safe_retry_condition="owner-only",
+        owner_escalate_when="always",
         safe_evidence=("counter:runpod_lifecycle_category",),
         forbidden_evidence=_BASELINE + ("bearer_token", "api_key"),
         hard_stop=False,

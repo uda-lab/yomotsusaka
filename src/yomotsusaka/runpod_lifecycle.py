@@ -439,7 +439,21 @@ class ManageRunPodLifecycle(RunPodLifecycle):
         logger.info("created")
 
         # Wait phase — pure category-only logging.
-        self._wait_for_healthy(handle)
+        # Delete-after-use invariant: if the Pod was created but never
+        # became healthy, we attempt best-effort cleanup before re-raising
+        # so no orphan Pod is left running (and billing).
+        try:
+            self._wait_for_healthy(handle)
+        except PodUnavailableError:
+            try:
+                self.stop_pod(handle, terminate=True)
+            except PodUnavailableError:
+                # Cleanup also failed — the Pod may still exist and bill.
+                # Raise the harder category so callers know the Pod is
+                # potentially still running (distinct from wait_timeout
+                # where cleanup succeeded).
+                raise PodUnavailableError("wait_timeout_cleanup_failed") from None
+            raise
         return handle
 
     def stop_pod(self, handle: PodHandle, *, terminate: bool = True) -> None:
