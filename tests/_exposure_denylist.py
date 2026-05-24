@@ -2,7 +2,9 @@
 
 This module centralises the fixture-only sentinel strings used by both the
 MVP-2 leakage scan (:mod:`tests.test_exposure_contract`, issue #29) and the
-MVP-3 widening (:mod:`tests.test_exposure_contract_mvp3`, issue #47).
+MVP-3 widening (:mod:`tests.test_exposure_contract_mvp3`, issue #47), and
+the boundary-symbol roster reused by the MVP-5 boundary-registry drift
+tests (:mod:`tests.test_boundary_registry_drift`, issue #95).
 
 All strings declared here are **fixture-only sentinels**. They MUST NEVER
 appear in any agent-facing return, log line, manifest, search result, or
@@ -135,6 +137,49 @@ ALL_MVP3_SENTINELS: tuple[str, ...] = (
 loops in the abstract contract classes."""
 
 
+# ---------------------------------------------------------------------------
+# Boundary symbol roster (shared with tests.test_boundary_registry_drift, #95)
+# ---------------------------------------------------------------------------
+#
+# Every public response type whose serialisation flows through the
+# :mod:`tests.test_exposure_contract` scan. The boundary-registry drift
+# tests (issue #95, child 06 of MVP-5) also consume this constant so the
+# two suites pin the same surface set. If ``boundary.__all__`` ever grows a
+# new response, this set must grow to match (or the new response must be
+# added to one of the per-surface tests in ``test_exposure_contract.py``).
+
+EXPECTED_BOUNDARY_SYMBOLS: frozenset[str] = frozenset(
+    {
+        "PublicHandle",
+        "PublicManifestView",
+        "ProcessResponse",
+        "InspectResponse",
+        "SearchHit",
+        "SearchResponse",
+        "RestorationResponse",
+        "StatusReportResponse",
+        "ResolverFailure",
+        "ResolverFailureReason",
+        "ResolverScope",
+        "ResolverSuccess",
+        "PrivateState",
+        "ExecutionResponse",
+        "parse_locator",
+        "build_locator",
+        "process_document_request",
+        "inspect_request",
+        "search_request",
+        "restoration_request",
+        "status_report_request",
+        "execute_request",
+        "resolve",
+    }
+)
+"""Boundary symbols (responses + entry points) covered by the public-surface
+scan and the boundary-field registry. Single source of truth shared between
+``test_exposure_contract.py`` and ``test_boundary_registry_drift.py``."""
+
+
 __all__ = [
     "CANONICAL_TEXT",
     "CANONICAL_SPANS",
@@ -147,4 +192,5 @@ __all__ = [
     "MOCK_APPROVAL_TICKET_SENTINELS",
     "MOCK_POLICY_PROFILE_SENTINELS",
     "ALL_MVP3_SENTINELS",
+    "EXPECTED_BOUNDARY_SYMBOLS",
 ]

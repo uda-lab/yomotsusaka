@@ -90,6 +90,34 @@ _CATEGORY_DELETED = "deleted"
 _CATEGORY_KEPT = "kept"
 _CATEGORY_CLEANUP_FAILED = "cleanup_failed"
 
+
+# Aggregate set of public-safe category literals emitted on stdout via
+# ``_emit_category``. Iterated by the MVP-5 boundary-field registry (issue
+# #95) so the registry stays in lockstep with the literal set without
+# duplicating the strings. Adding a new ``_CATEGORY_*`` literal MUST be
+# reflected here so the registry's drift test recognises the new value as
+# part of the public-safe vocabulary; the registry-drift test asserts
+# bidirectional agreement.
+PUBLIC_SAFE_CATEGORIES: frozenset[str] = frozenset(
+    {
+        _CATEGORY_PREFLIGHT_RUNPODCTL,
+        _CATEGORY_PREFLIGHT_APIKEY,
+        _CATEGORY_CREATED,
+        _CATEGORY_CREATE_FAILED,
+        _CATEGORY_HEALTHY,
+        _CATEGORY_WAIT_TIMEOUT,
+        _CATEGORY_SMOKE_PASSED,
+        _CATEGORY_SMOKE_FAILED,
+        _CATEGORY_DELETED,
+        _CATEGORY_KEPT,
+        _CATEGORY_CLEANUP_FAILED,
+    }
+)
+"""Frozen set of stdout category literals (the ``<value>`` portion of
+``lifecycle: <value>``). Public-safe by construction: each literal is a
+short token that does not echo Pod IDs, endpoint URLs, or any credential
+material. Consumed by the boundary-field registry (issue #95)."""
+
 # The runpodctl docs URL referenced from the break-glass docs only
 # (``docs/runpod-agent-lifecycle.md`` §10 / ``docs/runpod.md`` §10).
 # Retained as a module-level constant in case a future opt-in strict

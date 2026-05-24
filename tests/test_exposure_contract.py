@@ -83,6 +83,7 @@ from yomotsusaka.search_gateway import QueryResolver, SearchGateway
 from tests._exposure_denylist import (
     CANONICAL_SPANS,
     CANONICAL_TEXT,
+    EXPECTED_BOUNDARY_SYMBOLS,
     PATH_LEAK_PATTERNS,
     RAW_VALUES,
 )
@@ -101,34 +102,9 @@ from tests._exposure_denylist import (
 # Every public response type whose serialisation flows through this scan.
 # If boundary.__all__ ever grows a new response, this set must grow to match
 # (or the new response must be added to one of the per-surface tests below).
-# Names this scan covers (responses + supporting types + entry points).
-EXPECTED_BOUNDARY_SYMBOLS: frozenset[str] = frozenset(
-    {
-        "PublicHandle",
-        "PublicManifestView",
-        "ProcessResponse",
-        "InspectResponse",
-        "SearchHit",
-        "SearchResponse",
-        "RestorationResponse",
-        "StatusReportResponse",
-        "ResolverFailure",
-        "ResolverFailureReason",
-        "ResolverScope",
-        "ResolverSuccess",
-        "PrivateState",
-        "ExecutionResponse",
-        "parse_locator",
-        "build_locator",
-        "process_document_request",
-        "inspect_request",
-        "search_request",
-        "restoration_request",
-        "status_report_request",
-        "execute_request",
-        "resolve",
-    }
-)
+# The canonical roster lives in :mod:`tests._exposure_denylist` so that the
+# MVP-5 boundary-registry drift tests (issue #95) share a single source of
+# truth with this scan.
 
 # Names that are intentionally exported by ``boundary.__all__`` but are
 # *not* themselves agent-facing responses (locator-grammar constants,
