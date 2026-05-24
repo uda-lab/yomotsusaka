@@ -417,7 +417,13 @@ _NAME_TOKEN_PREFIXES = (
 # `tee` and `$?` detection in shell blocks.
 _TEE_LINE_RE = re.compile(r"\btee\b")
 _DOLLAR_QUESTION_RE = re.compile(r"\$\?")
-_PIPEFAIL_RE = re.compile(r"set\s+-[eou]*pipefail|set\s+-o\s+pipefail")
+# Match all common pipefail-enabling forms:
+#   set -o pipefail          (canonical)
+#   set -eo pipefail         (short-flag combos + `-o pipefail`)
+#   set -euo pipefail
+#   set -e -o pipefail       (separate flags)
+# Each must include the literal `pipefail` token.
+_PIPEFAIL_RE = re.compile(r"set\s+-[A-Za-z\s\-]*\bpipefail\b")
 _PIPESTATUS_RE = re.compile(r"\$\{PIPESTATUS\[")
 
 # Fixture-path seeding detection.
@@ -733,21 +739,35 @@ def check_python_invocation_has_main(
 def check_tee_pipefail_guard(
     blocks: Sequence[Block], repo_root: Path
 ) -> Iterator[Finding]:
-    """B2: tee + $? without pipefail or PIPESTATUS guard."""
+    """B2: tee + $? without pipefail or PIPESTATUS guard.
+
+    Order matters. The guard (``set -o pipefail`` or any of its short-flag
+    variants like ``set -euo pipefail``) must appear *before* the ``tee``
+    pipeline — a pipefail set after the pipeline has already exited
+    cannot influence ``$?`` for that pipeline. ``${PIPESTATUS[0]}``,
+    being an explicit per-line read, is accepted on the same line as the
+    ``$?`` check or earlier (it replaces ``$?``, it doesn't precede it).
+    """
 
     for block in blocks:
         if block.tag not in {"sh", "bash", ""}:
             continue
         lines = block.body.splitlines()
         tee_seen_at: int | None = None
-        guard_seen = False
+        pipefail_before_tee = False
+        # Track whether the line that inspects $? also uses PIPESTATUS
+        # (PIPESTATUS is a per-line guard, not a session-wide one).
         for idx, raw in enumerate(lines):
-            if _PIPEFAIL_RE.search(raw) or _PIPESTATUS_RE.search(raw):
-                guard_seen = True
             if _TEE_LINE_RE.search(raw):
-                tee_seen_at = idx
+                if tee_seen_at is None:
+                    tee_seen_at = idx
+            elif tee_seen_at is None and _PIPEFAIL_RE.search(raw):
+                # pipefail must precede the tee pipeline to count
+                pipefail_before_tee = True
             if tee_seen_at is not None and _DOLLAR_QUESTION_RE.search(raw):
-                if not guard_seen:
+                # Accept PIPESTATUS as a per-line replacement for $?.
+                pipestatus_here = bool(_PIPESTATUS_RE.search(raw))
+                if not (pipefail_before_tee or pipestatus_here):
                     yield Finding(
                         rule="command_validity.tee_pipefail_guard",
                         severity="error",
@@ -757,8 +777,9 @@ def check_tee_pipefail_guard(
                         evidence=raw.strip(),
                         detail=(
                             "shell block pipes through tee and inspects "
-                            "$? without `set -o pipefail` or "
-                            "${PIPESTATUS[0]} guard"
+                            "$? without a preceding `set -o pipefail` "
+                            "(or short-flag variant) and no "
+                            "${PIPESTATUS[0]} guard on the inspection line"
                         ),
                     )
                 # Only fire once per block.

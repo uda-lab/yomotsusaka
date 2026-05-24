@@ -301,3 +301,54 @@ def test_inbox_with_mkdir_seeding_does_not_fire(tmp_path):
     report = CHECK_MODULE.run_checks([sample], REPO_ROOT)
     rule_ids = [f.rule for f in report.findings]
     assert "command_validity.fixture_path_seeded" not in rule_ids
+
+
+# ---------------------------------------------------------------------------
+# Regression coverage for PR #117 codex review
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "guard_line",
+    [
+        "set -o pipefail",
+        "set -eo pipefail",
+        "set -euo pipefail",
+        "set -e -o pipefail",
+    ],
+)
+def test_tee_pipefail_short_flag_variants_recognized(tmp_path, guard_line):
+    """Codex PR #117 P1: short-flag pipefail forms must count as a guard."""
+
+    safe = guard_line.replace(" ", "_").replace("-", "_")
+    sample = tmp_path / f"tee_{safe}.md"
+    sample.write_text(
+        f"```sh\n{guard_line}\nuv run pytest 2>&1 | tee pytest.log\n"
+        "if [ $? -ne 0 ]; then echo fail; fi\n```\n",
+        encoding="utf-8",
+    )
+    report = CHECK_MODULE.run_checks([sample], REPO_ROOT)
+    rule_ids = [f.rule for f in report.findings]
+    assert "command_validity.tee_pipefail_guard" not in rule_ids, (
+        f"guard form '{guard_line}' should be recognized but was flagged"
+    )
+
+
+def test_tee_pipefail_after_pipeline_does_not_count(tmp_path):
+    """Codex PR #117 P2: pipefail after the tee pipeline cannot influence
+    the pipeline that has already exited; the rule must still fire."""
+
+    sample = tmp_path / "tee_pipefail_late.md"
+    sample.write_text(
+        "```sh\n"
+        "uv run pytest 2>&1 | tee pytest.log\n"
+        "set -o pipefail  # too late\n"
+        "if [ $? -ne 0 ]; then echo fail; fi\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    report = CHECK_MODULE.run_checks([sample], REPO_ROOT)
+    rule_ids = [f.rule for f in report.findings]
+    assert "command_validity.tee_pipefail_guard" in rule_ids, (
+        "pipefail after the tee pipeline must not be accepted as a guard"
+    )
