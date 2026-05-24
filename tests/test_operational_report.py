@@ -284,6 +284,16 @@ SENSITIVE_TOKENS: tuple[tuple[str, str], ...] = (
     ("vault_path", "/manifests/doc_abcdef.json"),
     ("vault_private_path", "/private/doc_abcdef.json"),
     ("vault_audit_path", "/audit/restoration.jsonl"),
+    # The snapshot directory written by ``SearchGateway.snapshot`` lives
+    # at ``<vault_root>/index/manifests.jsonl``. PR #104 codex review id
+    # 3294021180 caught that the original ``vault_path`` regex omitted the
+    # ``index`` segment, so a counter value containing that path would
+    # silently pass the public-safe sweep. This fixture pins the fix.
+    ("vault_index_snapshot_path", "/index/manifests.jsonl"),
+    (
+        "vault_index_snapshot_absolute",
+        "/tmp/scenario-vault/index/manifests.jsonl",
+    ),
     ("https_endpoint", "https://api.runpod.io/v1/pods/runpod-abcdef123"),
     ("http_endpoint", "http://10.0.0.1:8000/v1/chat/completions"),
     ("pod_id", "runpod-deadbeefcafe"),
@@ -478,6 +488,58 @@ class TestCliEntry:
         assert rc == 2
         assert stdout.getvalue() == ""
         assert "redaction" in stderr.getvalue().lower()
+
+    def test_input_path_is_directory_returns_input_error(
+        self, tmp_path
+    ) -> None:
+        # PR #104 codex review id 3294021182: ``_load_input`` used to only
+        # check ``path.exists()`` before ``read_text``, so a directory path
+        # would surface as an uncaught ``IsADirectoryError`` traceback.
+        # The CLI must convert this into the documented input-error exit
+        # path with a category-only diagnostic.
+        directory = tmp_path / "input_is_a_dir"
+        directory.mkdir()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli_module.main(["--input", str(directory)])
+        assert rc == 1
+        assert stdout.getvalue() == ""
+        err = stderr.getvalue()
+        assert err.startswith("error:"), err
+        # Diagnostic must NOT echo file contents — there are none — and
+        # must NOT leak a traceback. The path is caller-supplied so it is
+        # not itself a privacy concern.
+        assert "Traceback" not in err
+
+    def test_input_path_is_unreadable_returns_input_error(
+        self, tmp_path
+    ) -> None:
+        # PR #104 codex review id 3294021182: an unreadable file (mode 0)
+        # raises ``PermissionError`` inside ``read_text``; the CLI must
+        # surface it as the same controlled input-error flow rather than
+        # crashing with a traceback.
+        import os
+        import stat
+
+        if os.geteuid() == 0:
+            pytest.skip("running as root bypasses POSIX file-mode checks")
+        unreadable = tmp_path / "unreadable.json"
+        unreadable.write_text('{"phases": [], "counters": {}}', encoding="utf-8")
+        unreadable.chmod(0)
+        try:
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = cli_module.main(["--input", str(unreadable)])
+        finally:
+            # Restore mode so pytest's tmp_path cleanup can unlink it.
+            unreadable.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        assert rc == 1
+        assert stdout.getvalue() == ""
+        err = stderr.getvalue()
+        assert err.startswith("error:"), err
+        assert "Traceback" not in err
 
 
 # ---------------------------------------------------------------------------

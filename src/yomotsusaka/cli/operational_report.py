@@ -87,7 +87,26 @@ def _load_input(args: argparse.Namespace) -> Any:
         path: Path = args.input
         if not path.exists():
             raise FileNotFoundError(f"input file does not exist: {path}")
-        return json.loads(path.read_text(encoding="utf-8"))
+        # ``path.exists()`` does not distinguish files from directories and
+        # does not check readability. ``read_text`` can therefore raise
+        # ``IsADirectoryError`` (path is a directory) or ``PermissionError``
+        # (path is mode-0 or in a non-readable directory). Both subclass
+        # ``OSError``. Without this catch the CLI crashes with a traceback
+        # instead of returning the documented input-error exit path. The
+        # raised ``OSError`` is converted by ``main`` into the same flow
+        # used for ``FileNotFoundError``. (PR #104 codex review id
+        # 3294021182.)
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            # Reraise as a fresh ``OSError`` so ``main`` can branch on the
+            # canonical class without depending on the platform-specific
+            # subclass surface. The message is path-only and does NOT echo
+            # file contents.
+            raise OSError(
+                f"input file is not readable as text: {path} "
+                f"({type(exc).__name__})"
+            ) from exc
     raw = sys.stdin.read()
     if not raw.strip():
         raise ValueError("no JSON received on stdin")
@@ -168,6 +187,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         raw = _load_input(args)
     except FileNotFoundError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
+    except OSError as exc:
+        # ``IsADirectoryError`` / ``PermissionError`` from ``_load_input``
+        # (PR #104 codex review id 3294021182). Surface the path-only
+        # message so the agent gets a stable input-error category instead
+        # of an unhandled traceback. ``FileNotFoundError`` is handled
+        # above because it is the most common subclass and gets a
+        # narrower message.
         sys.stderr.write(f"error: {exc}\n")
         return 1
     except (json.JSONDecodeError, ValueError) as exc:

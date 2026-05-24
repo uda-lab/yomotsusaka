@@ -212,8 +212,15 @@ class RedactionError(Exception):
 # The list mirrors the boundary surfaces already audited elsewhere in the
 # repo:
 #
-# * ``/manifests/...`` / ``/private/...`` / ``/audit/...`` — vault layout
-#   (matches ``scrubber._VAULT_PATH_PATTERN`` plus generic vault prefixes).
+# * ``/manifests/...`` / ``/private/...`` / ``/audit/...`` / ``/index/...``
+#   — vault layout. The ``index`` segment matches the snapshot directory
+#   produced by :meth:`yomotsusaka.search_gateway.SearchGateway.snapshot`
+#   (``<vault_root>/index/manifests.jsonl``); without it, a counter value
+#   like ``"/tmp/.../index/manifests.jsonl"`` would pass the sweep and
+#   leak vault filesystem layout into the public report. (PR #104 codex
+#   review id 3294021180.) The ``search-index`` alternative is retained
+#   as a forward-compatible alias in case the snapshot directory is ever
+#   renamed.
 # * ``http(s)://`` URLs — endpoint leaks (RunPod, vLLM, etc.).
 # * RunPod-style Pod IDs (``runpod-...``, ``pod-...``).
 # * Bearer tokens (``Bearer <token>``).
@@ -223,7 +230,8 @@ _LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "vault_path",
         re.compile(
-            r"/(?:manifests|private|audit|search-index)/[A-Za-z0-9._-]{1,128}"
+            r"/(?:manifests|private|audit|search-index|index)"
+            r"/[A-Za-z0-9._-]{1,128}"
         ),
     ),
     (
