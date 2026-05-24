@@ -20,7 +20,7 @@ uv run python -m yomotsusaka.cli.run_batch ./inbox --vault-root ./vault  # quick
 ## Operational smoke
 
 ~~~sh
-uv run python -m yomotsusaka.cli.operational_smoke ./inbox --vault-root ./vault  # MVP-5 #91; no network by default
+uv run python -m yomotsusaka.cli.operational_smoke ./inbox --vault-root ./vault --demo-corpus  # MVP-5 #91 / MVP-6 #113; no network by default; --demo-corpus seeds a temp inbox so the positional path can be a placeholder
 ~~~
 
 ## Architecture
