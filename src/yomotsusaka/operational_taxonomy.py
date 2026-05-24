@@ -3,16 +3,29 @@ Operational failure taxonomy and recovery instructions.
 
 This module is the **single closed enum + recovery-instruction registry**
 covering the operational surfaces that an ordinary agent may encounter when
-driving the MVP-5 agent-runnable flow (batch, index snapshot/load, search
-smoke, restoration/audit, RunPod lifecycle, RunPod smoke, inference-backed
-span proposer). It does NOT redefine the four MVP-4 wire enums
+driving the MVP-5 / MVP-6 agent-runnable flow (batch, index snapshot/load,
+search smoke, restoration/audit, RunPod lifecycle, RunPod smoke, inference-
+backed span proposer). It does NOT redefine the four MVP-4 wire enums
 (:class:`~yomotsusaka.boundary.ResolverFailureReason`,
 :class:`~yomotsusaka.boundary.RestorationFailureReason`,
 :class:`~yomotsusaka.execution_gateway.ExecutionFailureReason`,
-:class:`~yomotsusaka.inference_backend.InferenceBackendReason`), nor the
-script-local category literals in ``scripts/manage_runpod.py`` and
-``scripts/smoke_runpod.py``. Those vocabularies remain wire-stable and are
-consumed by reference; this module wraps the operational surface only.
+:class:`~yomotsusaka.inference_backend.InferenceBackendReason`). Those
+vocabularies remain wire-stable and are consumed by reference; this module
+wraps the operational surface only.
+
+Mirror-not-redefine contract for ``scripts/manage_runpod.py`` literals
+----------------------------------------------------------------------
+The script-local category literals in ``scripts/manage_runpod.py`` (e.g.
+``create_failed``, ``wait_timeout``, ``api_key_missing``, ``cleanup_failed``)
+remain wire-authoritative on the script's own stdout — they are not
+redefined here. Where the **operational layer** (``operational_smoke``)
+forwards those literals on its own stdout phase ledger, the enum mirrors
+them by string equality so the per-phase category token is canonical at the
+operational layer too. This is the same pattern already used for
+``runpod_lifecycle_failed_cleaned`` / ``runpod_lifecycle_failed_owner_action``
+(operational-layer enum values that mirror script-local result tokens). The
+mirror is one-way: a wire-vocabulary change in the script side requires a
+matching enum-side change here.
 
 Two products live here:
 
@@ -118,25 +131,67 @@ class OperationalCategory(str, Enum):
     BatchOk = "batch_ok"
     BatchPartial = "batch_partial"
     BatchFailed = "batch_failed"
+    # Fine-grained batch fail-causes mirrored from operational_smoke so the
+    # per-phase ledger preserves the recovery hint (issue #111). The coarse
+    # ``BatchFailed`` is retained for upstream callers (e.g. the report
+    # renderer's classifier) that key on the broader bucket.
+    BatchNoDocuments = "batch_no_documents"
+    BatchAllFailed = "batch_all_failed"
+    BatchPartialCommit = "batch_partial_commit"
+    BatchInfrastructureError = "batch_infrastructure_error"
 
     IndexSnapshotOk = "index_snapshot_ok"
     IndexSnapshotFailed = "index_snapshot_failed"
+    # Fine-grained snapshot fail-causes (issue #111). ``snapshot_write_failed``
+    # is the IO-raised path; ``snapshot_not_persisted`` is the post-write
+    # absent-file defensive branch.
+    SnapshotWriteFailed = "snapshot_write_failed"
+    SnapshotNotPersisted = "snapshot_not_persisted"
 
     IndexReloadOk = "index_reload_ok"
     IndexReloadFailed = "index_reload_failed"
 
     SearchSmokeOk = "search_smoke_ok"
     SearchSmokeFailed = "search_smoke_failed"
+    # Fine-grained smoke fail-cause (issue #111): the probe returned zero
+    # hits. Distinguishes a healthy gateway that failed the probe from a
+    # gateway that errored during the probe.
+    SearchNoHits = "search_no_hits"
 
     RestorationOk = "restoration_ok"
     RestorationFailed = "restoration_failed"
+    # Operational-layer fail-cause for ``operational_smoke``'s phase-5 check
+    # when the facade returns a not-``ScopeDenied`` failure (issue #111).
+    # The wire-level RestorationFailureReason is still preserved in the
+    # audit row; this token only describes the operational surface.
+    RestorationRequestUnexpectedOutcome = "restoration_request_unexpected_outcome"
 
     AuditInspectOk = "audit_inspect_ok"
     AuditInspectFailed = "audit_inspect_failed"
+    # Fine-grained audit fail-causes (issue #111). ``audit_file_missing``
+    # = audit JSONL absent or unreadable; ``audit_record_not_found`` =
+    # JSONL present but the correlation row for this run is absent.
+    AuditFileMissing = "audit_file_missing"
+    AuditRecordNotFound = "audit_record_not_found"
 
     RunpodLifecycleOk = "runpod_lifecycle_ok"
     RunpodLifecycleFailedCleaned = "runpod_lifecycle_failed_cleaned"
     RunpodLifecycleFailedOwnerAction = "runpod_lifecycle_failed_owner_action"
+    # Skipped / kept dispositions (issue #111). ``runpod_lifecycle_disabled``
+    # is the no-flag default; ``runpod_lifecycle_kept`` is the
+    # ``--keep-pod`` warn-case where the agent successfully drove create→
+    # wait→smoke but the caller opted out of delete.
+    RunpodLifecycleDisabled = "runpod_lifecycle_disabled"
+    RunpodLifecycleKept = "runpod_lifecycle_kept"
+    # Wire-mirrored RunPod fail-cause literals (issue #111).
+    # These mirror the ``scripts/manage_runpod.py`` PUBLIC_SAFE_CATEGORIES
+    # tokens by string equality so the operational layer's phase ledger
+    # carries the same vocabulary as the script's own stdout. See the
+    # module docstring's "Mirror-not-redefine" clause.
+    CreateFailed = "create_failed"
+    WaitTimeout = "wait_timeout"
+    ApiKeyMissing = "api_key_missing"
+    CleanupFailed = "cleanup_failed"
 
     InferenceSpanDegraded = "inference_span_degraded"
     InferenceSpanUnavailable = "inference_span_unavailable"
@@ -242,6 +297,66 @@ _RECOVERY_TABLE_DATA: tuple[RecoveryInstruction, ...] = (
         hard_stop=False,
     ),
     RecoveryInstruction(
+        category=OperationalCategory.BatchNoDocuments,
+        agent_action=(
+            "Report batch_no_documents; the inbox contained no admissible "
+            "files. Owner verifies the inbox directory holds the expected "
+            "corpus before re-running."
+        ),
+        safe_retry_condition="owner-only",
+        owner_escalate_when="always",
+        safe_evidence=("counter:processed_documents",),
+        forbidden_evidence=_BASELINE + ("inbox_path", "document_text"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.BatchAllFailed,
+        agent_action=(
+            "Report batch_all_failed; every submitted document failed to "
+            "commit. Owner inspects vault-side batch log for the per-file "
+            "cause before retrying."
+        ),
+        safe_retry_condition="owner-only",
+        owner_escalate_when="always",
+        safe_evidence=(
+            "counter:processed_documents",
+            "counter:failed_documents",
+        ),
+        forbidden_evidence=_BASELINE + ("inbox_path", "document_text"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.BatchPartialCommit,
+        agent_action=(
+            "Report batch_partial_commit (warn status); some documents "
+            "committed and some failed. Do not retry the batch — re-running "
+            "would re-process the already-committed files. Owner inspects "
+            "vault-side batch log for the failed subset."
+        ),
+        safe_retry_condition="owner-only",
+        owner_escalate_when="never",
+        safe_evidence=(
+            "counter:processed_documents",
+            "counter:failed_documents",
+        ),
+        forbidden_evidence=_BASELINE + ("inbox_path", "document_text"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.BatchInfrastructureError,
+        agent_action=(
+            "Report batch_infrastructure_error; the runner could not enter "
+            "the inbox at all (missing directory, IO fault, or constructor "
+            "error). Owner verifies the inbox path and filesystem before "
+            "re-running."
+        ),
+        safe_retry_condition="owner-only",
+        owner_escalate_when="always",
+        safe_evidence=("counter:failed_documents",),
+        forbidden_evidence=_BASELINE + ("inbox_path", "document_text"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
         category=OperationalCategory.IndexSnapshotOk,
         agent_action=(
             "Report snapshot success; emit only the manifest count, never "
@@ -262,6 +377,32 @@ _RECOVERY_TABLE_DATA: tuple[RecoveryInstruction, ...] = (
         ),
         safe_retry_condition="<= 1 retries",
         owner_escalate_when="after retries exhausted",
+        safe_evidence=("counter:index_snapshot_ok",),
+        forbidden_evidence=_BASELINE + ("snapshot_path", "manifest_doc_id"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.SnapshotWriteFailed,
+        agent_action=(
+            "Report snapshot_write_failed; an OSError was raised while "
+            "writing the index snapshot. The helper already performed a "
+            "bounded retry. Owner inspects vault-side index directory."
+        ),
+        safe_retry_condition="<= 1 retries",
+        owner_escalate_when="after retries exhausted",
+        safe_evidence=("counter:index_snapshot_ok",),
+        forbidden_evidence=_BASELINE + ("snapshot_path", "manifest_doc_id"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.SnapshotNotPersisted,
+        agent_action=(
+            "Report snapshot_not_persisted; the snapshot helper returned "
+            "without raising but the snapshot file is absent on disk. Owner "
+            "inspects vault-side index directory for write-through faults."
+        ),
+        safe_retry_condition="owner-only",
+        owner_escalate_when="always",
         safe_evidence=("counter:index_snapshot_ok",),
         forbidden_evidence=_BASELINE + ("snapshot_path", "manifest_doc_id"),
         hard_stop=False,
@@ -315,6 +456,20 @@ _RECOVERY_TABLE_DATA: tuple[RecoveryInstruction, ...] = (
         hard_stop=False,
     ),
     RecoveryInstruction(
+        category=OperationalCategory.SearchNoHits,
+        agent_action=(
+            "Report search_no_hits; the smoke probe returned zero matches "
+            "against a corpus that should always carry redaction keys. "
+            "Owner inspects vault-side index for schema drift or empty "
+            "manifests."
+        ),
+        safe_retry_condition="owner-only",
+        owner_escalate_when="after retries exhausted",
+        safe_evidence=("counter:search_smoke_ok",),
+        forbidden_evidence=_BASELINE + ("query_text", "manifest_doc_id"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
         category=OperationalCategory.RestorationOk,
         agent_action=(
             "Report restoration success; the raw private value is "
@@ -337,6 +492,23 @@ _RECOVERY_TABLE_DATA: tuple[RecoveryInstruction, ...] = (
         ),
         safe_retry_condition="owner-only",
         owner_escalate_when="after retries exhausted",
+        safe_evidence=(
+            "counter:restoration_outcome",
+            "wrapped:restoration_failure_reason",
+        ),
+        forbidden_evidence=_BASELINE + ("locator", "approval_ticket"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.RestorationRequestUnexpectedOutcome,
+        agent_action=(
+            "Report restoration_request_unexpected_outcome; the facade "
+            "returned a response that did not match the expected "
+            "scope-denied contract. Owner inspects vault-side audit log "
+            "to recover."
+        ),
+        safe_retry_condition="owner-only",
+        owner_escalate_when="always",
         safe_evidence=(
             "counter:restoration_outcome",
             "wrapped:restoration_failure_reason",
@@ -368,6 +540,32 @@ _RECOVERY_TABLE_DATA: tuple[RecoveryInstruction, ...] = (
         safe_evidence=("counter:audit_row_count",),
         forbidden_evidence=_BASELINE + ("audit_row_body", "locator"),
         hard_stop=True,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.AuditFileMissing,
+        agent_action=(
+            "Report audit_file_missing; the audit JSONL is absent or "
+            "unreadable. Owner inspects vault-side audit directory "
+            "(Chikaeshi audit contract). Never report status=accepted."
+        ),
+        safe_retry_condition="never",
+        owner_escalate_when="always",
+        safe_evidence=("counter:audit_row_count",),
+        forbidden_evidence=_BASELINE + ("audit_row_body", "locator"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.AuditRecordNotFound,
+        agent_action=(
+            "Report audit_record_not_found; the audit JSONL exists but the "
+            "correlation row for this run is absent. Owner inspects "
+            "vault-side audit log to recover."
+        ),
+        safe_retry_condition="never",
+        owner_escalate_when="always",
+        safe_evidence=("counter:audit_row_count",),
+        forbidden_evidence=_BASELINE + ("audit_row_body", "locator"),
+        hard_stop=False,
     ),
     RecoveryInstruction(
         category=OperationalCategory.RunpodLifecycleOk,
@@ -402,6 +600,87 @@ _RECOVERY_TABLE_DATA: tuple[RecoveryInstruction, ...] = (
             "cleanup retries exhausted and a Pod may still be running. "
             "Owner may use runpodctl as a break-glass tool to inspect or "
             "force-delete; the agent does not invoke runpodctl."
+        ),
+        safe_retry_condition="<= 1 retries",
+        owner_escalate_when="always",
+        safe_evidence=("counter:runpod_lifecycle_category",),
+        forbidden_evidence=_BASELINE + ("bearer_token", "api_key"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.RunpodLifecycleDisabled,
+        agent_action=(
+            "Report runpod_lifecycle_disabled; the RunPod phase was "
+            "skipped because the agent did not pass --live-runpod. No "
+            "owner action; this is the no-network default."
+        ),
+        safe_retry_condition="never",
+        owner_escalate_when="never",
+        safe_evidence=("counter:runpod_lifecycle_category",),
+        forbidden_evidence=_BASELINE + ("bearer_token", "api_key"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.RunpodLifecycleKept,
+        agent_action=(
+            "Report runpod_lifecycle_kept (warn status); the agent drove "
+            "create-wait-smoke but skipped delete because the caller "
+            "passed --keep-pod. Owner is responsible for deleting the "
+            "Pod when finished (cost control)."
+        ),
+        safe_retry_condition="never",
+        owner_escalate_when="always",
+        safe_evidence=("counter:runpod_lifecycle_category",),
+        forbidden_evidence=_BASELINE + ("bearer_token", "api_key"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.CreateFailed,
+        agent_action=(
+            "Report create_failed; the RunPod create call returned an "
+            "error before the Pod became schedulable. Owner inspects "
+            "RunPod console; agent does not retry without owner review."
+        ),
+        safe_retry_condition="owner-only",
+        owner_escalate_when="always",
+        safe_evidence=("counter:runpod_lifecycle_category",),
+        forbidden_evidence=_BASELINE + ("bearer_token", "api_key"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.WaitTimeout,
+        agent_action=(
+            "Report wait_timeout; the Pod was created but did not become "
+            "healthy within the configured wait budget. The bounded "
+            "cleanup helper deletes the Pod. Owner may inspect RunPod "
+            "console; no further agent action is required."
+        ),
+        safe_retry_condition="<= 1 retries",
+        owner_escalate_when="after retries exhausted",
+        safe_evidence=("counter:runpod_lifecycle_category",),
+        forbidden_evidence=_BASELINE + ("bearer_token", "api_key"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.ApiKeyMissing,
+        agent_action=(
+            "Report api_key_missing; the RunPod phase was requested but "
+            "no API key is configured. Owner provisions the credential "
+            "before re-running with --live-runpod."
+        ),
+        safe_retry_condition="owner-only",
+        owner_escalate_when="always",
+        safe_evidence=("counter:runpod_lifecycle_category",),
+        forbidden_evidence=_BASELINE + ("bearer_token", "api_key"),
+        hard_stop=False,
+    ),
+    RecoveryInstruction(
+        category=OperationalCategory.CleanupFailed,
+        agent_action=(
+            "Report cleanup_failed; the Pod exists but the bounded REST "
+            "DELETE retries were exhausted. Owner uses runpodctl as a "
+            "break-glass tool to force-delete; agent does not invoke "
+            "runpodctl."
         ),
         safe_retry_condition="<= 1 retries",
         owner_escalate_when="always",

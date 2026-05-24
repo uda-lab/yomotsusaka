@@ -97,16 +97,16 @@ def test_demo_corpus_runs_clean(tmp_path: Path) -> None:
 
     phases = _parse_phase_lines(result.stdout)
     statuses = {p: (s, c) for p, s, c in phases}
-    assert statuses["batch"] == ("ok", "batch_committed")
-    assert statuses["index_snapshot"] == ("ok", "snapshot_written")
-    assert statuses["index_reload"] == ("ok", "index_reloaded")
-    assert statuses["search_smoke"] == ("ok", "hits_found")
+    assert statuses["batch"] == ("ok", "batch_ok")
+    assert statuses["index_snapshot"] == ("ok", "index_snapshot_ok")
+    assert statuses["index_reload"] == ("ok", "index_reload_ok")
+    assert statuses["search_smoke"] == ("ok", "search_smoke_ok")
     assert statuses["restoration_request"] == (
         "ok",
-        "restoration_request_recorded",
+        "restoration_ok",
     )
-    assert statuses["audit_inspect"] == ("ok", "audit_present")
-    assert statuses["runpod_lifecycle"] == ("skipped", "runpod_disabled")
+    assert statuses["audit_inspect"] == ("ok", "audit_inspect_ok")
+    assert statuses["runpod_lifecycle"] == ("skipped", "runpod_lifecycle_disabled")
     assert _result_line(result.stdout) == "completed"
 
     # Override advisory lands on STDERR, never STDOUT.

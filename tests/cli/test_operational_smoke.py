@@ -161,16 +161,16 @@ def test_full_no_network_scenario_completes(tmp_path: Path) -> None:
     ], phase_names
 
     statuses = {p: (s, c) for p, s, c in phases}
-    assert statuses["batch"] == ("ok", "batch_committed")
-    assert statuses["index_snapshot"] == ("ok", "snapshot_written")
-    assert statuses["index_reload"] == ("ok", "index_reloaded")
-    assert statuses["search_smoke"] == ("ok", "hits_found")
+    assert statuses["batch"] == ("ok", "batch_ok")
+    assert statuses["index_snapshot"] == ("ok", "index_snapshot_ok")
+    assert statuses["index_reload"] == ("ok", "index_reload_ok")
+    assert statuses["search_smoke"] == ("ok", "search_smoke_ok")
     assert statuses["restoration_request"] == (
         "ok",
-        "restoration_request_recorded",
+        "restoration_ok",
     )
-    assert statuses["audit_inspect"] == ("ok", "audit_present")
-    assert statuses["runpod_lifecycle"] == ("skipped", "runpod_disabled")
+    assert statuses["audit_inspect"] == ("ok", "audit_inspect_ok")
+    assert statuses["runpod_lifecycle"] == ("skipped", "runpod_lifecycle_disabled")
 
     assert _result_line(result.stdout) == "completed"
 
@@ -202,8 +202,8 @@ def test_full_no_network_scenario_with_tenant_id(tmp_path: Path) -> None:
     statuses = {
         p: (s, c) for p, s, c in _parse_phase_lines(result.stdout)
     }
-    assert statuses["index_reload"] == ("ok", "index_reloaded")
-    assert statuses["search_smoke"] == ("ok", "hits_found")
+    assert statuses["index_reload"] == ("ok", "index_reload_ok")
+    assert statuses["search_smoke"] == ("ok", "search_smoke_ok")
     assert _result_line(result.stdout) == "completed"
 
 
@@ -397,7 +397,7 @@ def test_failure_batch_empty_inbox(tmp_path: Path) -> None:
     assert statuses["restoration_request"][0] == "fail"
     assert statuses["audit_inspect"][0] == "fail"
     # RunPod phase keeps its independent skipped/live decision.
-    assert statuses["runpod_lifecycle"] == ("skipped", "runpod_disabled")
+    assert statuses["runpod_lifecycle"] == ("skipped", "runpod_lifecycle_disabled")
     assert _result_line(result.stdout) == "failed_cleaned"
 
 
@@ -532,13 +532,13 @@ def test_synthesis_all_ok_yields_completed() -> None:
 
     statuses = _statuses_for(
         [
-            ("batch", "ok", "batch_committed"),
-            ("index_snapshot", "ok", "snapshot_written"),
-            ("index_reload", "ok", "index_reloaded"),
-            ("search_smoke", "ok", "hits_found"),
-            ("restoration_request", "ok", "restoration_request_recorded"),
-            ("audit_inspect", "ok", "audit_present"),
-            ("runpod_lifecycle", "skipped", "runpod_disabled"),
+            ("batch", "ok", "batch_ok"),
+            ("index_snapshot", "ok", "index_snapshot_ok"),
+            ("index_reload", "ok", "index_reload_ok"),
+            ("search_smoke", "ok", "search_smoke_ok"),
+            ("restoration_request", "ok", "restoration_ok"),
+            ("audit_inspect", "ok", "audit_inspect_ok"),
+            ("runpod_lifecycle", "skipped", "runpod_lifecycle_disabled"),
         ]
     )
     assert cli_mod._synthesise_result(statuses) == ("completed", 0)
@@ -550,12 +550,12 @@ def test_synthesis_warn_yields_completed_with_warnings() -> None:
     statuses = _statuses_for(
         [
             ("batch", "warn", "batch_partial_commit"),
-            ("index_snapshot", "ok", "snapshot_written"),
-            ("index_reload", "ok", "index_reloaded"),
-            ("search_smoke", "ok", "hits_found"),
-            ("restoration_request", "ok", "restoration_request_recorded"),
-            ("audit_inspect", "ok", "audit_present"),
-            ("runpod_lifecycle", "skipped", "runpod_disabled"),
+            ("index_snapshot", "ok", "index_snapshot_ok"),
+            ("index_reload", "ok", "index_reload_ok"),
+            ("search_smoke", "ok", "search_smoke_ok"),
+            ("restoration_request", "ok", "restoration_ok"),
+            ("audit_inspect", "ok", "audit_inspect_ok"),
+            ("runpod_lifecycle", "skipped", "runpod_lifecycle_disabled"),
         ]
     )
     assert cli_mod._synthesise_result(statuses) == (
@@ -569,13 +569,13 @@ def test_synthesis_fail_yields_failed_cleaned() -> None:
 
     statuses = _statuses_for(
         [
-            ("batch", "ok", "batch_committed"),
-            ("index_snapshot", "ok", "snapshot_written"),
-            ("index_reload", "ok", "index_reloaded"),
+            ("batch", "ok", "batch_ok"),
+            ("index_snapshot", "ok", "index_snapshot_ok"),
+            ("index_reload", "ok", "index_reload_ok"),
             ("search_smoke", "fail", "search_no_hits"),
-            ("restoration_request", "ok", "restoration_request_recorded"),
-            ("audit_inspect", "ok", "audit_present"),
-            ("runpod_lifecycle", "skipped", "runpod_disabled"),
+            ("restoration_request", "ok", "restoration_ok"),
+            ("audit_inspect", "ok", "audit_inspect_ok"),
+            ("runpod_lifecycle", "skipped", "runpod_lifecycle_disabled"),
         ]
     )
     assert cli_mod._synthesise_result(statuses) == ("failed_cleaned", 1)
@@ -637,7 +637,7 @@ def test_phase_restoration_asserts_scope_denied_contract(
     doc_id = sorted((vault / "manifests").glob("*.json"))[0].stem
     status, category, audit_id = cli_mod._phase_restoration(facade, doc_id)
     assert status == "ok"
-    assert category == "restoration_request_recorded"
+    assert category == "restoration_ok"
     assert isinstance(audit_id, str) and audit_id
 
 
@@ -688,7 +688,7 @@ def test_phase_audit_inspect_correlates_on_record_id_not_caller_label(
         vault, audit_record_id="current-run-record-id-that-was-not-written"
     )
     assert status == "ok"
-    assert category == "audit_present"
+    assert category == "audit_inspect_ok"
 
 
 def test_synthesis_cleanup_failed_yields_owner_action() -> None:
@@ -698,12 +698,12 @@ def test_synthesis_cleanup_failed_yields_owner_action() -> None:
 
     statuses = _statuses_for(
         [
-            ("batch", "ok", "batch_committed"),
-            ("index_snapshot", "ok", "snapshot_written"),
-            ("index_reload", "ok", "index_reloaded"),
-            ("search_smoke", "ok", "hits_found"),
-            ("restoration_request", "ok", "restoration_request_recorded"),
-            ("audit_inspect", "ok", "audit_present"),
+            ("batch", "ok", "batch_ok"),
+            ("index_snapshot", "ok", "index_snapshot_ok"),
+            ("index_reload", "ok", "index_reload_ok"),
+            ("search_smoke", "ok", "search_smoke_ok"),
+            ("restoration_request", "ok", "restoration_ok"),
+            ("audit_inspect", "ok", "audit_inspect_ok"),
             ("runpod_lifecycle", "fail", "cleanup_failed"),
         ]
     )
@@ -711,3 +711,351 @@ def test_synthesis_cleanup_failed_yields_owner_action() -> None:
         "failed_owner_action",
         3,
     )
+
+
+# ---------------------------------------------------------------------------
+# --emit-json bridge (issue #111)
+# ---------------------------------------------------------------------------
+
+
+def test_emit_json_default_omits_file(tmp_path: Path) -> None:
+    """Without ``--emit-json`` no JSON file is written. The default path
+    keeps the no-network happy-path unchanged."""
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    _write_corpus(inbox, _canonical_corpus())
+
+    result = _run_cli([str(inbox), "--vault-root", str(vault)])
+    assert result.returncode == 0
+    # No file should have been written anywhere under tmp_path beyond the
+    # vault and inbox we already created.
+    extras = sorted(
+        p
+        for p in tmp_path.rglob("*")
+        if p.is_file()
+        and not str(p).startswith(str(inbox))
+        and not str(p).startswith(str(vault))
+    )
+    assert extras == [], f"unexpected extra files: {extras}"
+
+
+def test_emit_json_writes_canonical_payload(tmp_path: Path) -> None:
+    """``--emit-json`` writes a JSON ScenarioResult that
+    ``operational_report`` can consume on stdin."""
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    _write_corpus(inbox, _canonical_corpus())
+    emit_path = tmp_path / "scenario.json"
+
+    result = _run_cli(
+        [
+            str(inbox),
+            "--vault-root",
+            str(vault),
+            "--emit-json",
+            str(emit_path),
+        ]
+    )
+    assert result.returncode == 0
+    # The phase ledger on stdout is unchanged.
+    statuses = {p: (s, c) for p, s, c in _parse_phase_lines(result.stdout)}
+    assert statuses["batch"] == ("ok", "batch_ok")
+    assert _result_line(result.stdout) == "completed"
+
+    # JSON file exists, parses, and carries the canonical shape.
+    assert emit_path.is_file()
+    payload = json.loads(emit_path.read_text(encoding="utf-8"))
+    assert set(payload.keys()) == {"phases", "counters"}
+    assert isinstance(payload["phases"], list)
+    assert len(payload["phases"]) == 7
+    first = payload["phases"][0]
+    assert set(first.keys()) >= {"phase_name", "status", "category"}
+    assert first == {
+        "phase_name": "batch",
+        "status": "ok",
+        "category": "batch_ok",
+    }
+
+    counters = payload["counters"]
+    assert counters["processed_documents"] == 2
+    assert counters["failed_documents"] == 0
+    assert counters["index_snapshot_ok"] == 1
+    assert counters["index_loadable"] == 1
+    assert counters["search_smoke_ok"] == 1
+    assert counters["restoration_outcome"] == "ok"
+    assert counters["audit_row_count"] == 1
+    # RunPod was skipped — runpod_lifecycle_category MUST be omitted (not
+    # present as an empty string).
+    assert "runpod_lifecycle_category" not in counters
+
+
+def test_emit_json_bridges_into_operational_report(tmp_path: Path) -> None:
+    """End-to-end: smoke --emit-json then pipe into operational_report."""
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    _write_corpus(inbox, _canonical_corpus())
+    emit_path = tmp_path / "scenario.json"
+
+    smoke = _run_cli(
+        [
+            str(inbox),
+            "--vault-root",
+            str(vault),
+            "--emit-json",
+            str(emit_path),
+        ]
+    )
+    assert smoke.returncode == 0
+    assert emit_path.is_file()
+
+    report = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "yomotsusaka.cli.operational_report",
+        ],
+        input=emit_path.read_text(encoding="utf-8"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert report.returncode == 0, (
+        f"operational_report exited {report.returncode}; "
+        f"stderr={report.stderr!r}"
+    )
+    # The renderer emits the canonical state token and the canonical
+    # counters; no need to assert every cell here.
+    assert "## Result" in report.stdout
+    assert "completed" in report.stdout
+    assert "## Phases" in report.stdout
+    assert "| batch | ok | batch_ok |" in report.stdout
+    assert "- processed_documents: 2" in report.stdout
+
+
+def test_emit_json_written_after_result_line(tmp_path: Path) -> None:
+    """Phase ledger on stdout is unaffected by ``--emit-json``: ``result=``
+    is still the final stdout line (no JSON noise mixed in)."""
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    _write_corpus(inbox, _canonical_corpus())
+    emit_path = tmp_path / "scenario.json"
+
+    result = _run_cli(
+        [
+            str(inbox),
+            "--vault-root",
+            str(vault),
+            "--emit-json",
+            str(emit_path),
+        ]
+    )
+    assert result.returncode == 0
+    non_empty_lines = [
+        line for line in result.stdout.splitlines() if line.strip()
+    ]
+    assert non_empty_lines[-1].startswith("result="), non_empty_lines[-1]
+
+
+def test_emit_json_atomic_via_tmp_rename(tmp_path: Path) -> None:
+    """The atomic write should leave no ``.tmp`` sibling after the run."""
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    _write_corpus(inbox, _canonical_corpus())
+    emit_path = tmp_path / "scenario.json"
+
+    result = _run_cli(
+        [
+            str(inbox),
+            "--vault-root",
+            str(vault),
+            "--emit-json",
+            str(emit_path),
+        ]
+    )
+    assert result.returncode == 0
+    assert emit_path.exists()
+    assert not emit_path.with_suffix(emit_path.suffix + ".tmp").exists()
+
+
+def test_emit_json_payload_passes_report_redaction(tmp_path: Path) -> None:
+    """The emitted JSON, fed into the report renderer's render_report,
+    passes the fail-closed redaction sweep (no vault paths, no Pod IDs,
+    etc.). Cross-check that the smoke counters do not echo any sensitive
+    shape.
+    """
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    _write_corpus(inbox, _canonical_corpus())
+    emit_path = tmp_path / "scenario.json"
+
+    result = _run_cli(
+        [
+            str(inbox),
+            "--vault-root",
+            str(vault),
+            "--emit-json",
+            str(emit_path),
+        ]
+    )
+    assert result.returncode == 0
+
+    # Round-trip via the parser.
+    from yomotsusaka.cli import operational_report as report_cli
+    payload = json.loads(emit_path.read_text(encoding="utf-8"))
+    scenario = report_cli._parse_scenario_result(payload)
+    from yomotsusaka.operational_report import render_report
+    rendered = render_report(scenario)  # raises RedactionError on leak
+    assert "## Result" in rendered
+
+
+def test_emit_json_runpod_category_present_on_live_run(
+    tmp_path: Path,
+) -> None:
+    """When ``--live-runpod`` runs and the RunPod phase fails the api-key
+    preflight, the JSON counters include the ``runpod_lifecycle_category``
+    token. Demonstrates the present-only-when-actually-ran rule (D4)."""
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    _write_corpus(inbox, _canonical_corpus())
+    emit_path = tmp_path / "scenario.json"
+
+    # No RUNPOD_API_KEY -> preflight reports api_key_missing.
+    result = _run_cli(
+        [
+            str(inbox),
+            "--vault-root",
+            str(vault),
+            "--live-runpod",
+            "--emit-json",
+            str(emit_path),
+        ]
+    )
+    assert result.returncode == 1
+    payload = json.loads(emit_path.read_text(encoding="utf-8"))
+    assert (
+        payload["counters"]["runpod_lifecycle_category"] == "api_key_missing"
+    )
+
+
+def test_emit_json_state_matches_smoke_for_runpod_failures(
+    tmp_path: Path,
+) -> None:
+    """Codex P1 (PR #119 review id 4352393743): when smoke reports
+    ``failed_cleaned`` for a RunPod-touched run, the JSON the report
+    renderer consumes MUST classify identically (``failed_cleaned``), not
+    ``failed_owner_action``.
+
+    The report renderer's ``classify_result_state`` is fail-closed: it
+    defaults to ``failed_owner_action`` for any failing scenario that
+    touched RunPod, unless the strict-bool ``runpod_cleanup_confirmed``
+    flag is exactly ``True``. We pin that the bridge emits the flag
+    correctly so the two CLIs agree.
+    """
+    inbox = tmp_path / "inbox"
+    vault = tmp_path / "vault"
+    _write_corpus(inbox, _canonical_corpus())
+    emit_path = tmp_path / "scenario.json"
+
+    # Force the api_key_missing path: --live-runpod with no key. Smoke
+    # classifies this as failed_cleaned (only cleanup_failed promotes
+    # to owner_action). The bridge must surface a payload that the
+    # report renderer also classifies as failed_cleaned.
+    result = _run_cli(
+        [
+            str(inbox),
+            "--vault-root",
+            str(vault),
+            "--live-runpod",
+            "--emit-json",
+            str(emit_path),
+        ]
+    )
+    assert result.returncode == 1
+    assert _result_line(result.stdout) == "failed_cleaned"
+
+    payload = json.loads(emit_path.read_text(encoding="utf-8"))
+    counters = payload["counters"]
+    assert counters["runpod_lifecycle_category"] == "api_key_missing"
+    # Strict-bool: must be the literal True, not a string or int — the
+    # renderer's check rejects anything that is not the Python bool.
+    assert counters["runpod_cleanup_confirmed"] is True
+
+    # End-to-end: render the report and assert the state token agrees.
+    from yomotsusaka.cli import operational_report as report_cli
+    from yomotsusaka.operational_report import (
+        classify_result_state,
+        render_report,
+    )
+
+    scenario = report_cli._parse_scenario_result(payload)
+    assert classify_result_state(scenario) == "failed_cleaned"
+    rendered = render_report(scenario)
+    assert "## Result\n\nfailed_cleaned\n" in rendered
+
+
+def test_emit_json_state_matches_smoke_for_cleanup_failed() -> None:
+    """Inverse of the P1 alignment: when the runpod fail-category IS
+    ``cleanup_failed``, smoke routes to ``failed_owner_action`` and the
+    JSON must carry ``runpod_cleanup_confirmed=False`` so the report
+    renderer agrees. Direct unit-test of the synthesiser because
+    triggering a real cleanup_failed needs a mocked lifecycle.
+    """
+    from yomotsusaka.cli import operational_smoke as cli_mod
+    from yomotsusaka.operational_report import (
+        PhaseRecord as ReportPhaseRecord,
+        ScenarioResult,
+        classify_result_state,
+    )
+
+    statuses = [
+        ("batch", "ok", "batch_ok"),
+        ("index_snapshot", "ok", "index_snapshot_ok"),
+        ("index_reload", "ok", "index_reload_ok"),
+        ("search_smoke", "ok", "search_smoke_ok"),
+        ("restoration_request", "ok", "restoration_ok"),
+        ("audit_inspect", "ok", "audit_inspect_ok"),
+        ("runpod_lifecycle", "fail", "cleanup_failed"),
+    ]
+    counters = cli_mod._synthesise_counters(statuses, batch_summary=None)
+    assert counters["runpod_lifecycle_category"] == "cleanup_failed"
+    assert counters["runpod_cleanup_confirmed"] is False
+
+    # The renderer agrees: failed_owner_action.
+    scenario = ScenarioResult(
+        phases=tuple(
+            ReportPhaseRecord(p, s, c)  # type: ignore[arg-type]
+            for p, s, c in statuses
+        ),
+        counters=counters,
+    )
+    assert classify_result_state(scenario) == "failed_owner_action"
+
+
+def test_synthesise_counters_omits_runpod_when_skipped() -> None:
+    """Direct unit-test of the counter-synthesis helper: a skipped RunPod
+    phase MUST NOT emit a ``runpod_lifecycle_category`` key. An empty
+    string is forbidden by the contract."""
+    from yomotsusaka.cli import operational_smoke as cli_mod
+
+    statuses = [
+        ("batch", "ok", "batch_ok"),
+        ("index_snapshot", "ok", "index_snapshot_ok"),
+        ("index_reload", "ok", "index_reload_ok"),
+        ("search_smoke", "ok", "search_smoke_ok"),
+        ("restoration_request", "ok", "restoration_ok"),
+        ("audit_inspect", "ok", "audit_inspect_ok"),
+        ("runpod_lifecycle", "skipped", "runpod_lifecycle_disabled"),
+    ]
+    counters = cli_mod._synthesise_counters(statuses, batch_summary=None)
+    assert "runpod_lifecycle_category" not in counters
+    # When the phase did NOT run, the cleanup-confirmed flag also stays
+    # out of the payload — there is no failing scenario to classify, so
+    # the report renderer's fail-closed default never fires.
+    assert "runpod_cleanup_confirmed" not in counters
+    # Boolean-as-int counters are integers, not bool-strings.
+    assert counters["index_snapshot_ok"] == 1
+    assert counters["index_loadable"] == 1
+    assert counters["search_smoke_ok"] == 1
+    # Empty batch_summary -> 0 counts.
+    assert counters["processed_documents"] == 0
+    assert counters["failed_documents"] == 0

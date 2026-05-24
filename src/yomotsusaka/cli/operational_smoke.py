@@ -19,6 +19,7 @@ CLI surface
         [--tenant-id <id>]
         [--live-runpod]
         [--keep-pod]   # only meaningful with --live-runpod; default is delete
+        [--emit-json <path>]  # optional ScenarioResult JSON for operational_report
 
 Phases (in order)
 -----------------
@@ -92,13 +93,14 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-from yomotsusaka.batch_runner import BatchRunner
+from yomotsusaka.batch_runner import BatchRunner, BatchSummary
 from yomotsusaka.boundary import (
     RestorationFailureReason,
     RestorationRequest,
     RestorationResponse,
 )
 from yomotsusaka.facade import LocalFacade
+from yomotsusaka.operational_taxonomy import OperationalCategory
 from yomotsusaka.schemas import EntityKind
 from yomotsusaka.tenant import TenantScope
 
@@ -109,38 +111,45 @@ from yomotsusaka.tenant import TenantScope
 #
 # These tokens are the ONLY values that may appear in ``category=<...>``.
 # Stable across releases; downstream agent consumers may pattern-match on
-# them. Coordinate any addition with child 04 (#93) which owns the cross-
-# script taxonomy consolidation, but do NOT block this child on that.
+# them. Every token is an ``OperationalCategory.value`` — the closed enum
+# in :mod:`yomotsusaka.operational_taxonomy` is the canonical source of
+# truth (issue #111). The drift test
+# ``tests/test_operational_smoke_taxonomy_drift.py`` enforces this by
+# asserting every ``_CAT_*`` literal here is a member value.
 
 # Phase-level OK categories.
-_CAT_OK_BATCH = "batch_committed"
-_CAT_OK_INDEX_SNAPSHOT = "snapshot_written"
-_CAT_OK_INDEX_RELOAD = "index_reloaded"
-_CAT_OK_SEARCH_SMOKE = "hits_found"
-_CAT_OK_RESTORATION = "restoration_request_recorded"
-_CAT_OK_AUDIT = "audit_present"
-_CAT_OK_RUNPOD = "runpod_cycle_complete"
+_CAT_OK_BATCH = OperationalCategory.BatchOk.value
+_CAT_OK_INDEX_SNAPSHOT = OperationalCategory.IndexSnapshotOk.value
+_CAT_OK_INDEX_RELOAD = OperationalCategory.IndexReloadOk.value
+_CAT_OK_SEARCH_SMOKE = OperationalCategory.SearchSmokeOk.value
+_CAT_OK_RESTORATION = OperationalCategory.RestorationOk.value
+_CAT_OK_AUDIT = OperationalCategory.AuditInspectOk.value
+_CAT_OK_RUNPOD = OperationalCategory.RunpodLifecycleOk.value
 
-# Skipped category — RunPod phase only.
-_CAT_SKIPPED_RUNPOD = "runpod_disabled"
-_CAT_KEPT_RUNPOD = "runpod_kept"
+# Skipped / kept dispositions — RunPod phase only.
+_CAT_SKIPPED_RUNPOD = OperationalCategory.RunpodLifecycleDisabled.value
+_CAT_KEPT_RUNPOD = OperationalCategory.RunpodLifecycleKept.value
 
 # Phase-level FAIL categories.
-_CAT_FAIL_BATCH_EMPTY = "batch_no_documents"
-_CAT_FAIL_BATCH_ALL_FAILED = "batch_all_failed"
-_CAT_FAIL_BATCH_PARTIAL = "batch_partial_commit"
-_CAT_FAIL_BATCH_INFRA = "batch_infrastructure_error"
-_CAT_FAIL_INDEX_SNAPSHOT_WRITE = "snapshot_write_failed"
-_CAT_FAIL_INDEX_SNAPSHOT_NOT_PERSISTED = "snapshot_not_persisted"
-_CAT_FAIL_INDEX_RELOAD = "index_reload_failed"
-_CAT_FAIL_SEARCH_SMOKE = "search_no_hits"
-_CAT_FAIL_RESTORATION = "restoration_request_unexpected_outcome"
-_CAT_FAIL_AUDIT_MISSING = "audit_file_missing"
-_CAT_FAIL_AUDIT_NO_MATCH = "audit_record_not_found"
-_CAT_FAIL_RUNPOD_CREATE = "create_failed"
-_CAT_FAIL_RUNPOD_WAIT = "wait_timeout"
-_CAT_FAIL_RUNPOD_PREFLIGHT_APIKEY = "api_key_missing"
-_CAT_FAIL_RUNPOD_CLEANUP = "cleanup_failed"
+_CAT_FAIL_BATCH_EMPTY = OperationalCategory.BatchNoDocuments.value
+_CAT_FAIL_BATCH_ALL_FAILED = OperationalCategory.BatchAllFailed.value
+_CAT_FAIL_BATCH_PARTIAL = OperationalCategory.BatchPartialCommit.value
+_CAT_FAIL_BATCH_INFRA = OperationalCategory.BatchInfrastructureError.value
+_CAT_FAIL_INDEX_SNAPSHOT_WRITE = OperationalCategory.SnapshotWriteFailed.value
+_CAT_FAIL_INDEX_SNAPSHOT_NOT_PERSISTED = (
+    OperationalCategory.SnapshotNotPersisted.value
+)
+_CAT_FAIL_INDEX_RELOAD = OperationalCategory.IndexReloadFailed.value
+_CAT_FAIL_SEARCH_SMOKE = OperationalCategory.SearchNoHits.value
+_CAT_FAIL_RESTORATION = (
+    OperationalCategory.RestorationRequestUnexpectedOutcome.value
+)
+_CAT_FAIL_AUDIT_MISSING = OperationalCategory.AuditFileMissing.value
+_CAT_FAIL_AUDIT_NO_MATCH = OperationalCategory.AuditRecordNotFound.value
+_CAT_FAIL_RUNPOD_CREATE = OperationalCategory.CreateFailed.value
+_CAT_FAIL_RUNPOD_WAIT = OperationalCategory.WaitTimeout.value
+_CAT_FAIL_RUNPOD_PREFLIGHT_APIKEY = OperationalCategory.ApiKeyMissing.value
+_CAT_FAIL_RUNPOD_CLEANUP = OperationalCategory.CleanupFailed.value
 
 # Final result tokens.
 _RESULT_COMPLETED = "completed"
@@ -273,25 +282,29 @@ def _construct_facade(vault_root: Path, tenant_id: str | None) -> LocalFacade:
 
 def _phase_batch(
     facade: LocalFacade, inbox: Path
-) -> tuple[str, str, str | None]:
+) -> tuple[str, str, str | None, BatchSummary | None]:
     """Run the batch runner against *inbox*.
 
-    Returns ``(status, category, doc_id_for_restoration_phase)``. The
-    third element is a doc_id from a successfully committed document the
-    later phases can target; ``None`` on failure.
+    Returns ``(status, category, doc_id_for_restoration_phase, summary)``.
+    The third element is a doc_id from a successfully committed document
+    the later phases can target; ``None`` on failure. The fourth element
+    is the raw :class:`BatchSummary` (or ``None`` when the runner errored
+    before producing one) so the calling layer can populate
+    ``processed_documents`` / ``failed_documents`` counters for the
+    ``--emit-json`` payload (issue #111).
     """
     runner = BatchRunner(facade=facade)
     try:
         summary = runner.run_directory(inbox)
     except (FileNotFoundError, NotADirectoryError):
-        return _STATUS_FAIL, _CAT_FAIL_BATCH_INFRA, None
+        return _STATUS_FAIL, _CAT_FAIL_BATCH_INFRA, None, None
     except Exception:  # pragma: no cover - defensive
-        return _STATUS_FAIL, _CAT_FAIL_BATCH_INFRA, None
+        return _STATUS_FAIL, _CAT_FAIL_BATCH_INFRA, None, None
 
     if summary.submitted_count == 0:
-        return _STATUS_FAIL, _CAT_FAIL_BATCH_EMPTY, None
+        return _STATUS_FAIL, _CAT_FAIL_BATCH_EMPTY, None, summary
     if summary.committed_count == 0:
-        return _STATUS_FAIL, _CAT_FAIL_BATCH_ALL_FAILED, None
+        return _STATUS_FAIL, _CAT_FAIL_BATCH_ALL_FAILED, None, summary
 
     # Pick a stable doc_id from the committed set so phases 5/6 can
     # target a known artifact. Reading the manifests directory is a
@@ -301,16 +314,16 @@ def _phase_batch(
     try:
         candidates = sorted(manifests_dir.glob("*.json"))
     except OSError:
-        return _STATUS_FAIL, _CAT_FAIL_BATCH_INFRA, None
+        return _STATUS_FAIL, _CAT_FAIL_BATCH_INFRA, None, summary
     if not candidates:
-        return _STATUS_FAIL, _CAT_FAIL_BATCH_ALL_FAILED, None
+        return _STATUS_FAIL, _CAT_FAIL_BATCH_ALL_FAILED, None, summary
     doc_id = candidates[0].stem
 
     if summary.failed_count > 0:
         # A partial-commit batch is a warning — work proceeds, but the
         # synthesis result will downgrade to ``completed_with_warnings``.
-        return _STATUS_WARN, _CAT_FAIL_BATCH_PARTIAL, doc_id
-    return _STATUS_OK, _CAT_OK_BATCH, doc_id
+        return _STATUS_WARN, _CAT_FAIL_BATCH_PARTIAL, doc_id, summary
+    return _STATUS_OK, _CAT_OK_BATCH, doc_id, summary
 
 
 def _phase_index_snapshot(facade: LocalFacade) -> tuple[str, str]:
@@ -623,6 +636,173 @@ def _synthesise_result(
 
 
 # ---------------------------------------------------------------------------
+# Smoke -> report JSON bridge (issue #111)
+# ---------------------------------------------------------------------------
+
+
+# Phases whose ``status == "ok"`` should map to a ``1`` boolean-as-int
+# counter in the synthesised ``ScenarioResult`` consumed by
+# ``operational_report``. These names align with the ``_CANONICAL_COUNTERS``
+# tuple in :mod:`yomotsusaka.operational_report`. A phase that did NOT
+# run ``ok`` synthesises a ``0`` counter so the report renderer still sees
+# the canonical key (matches the existing ``_baseline_counters`` shape used
+# by ``operational_report``'s own test fixtures).
+_PHASE_TO_BOOL_COUNTER: dict[str, str] = {
+    _PHASE_INDEX_SNAPSHOT: "index_snapshot_ok",
+    _PHASE_INDEX_RELOAD: "index_loadable",
+    _PHASE_SEARCH_SMOKE: "search_smoke_ok",
+}
+
+
+def _synthesise_counters(
+    statuses: list[tuple[str, str, str]],
+    batch_summary: BatchSummary | None,
+) -> dict[str, Any]:
+    """Build the ``counters`` dict for the ``--emit-json`` payload.
+
+    Public-safe by construction: only integer counts, boolean-as-int
+    flags, and the public-safe ``runpod_lifecycle_category`` token. No
+    vault paths, no doc identifiers, no raw text.
+
+    The shape matches the keys ``yomotsusaka.operational_report``
+    iterates over in ``_CANONICAL_COUNTERS``, plus the additional
+    ``restoration_outcome`` and ``audit_row_count`` keys the renderer
+    surfaces. Per the issue #111 augmentation:
+
+    * ``processed_documents`` / ``failed_documents`` from
+      ``BatchSummary.committed_count`` / ``failed_count`` (0 when the
+      runner never produced a summary).
+    * ``index_snapshot_ok`` / ``index_loadable`` / ``search_smoke_ok``
+      synthesised from the corresponding phase status (1 iff ``ok``).
+    * ``restoration_outcome`` derived from the restoration phase status
+      (``"ok"`` on success, otherwise the phase status token).
+    * ``audit_row_count`` is 1 iff the audit phase reported ``ok``
+      (smoke does not count rows itself; the report renderer prints the
+      integer verbatim).
+    * ``runpod_lifecycle_category`` is included ONLY when the RunPod
+      phase actually ran (``--live-runpod``). An empty string is
+      forbidden by the contract — the key is OMITTED instead.
+    """
+    by_phase: dict[str, tuple[str, str]] = {
+        phase: (status, category) for phase, status, category in statuses
+    }
+    counters: dict[str, Any] = {}
+
+    if batch_summary is not None:
+        counters["processed_documents"] = int(batch_summary.committed_count)
+        counters["failed_documents"] = int(batch_summary.failed_count)
+    else:
+        counters["processed_documents"] = 0
+        counters["failed_documents"] = 0
+
+    for phase_name, counter_key in _PHASE_TO_BOOL_COUNTER.items():
+        status_tuple = by_phase.get(phase_name)
+        counters[counter_key] = (
+            1 if status_tuple and status_tuple[0] == _STATUS_OK else 0
+        )
+
+    restoration = by_phase.get(_PHASE_RESTORATION)
+    if restoration is None:
+        counters["restoration_outcome"] = "not_attempted"
+    elif restoration[0] == _STATUS_OK:
+        counters["restoration_outcome"] = "ok"
+    else:
+        counters["restoration_outcome"] = restoration[0]
+
+    audit = by_phase.get(_PHASE_AUDIT)
+    counters["audit_row_count"] = 1 if audit and audit[0] == _STATUS_OK else 0
+
+    runpod = by_phase.get(_PHASE_RUNPOD)
+    # Per D4: include the runpod category ONLY when --live-runpod actually
+    # ran (i.e. status is not "skipped"). An empty string is forbidden;
+    # omit the key instead. The skipped-disposition is recorded in the
+    # phase ledger itself, not as a counter.
+    if runpod is not None and runpod[0] != _STATUS_SKIPPED:
+        counters["runpod_lifecycle_category"] = runpod[1]
+        # Cross-CLI state alignment (codex review on PR #119, P1).
+        # ``operational_report.classify_result_state`` is fail-closed: a
+        # failing scenario that touched RunPod defaults to
+        # ``failed_owner_action`` UNLESS the strict-bool flag
+        # ``runpod_cleanup_confirmed`` is exactly ``True``. Smoke's own
+        # classifier (:func:`_synthesise_result`) only routes to
+        # ``failed_owner_action`` when the runpod fail-category is
+        # ``cleanup_failed``; every other runpod fail
+        # (``api_key_missing``, ``wait_timeout``, ``create_failed``)
+        # routes to ``failed_cleaned``. Without an explicit flag the
+        # report renderer would render those latter cases as
+        # owner-action-required while smoke's stdout said
+        # ``failed_cleaned`` — a state mismatch that misleads operators.
+        # Mirror smoke's classifier here so both CLIs agree.
+        counters["runpod_cleanup_confirmed"] = (
+            runpod[1] != _CAT_FAIL_RUNPOD_CLEANUP
+        )
+
+    return counters
+
+
+def _build_scenario_payload(
+    statuses: list[tuple[str, str, str]],
+    batch_summary: BatchSummary | None,
+) -> dict[str, Any]:
+    """Build the JSON payload (``ScenarioResult`` shape) for ``--emit-json``.
+
+    Mirrors :class:`yomotsusaka.operational_report.ScenarioResult`. The
+    keys / shape are the same contract ``operational_report`` already
+    consumes on stdin.
+    """
+    phases_payload = [
+        {
+            "phase_name": phase,
+            "status": status,
+            "category": category,
+        }
+        for phase, status, category in statuses
+    ]
+    return {
+        "phases": phases_payload,
+        "counters": _synthesise_counters(statuses, batch_summary),
+    }
+
+
+def _maybe_emit_json(
+    args: argparse.Namespace,
+    statuses: list[tuple[str, str, str]],
+    batch_summary: BatchSummary | None,
+) -> None:
+    """Write the JSON ScenarioResult to ``args.emit_json`` (if set).
+
+    Atomic write: serialise to ``<path>.tmp`` then ``os.replace`` onto the
+    final path so a concurrent reader cannot observe a partial file. The
+    parent directory is created on demand. On filesystem error the helper
+    writes a single advisory line to stderr (stable token shape so agent
+    callers can pattern-match) and returns; the run's exit code is NOT
+    altered — the JSON bridge is best-effort, the phase ledger on stdout
+    remains the load-bearing surface.
+
+    Called AFTER ``result=<...>`` has already been emitted on stdout so a
+    write failure cannot truncate the human-facing log.
+    """
+    emit_path: Path | None = args.emit_json
+    if emit_path is None:
+        return
+    payload = _build_scenario_payload(statuses, batch_summary)
+    try:
+        emit_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = emit_path.with_suffix(emit_path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, emit_path)
+    except OSError:
+        # Stable stderr advisory; never echoes the path back (the path is
+        # caller-supplied and may be private). Public-safe category token
+        # only.
+        sys.stderr.write("notice=emit_json_write_failed\n")
+        sys.stderr.flush()
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing + entry point
 # ---------------------------------------------------------------------------
 
@@ -703,6 +883,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "echoed to stderr (never stdout)."
         ),
     )
+    parser.add_argument(
+        "--emit-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path. When supplied, write the structured "
+            "ScenarioResult (matching the operational_report stdin "
+            "contract) to this path AFTER the final result= line on "
+            "stdout. Per-phase stdout lines remain unchanged. The file "
+            "is written atomically (tmp + rename) so partial JSON "
+            "cannot be read by a concurrent reader."
+        ),
+    )
     return parser
 
 
@@ -766,6 +959,11 @@ def _run_main(
         # synthesis behaves uniformly.
         _emit_phase(_PHASE_BATCH, _STATUS_FAIL, _CAT_FAIL_BATCH_INFRA)
         _emit_result(_RESULT_FAILED_CLEANED)
+        _maybe_emit_json(
+            args,
+            [(_PHASE_BATCH, _STATUS_FAIL, _CAT_FAIL_BATCH_INFRA)],
+            None,
+        )
         return _EXIT_FAILED_CLEANED
 
     try:
@@ -773,6 +971,11 @@ def _run_main(
     except OSError:
         _emit_phase(_PHASE_BATCH, _STATUS_FAIL, _CAT_FAIL_BATCH_INFRA)
         _emit_result(_RESULT_FAILED_CLEANED)
+        _maybe_emit_json(
+            args,
+            [(_PHASE_BATCH, _STATUS_FAIL, _CAT_FAIL_BATCH_INFRA)],
+            None,
+        )
         return _EXIT_FAILED_CLEANED
 
     try:
@@ -780,12 +983,19 @@ def _run_main(
     except (ValueError, TypeError):
         _emit_phase(_PHASE_BATCH, _STATUS_FAIL, _CAT_FAIL_BATCH_INFRA)
         _emit_result(_RESULT_FAILED_CLEANED)
+        _maybe_emit_json(
+            args,
+            [(_PHASE_BATCH, _STATUS_FAIL, _CAT_FAIL_BATCH_INFRA)],
+            None,
+        )
         return _EXIT_FAILED_CLEANED
 
     statuses: list[tuple[str, str, str]] = []
 
     # ---- phase 1: batch ----
-    batch_status, batch_category, doc_id = _phase_batch(facade, inbox)
+    batch_status, batch_category, doc_id, batch_summary = _phase_batch(
+        facade, inbox
+    )
     statuses.append((_PHASE_BATCH, batch_status, batch_category))
     _emit_phase(_PHASE_BATCH, batch_status, batch_category)
 
@@ -810,6 +1020,7 @@ def _run_main(
         _emit_phase(_PHASE_RUNPOD, runpod_status, runpod_category)
         result, exit_code = _synthesise_result(statuses)
         _emit_result(result)
+        _maybe_emit_json(args, statuses, batch_summary)
         return exit_code
 
     # ---- phase 2: index_snapshot ----
@@ -851,6 +1062,7 @@ def _run_main(
 
     result, exit_code = _synthesise_result(statuses)
     _emit_result(result)
+    _maybe_emit_json(args, statuses, batch_summary)
     return exit_code
 
 
