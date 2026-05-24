@@ -228,6 +228,30 @@ otherwise read `permit`:
    shares. Operator access is direct and out-of-band; it is not a route to
    widen ordinary-agent capability.
 
+### Boundary-field registry
+
+The five exposure classes above pin the *vocabulary*. The field-by-field
+mapping from each public-facing model field to its exposure class and scrub
+mechanism is the **boundary-field registry**:
+
+* Module: `src/yomotsusaka/boundary_registry.py` — frozen Pydantic
+  `BoundaryField` rows aggregated into a module-level `REGISTRY` tuple.
+* Drift tests: `tests/test_boundary_registry_drift.py` — fail CI when a
+  registry row references a missing field, when a new public-facing field
+  is added without a registry row, when a `never_expose` / `private` field
+  leaks into an agent-facing serialisation, or when the
+  `ResolverSuccess.private_state` scope gate regresses.
+* Markdown render: `python -m yomotsusaka.boundary_registry --render-markdown`
+  prints the registry as a markdown table for cross-link or paste. The
+  render path is not CI-gated; only the drift tests are.
+
+The registry is the source of truth for field-level classifications cited
+by the operational report (`yomotsusaka.operational_report`, MVP-5 child 03)
+and consumed by the failure-taxonomy work (MVP-5 child 04). Adding a new
+exposure class is out of scope for the registry and belongs in a dedicated
+docs-architecture issue — the closed five-element vocabulary is pinned by
+`yomotsusaka.boundary.EXPOSURE_CLASSES`.
+
 ## 2. Design Philosophy
 
 ### 2.1 Best-effort privacy, not absolute isolation
