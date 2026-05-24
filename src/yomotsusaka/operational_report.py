@@ -44,6 +44,7 @@ from typing import Any, Literal
 
 __all__ = [
     "PhaseStatus",
+    "PHASE_STATUS_VOCABULARY",
     "ResultState",
     "PhaseRecord",
     "ScenarioResult",
@@ -61,6 +62,15 @@ __all__ = [
 PhaseStatus = Literal["ok", "warn", "fail", "skipped"]
 """Status token for a single phase. Stable vocabulary; do not extend without
 co-updating the classifier and child 04's consolidated taxonomy (#93)."""
+
+
+PHASE_STATUS_VOCABULARY: frozenset[str] = frozenset({"ok", "warn", "fail", "skipped"})
+"""Runtime mirror of :data:`PhaseStatus` for input validators that cannot
+introspect the :class:`typing.Literal` at parse time. Stays in sync with
+``PhaseStatus`` — adding a new status requires touching both (and the
+classifier's branch coverage). Used by the CLI parser to reject unknown
+tokens that would otherwise silently fall through ``classify_result_state``
+to ``completed`` (see PR #98 codex review id 4351827310)."""
 
 
 ResultState = Literal[
@@ -159,7 +169,15 @@ def classify_result_state(result: ScenarioResult) -> ResultState:
 
     if "fail" in statuses:
         runpod_touched = "runpod_lifecycle_category" in result.counters
-        cleanup_confirmed = bool(result.counters.get("runpod_cleanup_confirmed", False))
+        # Fail-closed strict-bool check: ONLY the literal Python ``True``
+        # (or the JSON literal ``true``, which :mod:`json` decodes to
+        # ``True``) counts as confirmed cleanup. Truthy-but-non-bool values
+        # like the strings ``"true"`` / ``"false"``, ``1``, or ``"yes"``
+        # all flip to ``failed_owner_action`` rather than silently widening
+        # to ``failed_cleaned``. The umbrella spec's fail-closed clause
+        # requires this — see PR #98 codex review (id 4351827310).
+        raw_flag = result.counters.get("runpod_cleanup_confirmed", False)
+        cleanup_confirmed = raw_flag is True
         if not runpod_touched or cleanup_confirmed:
             return "failed_cleaned"
         return "failed_owner_action"

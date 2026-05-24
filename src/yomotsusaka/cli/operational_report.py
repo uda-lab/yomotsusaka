@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any
 
 from yomotsusaka.operational_report import (
+    PHASE_STATUS_VOCABULARY,
     PhaseRecord,
     RedactionError,
     ScenarioResult,
@@ -119,6 +120,17 @@ def _parse_scenario_result(data: Any) -> ScenarioResult:
         if not isinstance(phase_name, str) or not isinstance(status, str):
             raise ValueError(
                 f"phases[{idx}] phase_name/status must be strings"
+            )
+        # Enforce the PhaseStatus vocabulary at the input boundary. The
+        # classifier only branches on the literal "fail" / "warn" tokens,
+        # so unknown statuses (e.g. "error", "failed") would otherwise
+        # silently fall through to ``completed`` — turning a failed
+        # scenario into a successful report. See PR #98 codex review
+        # (id 4351827310). Reject the input instead.
+        if status not in PHASE_STATUS_VOCABULARY:
+            allowed = ", ".join(sorted(PHASE_STATUS_VOCABULARY))
+            raise ValueError(
+                f"phases[{idx}] status {status!r} is not one of: {allowed}"
             )
         category = raw.get("category", "")
         if not isinstance(category, str):

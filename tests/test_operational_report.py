@@ -140,6 +140,40 @@ class TestClassifyResultState:
         result = ScenarioResult(phases=phases, counters=counters)
         assert classify_result_state(result) == "failed_owner_action"
 
+    @pytest.mark.parametrize(
+        "truthy_non_bool",
+        [
+            "true",
+            "false",
+            "yes",
+            "no",
+            "1",
+            "0",
+            1,
+            0,
+            "ok",
+            [True],
+        ],
+    )
+    def test_failed_owner_action_when_cleanup_flag_is_non_bool(
+        self, truthy_non_bool: object
+    ) -> None:
+        # Strict-bool check (PR #98 codex review id 4351827310): only the
+        # literal Python ``True`` (decoded from JSON ``true``) counts as
+        # confirmed cleanup. Any non-bool value — including the string
+        # ``"true"``, integers ``0`` / ``1``, and other truthy-looking
+        # shapes — must fall back to ``failed_owner_action``.
+        phases = (
+            PhaseRecord("runpod_lifecycle", "fail", "delete_failed"),
+        )
+        counters = {
+            **_baseline_counters(),
+            "runpod_lifecycle_category": "delete_failed",
+            "runpod_cleanup_confirmed": truthy_non_bool,
+        }
+        result = ScenarioResult(phases=phases, counters=counters)
+        assert classify_result_state(result) == "failed_owner_action"
+
     def test_skipped_phases_do_not_block_completed(self) -> None:
         phases = (
             PhaseRecord("batch", "ok", "batch_ok"),
@@ -389,6 +423,37 @@ class TestCliEntry:
             rc = cli_module.main([])
         assert rc == 1
         assert stdout.getvalue() == ""
+
+    @pytest.mark.parametrize(
+        "bad_status", ["error", "failed", "FAIL", "success", "OK", ""]
+    )
+    def test_unknown_phase_status_rejected_by_cli(
+        self, bad_status: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Status-vocabulary enforcement (PR #98 codex review id 4351827310).
+        # Without this guard, an unknown status would silently fall through
+        # ``classify_result_state`` to ``completed`` — turning a failed
+        # scenario into a successful report. The CLI must reject the input.
+        bad_payload = json.dumps(
+            {
+                "phases": [
+                    {"phase_name": "batch", "status": bad_status},
+                ],
+                "counters": {},
+            }
+        )
+        monkeypatch.setattr(sys, "stdin", io.StringIO(bad_payload))
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = cli_module.main([])
+        assert rc == 1
+        # No partial report emitted; rejection should be category-only.
+        assert stdout.getvalue() == ""
+        # Diagnostic names the offending field but does NOT need to echo
+        # the bad token. We only assert the failure happened on the
+        # status field.
+        assert "status" in stderr.getvalue()
 
     def test_redaction_failure_returns_exit_two(
         self, monkeypatch: pytest.MonkeyPatch
