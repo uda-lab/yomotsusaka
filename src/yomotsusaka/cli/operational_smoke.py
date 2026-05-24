@@ -91,6 +91,7 @@ from typing import Any
 
 from yomotsusaka.batch_runner import BatchRunner
 from yomotsusaka.boundary import (
+    RestorationFailureReason,
     RestorationRequest,
     RestorationResponse,
 )
@@ -391,15 +392,29 @@ print(json.dumps({"loaded": loaded, "hits": hits}))
 
 def _phase_restoration(
     facade: LocalFacade, doc_id: str
-) -> tuple[str, str]:
+) -> tuple[str, str, str | None]:
     """Submit a public restoration request via the facade.
 
-    The facade is hard-wired to ordinary-agent scope; the response is a
-    ``scope_denied`` failure, but the boundary writes an audit row
-    regardless. The phase succeeds when the response is a
-    well-formed :class:`RestorationResponse` carrying a non-empty
-    ``audit_record_id``; the next phase (``audit_inspect``) verifies the
-    row actually landed on disk.
+    The facade is hard-wired to ordinary-agent scope; the boundary's
+    scope gate denies the request and writes one audit row before
+    returning. The phase succeeds **only** when the response matches the
+    expected contract:
+
+    * ``outcome == "failed"`` (any other outcome would mean the kernel
+      actually returned private entries — a privilege escalation the
+      facade is supposed to prevent and the smoke must catch);
+    * ``reason == RestorationFailureReason.ScopeDenied`` (any other
+      ``RestorationFailureReason`` means a different failure path ran —
+      e.g. ``AuditWriteFailed`` would mean the row this phase relies on
+      was never appended, which the next phase would mis-classify);
+    * ``audit_record_id`` is non-empty so phase 6 can correlate on it.
+
+    Returns ``(status, category, audit_record_id_or_none)``. The audit
+    record id is forwarded to :func:`_phase_audit_inspect`, which uses
+    it as the sole correlation key — relying on ``caller_label`` and
+    ``document_id`` alone is insufficient because both are stable across
+    reruns and a stale row from a previous invocation would mask a
+    missing write from the current run (codex review on PR #99, P2).
     """
     request = RestorationRequest(
         caller_label=_RESTORATION_CALLER_LABEL,
@@ -411,25 +426,48 @@ def _phase_restoration(
     try:
         response = facade.request_restore(request)
     except Exception:  # pragma: no cover - defensive
-        return _STATUS_FAIL, _CAT_FAIL_RESTORATION
+        return _STATUS_FAIL, _CAT_FAIL_RESTORATION, None
 
     if not isinstance(response, RestorationResponse):  # pragma: no cover
-        return _STATUS_FAIL, _CAT_FAIL_RESTORATION
+        return _STATUS_FAIL, _CAT_FAIL_RESTORATION, None
+    # Contract check (codex review on PR #99, P1). The facade pins the
+    # scope to ordinary-agent, so the boundary's scope gate is the only
+    # outcome that should ever surface here. Any other outcome / reason
+    # indicates either a regression in the facade's privilege pinning
+    # or a different failure mode on the audit-write path — either way,
+    # the operational backbone is NOT healthy and the phase must fail
+    # loudly rather than report ``ok`` while restoration semantics are
+    # broken.
+    if response.outcome != "failed":
+        return _STATUS_FAIL, _CAT_FAIL_RESTORATION, None
+    if response.reason is not RestorationFailureReason.ScopeDenied:
+        return _STATUS_FAIL, _CAT_FAIL_RESTORATION, None
     if not response.audit_record_id:
-        return _STATUS_FAIL, _CAT_FAIL_RESTORATION
-    return _STATUS_OK, _CAT_OK_RESTORATION
+        return _STATUS_FAIL, _CAT_FAIL_RESTORATION, None
+    return _STATUS_OK, _CAT_OK_RESTORATION, response.audit_record_id
 
 
 def _phase_audit_inspect(
-    vault_root: Path, doc_id: str
+    vault_root: Path, audit_record_id: str | None
 ) -> tuple[str, str]:
-    """Read the audit JSONL and assert the restoration row landed.
+    """Read the audit JSONL and assert the phase-5 row landed.
+
+    Correlation key is the ``audit_record_id`` returned by phase 5 —
+    not ``caller_label`` + ``document_id``, which are both stable
+    across reruns and would let a stale row from a previous invocation
+    mask a missing write from the current run (codex review on PR #99,
+    P2).
 
     The audit file is read as plain text — no kernel-side parser is
-    imported, so the privacy-boundary import scan stays green. Each line
-    is parsed as JSON and matched on ``caller_label`` and a target field
-    that names ``doc_id``.
+    imported, so the privacy-boundary import scan stays green.
     """
+    if audit_record_id is None:
+        # Phase 5 short-circuited; phase 6 cannot synthesise a positive
+        # answer without a correlation key, so report the no-match
+        # category. ``audit_file_missing`` would mislead — the file may
+        # well exist and contain unrelated rows.
+        return _STATUS_FAIL, _CAT_FAIL_AUDIT_NO_MATCH
+
     audit_path = vault_root / "audit" / "restoration.jsonl"
     if not audit_path.exists():
         return _STATUS_FAIL, _CAT_FAIL_AUDIT_MISSING
@@ -446,10 +484,7 @@ def _phase_audit_inspect(
             record = json.loads(stripped)
         except ValueError:
             continue
-        if record.get("caller_label") != _RESTORATION_CALLER_LABEL:
-            continue
-        target = record.get("target") or {}
-        if isinstance(target, dict) and target.get("document_id") == doc_id:
+        if record.get("audit_record_id") == audit_record_id:
             return _STATUS_OK, _CAT_OK_AUDIT
     return _STATUS_FAIL, _CAT_FAIL_AUDIT_NO_MATCH
 
@@ -679,12 +714,20 @@ def main(argv: list[str] | None = None) -> int:
     _emit_phase(_PHASE_SEARCH_SMOKE, search_status, search_category)
 
     # ---- phase 5: restoration_request ----
-    rest_status, rest_category = _phase_restoration(facade, doc_id)
+    # Phase 5 returns the audit_record_id so phase 6 can correlate
+    # exactly (codex review on PR #99, P2). Without that key, a stale
+    # row from a previous invocation against the same vault would let
+    # phase 6 report ok even when the current phase 5 wrote nothing.
+    rest_status, rest_category, audit_record_id = _phase_restoration(
+        facade, doc_id
+    )
     statuses.append((_PHASE_RESTORATION, rest_status, rest_category))
     _emit_phase(_PHASE_RESTORATION, rest_status, rest_category)
 
     # ---- phase 6: audit_inspect ----
-    audit_status, audit_category = _phase_audit_inspect(vault_root, doc_id)
+    audit_status, audit_category = _phase_audit_inspect(
+        vault_root, audit_record_id
+    )
     statuses.append((_PHASE_AUDIT, audit_status, audit_category))
     _emit_phase(_PHASE_AUDIT, audit_status, audit_category)
 

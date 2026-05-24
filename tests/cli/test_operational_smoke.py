@@ -581,6 +581,116 @@ def test_synthesis_fail_yields_failed_cleaned() -> None:
     assert cli_mod._synthesise_result(statuses) == ("failed_cleaned", 1)
 
 
+def test_phase_restoration_asserts_scope_denied_contract(
+    tmp_path: Path,
+) -> None:
+    """Phase 5 must validate the response contract before reporting ``ok``.
+
+    Pins the codex P1 fix on PR #99: a stub response that lacks
+    ``reason=ScopeDenied`` (e.g. an unexpected ``AuditWriteFailed``)
+    must surface as ``status=fail category=<restoration_fail>`` rather
+    than being papered over by a non-empty ``audit_record_id`` check.
+    """
+    from yomotsusaka.boundary import (
+        RestorationFailureReason,
+        RestorationResponse,
+    )
+    from yomotsusaka.cli import operational_smoke as cli_mod
+    from yomotsusaka.facade import LocalFacade
+
+    class _StubFacade:
+        """Minimal stand-in that returns a not-ScopeDenied failure."""
+
+        vault_root = tmp_path / "vault"
+        # Mirror the real facade's gateway attribute so any future
+        # phase-5 helper accidentally touching gateway raises clearly.
+        gateway = None  # type: ignore[assignment]
+
+        def request_restore(  # type: ignore[no-untyped-def]
+            self, request
+        ) -> RestorationResponse:
+            return RestorationResponse(
+                outcome="failed",
+                audit_record_id="stub-record-id",
+                document_id="doc-x",
+                reason=RestorationFailureReason.AuditWriteFailed,
+            )
+
+    status, category, audit_id = cli_mod._phase_restoration(
+        _StubFacade(),  # type: ignore[arg-type]
+        "doc-x",
+    )
+    assert status == "fail"
+    assert category == "restoration_request_unexpected_outcome"
+    assert audit_id is None
+
+    # And the inverse: a contract-matching response yields ``ok`` plus
+    # the surfaced audit_record_id so phase 6 can correlate.
+    vault = tmp_path / "vault-ok"
+    inbox = tmp_path / "inbox-ok"
+    _write_corpus(inbox, _canonical_corpus())
+    facade = LocalFacade(vault)
+    # Drive the real batch once so the facade has a real doc to target.
+    from yomotsusaka.batch_runner import BatchRunner
+
+    BatchRunner(facade=facade).run_directory(inbox)
+    doc_id = sorted((vault / "manifests").glob("*.json"))[0].stem
+    status, category, audit_id = cli_mod._phase_restoration(facade, doc_id)
+    assert status == "ok"
+    assert category == "restoration_request_recorded"
+    assert isinstance(audit_id, str) and audit_id
+
+
+def test_phase_audit_inspect_correlates_on_record_id_not_caller_label(
+    tmp_path: Path,
+) -> None:
+    """Phase 6 must match on the phase-5 ``audit_record_id``.
+
+    Pins the codex P2 fix on PR #99: a stale row from a previous run
+    (same caller_label, same document_id, different audit_record_id)
+    must NOT satisfy phase 6 when the current run's row is absent.
+    """
+    from yomotsusaka.cli import operational_smoke as cli_mod
+
+    vault = tmp_path / "vault"
+    audit_dir = vault / "audit"
+    audit_dir.mkdir(parents=True)
+    audit_path = audit_dir / "restoration.jsonl"
+
+    # Stale row from a prior run: same caller_label, same doc_id, but
+    # a DIFFERENT audit_record_id. With the old caller_label/doc_id
+    # match this would falsely pass; with the codex-P2 fix it must
+    # not.
+    stale = {
+        "audit_record_id": "stale-record-from-prior-run",
+        "caller_label": cli_mod._RESTORATION_CALLER_LABEL,
+        "target": {"document_id": "doc-shared"},
+        "scope": "ORDINARY_AGENT",
+        "outcome": "failed",
+        "reason": "scope_denied",
+    }
+    audit_path.write_text(json.dumps(stale) + "\n", encoding="utf-8")
+
+    # Phase 6 must report no-match because the current run's record id
+    # is not present, even though caller_label + document_id collide.
+    status, category = cli_mod._phase_audit_inspect(
+        vault, audit_record_id="current-run-record-id-that-was-not-written"
+    )
+    assert status == "fail"
+    assert category == "audit_record_not_found"
+
+    # Append the current row and re-check: now phase 6 finds it.
+    current = dict(stale)
+    current["audit_record_id"] = "current-run-record-id-that-was-not-written"
+    with audit_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(current) + "\n")
+    status, category = cli_mod._phase_audit_inspect(
+        vault, audit_record_id="current-run-record-id-that-was-not-written"
+    )
+    assert status == "ok"
+    assert category == "audit_present"
+
+
 def test_synthesis_cleanup_failed_yields_owner_action() -> None:
     """The ``cleanup_failed`` category outranks ordinary fail — the
     owner must intervene to delete the orphaned Pod."""
