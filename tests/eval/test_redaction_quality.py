@@ -33,6 +33,7 @@ from yomotsusaka.eval.redaction_quality import (
 )
 from yomotsusaka.eval.redaction_quality_inference import (
     InferenceEvaluationError,
+    MockOracleBackend,
     evaluate_corpus_inference,
 )
 from yomotsusaka.inference_backend import DummyBackend
@@ -437,6 +438,108 @@ def test_inference_live_mode_accepts_caller_backend(tmp_path: Path) -> None:
     )
     with pytest.raises(SpanProposerError):
         evaluate_corpus_inference(tmp_path, backend=DummyBackend(), live=True)
+
+
+def test_inference_live_mode_rejects_mock_oracle_backend(tmp_path: Path) -> None:
+    """``live=True`` MUST refuse :class:`MockOracleBackend` even when
+    supplied explicitly. (Regression guard for codex review on PR #102:
+    a caller could otherwise smuggle mocked metrics through the live
+    path and have them surface as if they were real model output.)
+    """
+    (tmp_path / "x.txt").write_text("hello world", encoding="utf-8")
+    (tmp_path / "x.expected.json").write_text(
+        json.dumps({"tenant_id": "_local", "spans": [], "expected_keys": []}),
+        encoding="utf-8",
+    )
+    mock = MockOracleBackend(tmp_path)
+    with pytest.raises(InferenceEvaluationError, match="must not be invoked with MockOracleBackend"):
+        evaluate_corpus_inference(tmp_path, backend=mock, live=True)
+
+
+# ---------------------------------------------------------------------------
+# MockOracleBackend prompt routing — unambiguous-match guarantee
+# (regression guard for codex review on PR #102)
+# ---------------------------------------------------------------------------
+
+
+def test_mock_oracle_routes_by_exact_suffix(tmp_path: Path) -> None:
+    """Default :class:`InferenceBackedSpanProposer` template places the
+    document body at the prompt's trailing position. The mock routes by
+    suffix match, so a prompt assembled by the default template
+    resolves unambiguously to its source document.
+    """
+    # Two fixtures where one body is a substring (but NOT a suffix) of
+    # the prompt-formatted other. Substring routing would mis-fire on
+    # the shorter; suffix routing must not.
+    (tmp_path / "short.txt").write_text("Alice Tan.", encoding="utf-8")
+    (tmp_path / "long.txt").write_text(
+        "Alice Tan reported. Bob Smith confirmed.", encoding="utf-8"
+    )
+    for stem in ("short", "long"):
+        (tmp_path / f"{stem}.expected.json").write_text(
+            json.dumps({"tenant_id": "_local", "spans": [], "expected_keys": []}),
+            encoding="utf-8",
+        )
+
+    mock = MockOracleBackend(tmp_path)
+    # Build a prompt that ends with the short body. Even though the
+    # short body's text is contained inside the long body's text, the
+    # mock must route to the short doc because the suffix matches it.
+    prompt_short = "Document:\nAlice Tan."
+    out = mock.generate(prompt_short)
+    assert out == "[]"  # short doc's expected spans
+
+    # Now route to the long doc — also expected to land on its own
+    # payload, not silently mis-fire.
+    prompt_long = "Document:\nAlice Tan reported. Bob Smith confirmed."
+    assert mock.generate(prompt_long) == "[]"
+
+
+def test_mock_oracle_picks_longest_suffix_on_tie(tmp_path: Path) -> None:
+    """If two registered bodies both suffix-match a prompt (only
+    possible when one body is itself a suffix of another), the longer
+    body wins. This is deterministic and corresponds to the strongest
+    evidence present in the prompt.
+    """
+    (tmp_path / "tail.txt").write_text("ends here.", encoding="utf-8")
+    (tmp_path / "with_prefix.txt").write_text(
+        "Story ends here.", encoding="utf-8"
+    )
+    for stem, kind in (("tail", "PERSON"), ("with_prefix", "ORG")):
+        (tmp_path / f"{stem}.expected.json").write_text(
+            json.dumps(
+                {
+                    "tenant_id": "_local",
+                    "spans": [{"start": 0, "end": 5, "kind": kind}],
+                    "expected_keys": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+    mock = MockOracleBackend(tmp_path)
+    prompt = "Document:\nStory ends here."
+    payload = mock.generate(prompt)
+    # The longer body's kind is ORG; the shorter body's kind is
+    # PERSON. The longer body must win.
+    assert '"ORG"' in payload
+    assert '"PERSON"' not in payload
+
+
+def test_mock_oracle_raises_when_prompt_routes_to_no_known_body(
+    tmp_path: Path,
+) -> None:
+    """A prompt that does not end with any registered body must raise
+    rather than silently returning ``"[]"`` (which would mask routing
+    bugs as innocuous false negatives in harness metrics).
+    """
+    (tmp_path / "known.txt").write_text("known body", encoding="utf-8")
+    (tmp_path / "known.expected.json").write_text(
+        json.dumps({"tenant_id": "_local", "spans": [], "expected_keys": []}),
+        encoding="utf-8",
+    )
+    mock = MockOracleBackend(tmp_path)
+    with pytest.raises(InferenceEvaluationError, match="could not route prompt"):
+        mock.generate("Document:\nsomething else entirely")
 
 
 # ---------------------------------------------------------------------------
