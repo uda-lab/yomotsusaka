@@ -84,9 +84,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -184,6 +187,50 @@ _RESTORATION_CALLER_LABEL = "operational-smoke"
 # through ``DeterministicSpanProposer`` will carry a ``<PERSON_*>``
 # redaction key — a robust hit pattern across canonical fixtures.
 _SEARCH_QUERY = "<PERSON_"
+
+# ---------------------------------------------------------------------------
+# Demo-corpus support
+# ---------------------------------------------------------------------------
+#
+# ``--demo-corpus`` materialises a small fixture inbox under a fresh temp
+# directory so a quickstart caller does not need to pre-stage an inbox or
+# copy fixtures by hand. The shipped files are a deliberate, frozen mirror
+# of two canonical fixtures from ``tests/fixtures/redaction_corpus/``;
+# byte-equality is enforced by a unit test so the mirror cannot silently
+# drift. The temp dir is created via :func:`tempfile.mkdtemp` (NOT under
+# the user-supplied positional ``inbox_dir``) so the positional path is
+# never mutated.
+_DEMO_CORPUS_PACKAGE = "yomotsusaka.cli._demo_corpus"
+_DEMO_CORPUS_FILES: tuple[str, ...] = (
+    "canonical_employee.txt",
+    "multi_mention.txt",
+)
+_DEMO_CORPUS_TEMP_PREFIX = "yomotsusaka-demo-corpus-"
+
+# Fixed stderr advisory tokens. Stable across releases for agent callers
+# that scrape stderr; do NOT interpolate paths into the override notice.
+_NOTICE_DEMO_CORPUS_OVERRIDE = "notice=demo_corpus_override"
+_NOTICE_DEMO_CORPUS_KEPT = "notice=demo_corpus_kept"
+
+
+def _materialise_demo_corpus() -> Path:
+    """Create a fresh temp directory and copy the demo fixtures into it.
+
+    Returns the temp directory path. Caller is responsible for cleanup
+    (typically via the ``main`` ``try/finally`` and ``--keep-demo-corpus``
+    semantics). Fixture bytes are loaded via :mod:`importlib.resources`
+    so the path works from an installed wheel as well as a source
+    checkout.
+    """
+    demo_root = Path(tempfile.mkdtemp(prefix=_DEMO_CORPUS_TEMP_PREFIX))
+    package = resources.files(_DEMO_CORPUS_PACKAGE)
+    for name in _DEMO_CORPUS_FILES:
+        # ``read_bytes`` over ``copy`` because the resource may live
+        # inside a zipfile when distributed as a wheel and ``shutil.copy``
+        # would need an on-disk source.
+        data = (package / name).read_bytes()
+        (demo_root / name).write_bytes(data)
+    return demo_root
 
 
 # ---------------------------------------------------------------------------
@@ -814,6 +861,29 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--demo-corpus",
+        action="store_true",
+        default=False,
+        help=(
+            "Materialise a small canonical fixture inbox under a fresh "
+            "temp directory and use that inbox for the run. When set, "
+            "the positional inbox_dir is ignored (a stderr advisory is "
+            "emitted). Intended for the agent quickstart from a fresh "
+            "checkout. The temp directory is removed on exit unless "
+            "--keep-demo-corpus is also set."
+        ),
+    )
+    parser.add_argument(
+        "--keep-demo-corpus",
+        action="store_true",
+        default=False,
+        help=(
+            "Only meaningful with --demo-corpus. Skip the temp-dir "
+            "cleanup after the run completes. The retained path is "
+            "echoed to stderr (never stdout)."
+        ),
+    )
+    parser.add_argument(
         "--emit-json",
         type=Path,
         default=None,
@@ -835,9 +905,52 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    inbox: Path = args.inbox_dir
+    # --keep-demo-corpus is only meaningful with --demo-corpus. Reject
+    # the lone-flag case at parse time so the user sees a usage error
+    # rather than a silent no-op.
+    if args.keep_demo_corpus and not args.demo_corpus:
+        parser.error("--keep-demo-corpus requires --demo-corpus")
+
+    # When --demo-corpus is set, materialise a transient inbox BEFORE
+    # the existing inbox probe and use it for the run. The positional
+    # arg is preserved on ``args.inbox_dir`` but ignored for routing;
+    # a single stable stderr advisory records the override so the agent
+    # caller has a trail. Cleanup is wired through ``try/finally`` so
+    # an unhandled exception still removes the temp dir (unless the
+    # caller opted into --keep-demo-corpus).
+    demo_root: Path | None = None
+    if args.demo_corpus:
+        demo_root = _materialise_demo_corpus()
+        sys.stderr.write(f"{_NOTICE_DEMO_CORPUS_OVERRIDE}\n")
+        sys.stderr.flush()
+        inbox: Path = demo_root
+    else:
+        inbox = args.inbox_dir
     vault_root: Path = args.vault_root
 
+    try:
+        return _run_main(args, inbox, vault_root)
+    finally:
+        if demo_root is not None:
+            if args.keep_demo_corpus:
+                # Path on stderr only — the explicit owner opt-in to
+                # retain the temp dir means the caller wants to find
+                # it, but stdout discipline still forbids any new
+                # token there.
+                sys.stderr.write(
+                    f"{_NOTICE_DEMO_CORPUS_KEPT} path={demo_root}\n"
+                )
+                sys.stderr.flush()
+            else:
+                shutil.rmtree(demo_root, ignore_errors=False)
+
+
+def _run_main(
+    args: argparse.Namespace, inbox: Path, vault_root: Path
+) -> int:
+    """Body of ``main`` factored out so the demo-corpus ``try/finally``
+    wrapper can guarantee cleanup regardless of the exit path.
+    """
     # Probe inbox / vault before kicking off any phase so a startup
     # failure does not emit a confusing partial-phase log.
     if not inbox.exists() or not inbox.is_dir():

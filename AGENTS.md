@@ -15,12 +15,13 @@ uv pip install -e ".[dev]"
 uv run pytest
 uv run ruff check src tests
 uv run python -m yomotsusaka.cli.run_batch ./inbox --vault-root ./vault  # quick end-to-end check
+uv run python scripts/gatekeeper/check_docs_commands.py  # docs-to-source drift gate (#114)
 ~~~
 
 ## Operational smoke
 
 ~~~sh
-uv run python -m yomotsusaka.cli.operational_smoke ./inbox --vault-root ./vault  # MVP-5 #91; no network by default
+uv run python -m yomotsusaka.cli.operational_smoke ./inbox --vault-root ./vault --demo-corpus  # MVP-5 #91 / MVP-6 #113; no network by default; --demo-corpus seeds a temp inbox so the positional path can be a placeholder
 ~~~
 
 ## Architecture
