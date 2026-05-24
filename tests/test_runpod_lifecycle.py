@@ -709,6 +709,117 @@ def test_manage_lifecycle_handle_exposure_unchanged(
 
 
 # ---------------------------------------------------------------------------
+# RUNPOD_TEMPLATE_ID — _create_payload round-trip (L1) + env-var hook (L2)
+# issue #126
+# ---------------------------------------------------------------------------
+
+
+def test_create_payload_without_template_id_omits_template_key() -> None:
+    """L1 — _create_payload with template_id=None must not include templateId."""
+    config = PodConfig()
+    assert config.template_id is None
+    payload = ManageRunPodLifecycle._create_payload(config)
+    assert "templateId" not in payload
+    assert "gpuTypeIds" in payload
+    assert "imageName" in payload
+    assert "containerDiskInGb" in payload
+    assert "env" in payload
+
+
+def test_create_payload_with_template_id_includes_template_key() -> None:
+    """L1 — _create_payload with template_id set includes templateId value."""
+    config = PodConfig(template_id="tmpl-abc123")
+    payload = ManageRunPodLifecycle._create_payload(config)
+    assert payload["templateId"] == "tmpl-abc123"
+    # Other fields still present.
+    assert "gpuTypeIds" in payload
+    assert "imageName" in payload
+    assert "containerDiskInGb" in payload
+    assert "env" in payload
+
+
+def test_manage_lifecycle_env_template_id_flows_into_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L2 — RUNPOD_TEMPLATE_ID env var wires into default PodConfig payload.
+
+    When ManageRunPodLifecycle is constructed without an explicit pod_config
+    and RUNPOD_TEMPLATE_ID is set, _create_payload must include templateId.
+    """
+    monkeypatch.setenv("RUNPOD_TEMPLATE_ID", "tmpl-env-001")
+
+    received_payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+        if request.method == "POST" and request.url.path.endswith("/pods"):
+            received_payloads.append(_json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"id": "pod-env-001", "endpoint": "http://env.invalid:8000"},
+            )
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200)
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        return httpx.Response(404)
+
+    import yomotsusaka.runpod_lifecycle as _mod
+    lifecycle = ManageRunPodLifecycle(
+        api_key="sk-test",
+        transport=httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr(_mod, "_MANAGE_HEALTH_POLL_INTERVAL_SECONDS", 0)
+    handle = lifecycle.start_pod()
+    lifecycle.stop_pod(handle, terminate=True)
+
+    assert len(received_payloads) == 1, (
+        f"expected exactly one POST /pods; got {received_payloads}"
+    )
+    assert received_payloads[0].get("templateId") == "tmpl-env-001", (
+        f"templateId not found in payload: {received_payloads[0]}"
+    )
+
+
+def test_manage_lifecycle_no_env_template_id_omits_from_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L2 — RUNPOD_TEMPLATE_ID unset → templateId absent from payload (back-compat)."""
+    monkeypatch.delenv("RUNPOD_TEMPLATE_ID", raising=False)
+
+    received_payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+        if request.method == "POST" and request.url.path.endswith("/pods"):
+            received_payloads.append(_json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"id": "pod-no-tmpl", "endpoint": "http://notmpl.invalid:8000"},
+            )
+        if request.url.path.endswith("/health"):
+            return httpx.Response(200)
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        return httpx.Response(404)
+
+    import yomotsusaka.runpod_lifecycle as _mod
+    lifecycle = ManageRunPodLifecycle(
+        api_key="sk-test",
+        transport=httpx.MockTransport(handler),
+    )
+    monkeypatch.setattr(_mod, "_MANAGE_HEALTH_POLL_INTERVAL_SECONDS", 0)
+    handle = lifecycle.start_pod()
+    lifecycle.stop_pod(handle, terminate=True)
+
+    assert len(received_payloads) == 1
+    assert "templateId" not in received_payloads[0], (
+        f"templateId must be absent when RUNPOD_TEMPLATE_ID is unset; "
+        f"got {received_payloads[0]}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Mode selection
 # ---------------------------------------------------------------------------
 

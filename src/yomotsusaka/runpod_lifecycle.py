@@ -62,6 +62,12 @@ class PodConfig:
 
     ``model_id`` defaults to the MVP-3 pin ``"Qwen/Qwen3-8B"`` per
     ``docs/runpod.md`` §4 and metaplan Fork 5.
+
+    ``template_id`` is the optional owner-pinned RunPod template ID (set
+    via ``RUNPOD_TEMPLATE_ID`` env var or passed explicitly). When set,
+    ``_create_payload`` includes ``"templateId"`` in the REST body so
+    the owner-configured cheap template (community cloud, spot price, etc.)
+    is honoured by the agent-managed lifecycle (issue #126).
     """
 
     gpu_type: str = "NVIDIA RTX A5000"
@@ -69,6 +75,7 @@ class PodConfig:
     model_id: str = "Qwen/Qwen3-8B"
     disk_gb: int = 20
     extra: dict[str, Any] = field(default_factory=dict)
+    template_id: str | None = None
 
 
 @dataclass
@@ -350,7 +357,17 @@ class ManageRunPodLifecycle(RunPodLifecycle):
             )
 
         self._api_key = resolved_api_key
-        self._pod_config = pod_config or PodConfig()
+        # When the caller does not supply an explicit pod_config, build the
+        # default PodConfig and thread in RUNPOD_TEMPLATE_ID from the
+        # environment (issue #126). Explicit pod_config is passed through
+        # unchanged so callers that construct PodConfig themselves retain
+        # full control.
+        if pod_config is not None:
+            self._pod_config = pod_config
+        else:
+            self._pod_config = PodConfig(
+                template_id=os.environ.get("RUNPOD_TEMPLATE_ID") or None,
+            )
         self._transport = transport
         self._bypass_pod_id = pod_id
         self._bypass_endpoint = endpoint.rstrip("/") if endpoint else None
@@ -589,13 +606,22 @@ class ManageRunPodLifecycle(RunPodLifecycle):
         Field names follow the public RunPod REST schema. The payload is
         constructed here (not in :meth:`start_pod`) so the test seam can
         inspect it via a :class:`httpx.MockTransport` handler.
+
+        ``templateId`` is included ONLY when ``config.template_id`` is not
+        ``None`` (issue #126). This lets the owner pin a RunPod template
+        (community cloud type, spot-price ceiling, data-center, image, env
+        vars, ports, volume) via ``RUNPOD_TEMPLATE_ID`` without requiring
+        every caller to supply it.
         """
-        return {
+        payload: dict[str, Any] = {
             "gpuTypeIds": [config.gpu_type],
             "imageName": config.image,
             "containerDiskInGb": config.disk_gb,
             "env": {"MODEL_ID": config.model_id, **config.extra},
         }
+        if config.template_id is not None:
+            payload["templateId"] = config.template_id
+        return payload
 
     @staticmethod
     def _extract_pod_identity(data: Any) -> tuple[str | None, str | None]:
