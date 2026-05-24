@@ -129,10 +129,60 @@ def _is_start_pod_call(node: ast.AST) -> bool:
     return False
 
 
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+
+def _iter_body_in_scope(stmts: list[ast.stmt]) -> Iterator[ast.AST]:
+    """Yield every descendant of *stmts* WITHOUT crossing nested function /
+    class / lambda boundaries.
+
+    ``ast.walk`` traverses the whole subtree including nested defs, which
+    falsely treats a ``stop_pod`` call inside an uninvoked helper as
+    cleanup (codex P2 on PR #132). Scope-stopping traversal ensures that
+    only statements actually reachable from the current scope count.
+
+    Statements that are themselves scope nodes (``def _x():``,
+    ``class Y:``, ``lambda``) are yielded as a single node — their bodies
+    are NOT descended into.
+    """
+    for stmt in stmts:
+        if isinstance(stmt, _SCOPE_NODES):
+            # The scope-node statement itself is yielded (caller may want
+            # to see the def line), but we do NOT recurse into its body.
+            yield stmt
+            continue
+        yield from _walk_no_scope(stmt)
+
+
+def _walk_no_scope(node: ast.AST) -> Iterator[ast.AST]:
+    """Yield *node* and its descendants, stopping at any scope boundary.
+
+    Unlike ``ast.walk``, this traversal yields a scope-node when encountered
+    but does NOT descend into its body — so a nested ``def``/``class``/
+    ``lambda`` containing a ``stop_pod`` call inside the outer function is
+    NOT counted as reachable cleanup.
+    """
+    yield node
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, _SCOPE_NODES):
+            # Yield the def node itself but do NOT descend into its body.
+            yield child
+            continue
+        yield from _walk_no_scope(child)
+
+
 def _contains_stop_pod(stmts: list[ast.stmt]) -> bool:
-    """Return True if any node in *stmts* (recursively) is a stop_pod call."""
-    module_wrapper = ast.Module(body=stmts, type_ignores=[])
-    return any(_is_stop_pod_call(n) for n in ast.walk(module_wrapper))
+    """Return True if any node in *stmts* is a stop_pod call reachable from
+    the current scope (nested function/class bodies are NOT traversed).
+    """
+    return any(_is_stop_pod_call(n) for n in _iter_body_in_scope(stmts))
+
+
+def _contains_start_pod(stmts: list[ast.stmt]) -> bool:
+    """Return True if any node in *stmts* is a start_pod call reachable from
+    the current scope (nested function/class bodies are NOT traversed).
+    """
+    return any(_is_start_pod_call(n) for n in _iter_body_in_scope(stmts))
 
 
 def _source_snippet(source_lines: list[str], node: ast.AST) -> str:
@@ -168,22 +218,24 @@ def _check_library_start_pod(
     """
     # Walk the function body looking for a Try node whose body contains
     # _wait_for_healthy and whose handlers contain stop_pod.
+    # Scope-stopping traversal: nested defs are not descended into
+    # (codex P2 on PR #132).
     found_inner_try_with_cleanup = False
 
-    for node in ast.walk(ast.Module(body=func_def.body, type_ignores=[])):
+    def _is_wait_call(n: ast.AST) -> bool:
+        if not isinstance(n, ast.Call):
+            return False
+        if isinstance(n.func, ast.Attribute) and n.func.attr == "_wait_for_healthy":
+            return True
+        if isinstance(n.func, ast.Name) and n.func.id == "_wait_for_healthy":
+            return True
+        return False
+
+    for node in _iter_body_in_scope(func_def.body):
         if not isinstance(node, ast.Try):
             continue
-        # Does the body of this Try call _wait_for_healthy?
-        has_wait = any(
-            (
-                isinstance(n, ast.Call)
-                and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "_wait_for_healthy"
-            )
-            or (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_wait_for_healthy")
-            for stmt in node.body
-            for n in ast.walk(stmt)
-        )
+        # Does the body of this Try call _wait_for_healthy (scope-respecting)?
+        has_wait = any(_is_wait_call(n) for n in _iter_body_in_scope(node.body))
         if not has_wait:
             continue
         # Does at least one handler contain a stop_pod call?
@@ -256,11 +308,9 @@ def _check_caller_function(
         return
 
     # Does the function body contain a start_pod call?
-    has_start = any(
-        _is_start_pod_call(n)
-        for n in ast.walk(ast.Module(body=func_def.body, type_ignores=[]))
-    )
-    if not has_start:
+    # Scope-stopping: nested function/class/lambda bodies are NOT considered
+    # part of this caller's reachable code (codex P2 on PR #132).
+    if not _contains_start_pod(func_def.body):
         return
 
     # Check for caller-responsibility marker
@@ -269,17 +319,13 @@ def _check_caller_function(
 
     # Check for stop_pod in any except-handler or finally block that
     # covers a start_pod call.
-    # Strategy: walk the Try nodes. For each Try node whose body contains
-    # start_pod, check if any handler or the finalbody has stop_pod.
+    # Strategy: walk the Try nodes (scope-respecting). For each Try node
+    # whose body contains start_pod, check if any handler or the
+    # finalbody has stop_pod (also scope-respecting).
     cleanup_covered = False
-    for node in ast.walk(ast.Module(body=func_def.body, type_ignores=[])):
+    for node in _iter_body_in_scope(func_def.body):
         if isinstance(node, ast.Try):
-            body_has_start = any(
-                _is_start_pod_call(n)
-                for stmt in node.body
-                for n in ast.walk(stmt)
-            )
-            if body_has_start:
+            if _contains_start_pod(node.body):
                 for handler in node.handlers:
                     if _contains_stop_pod(handler.body):
                         cleanup_covered = True
@@ -293,11 +339,8 @@ def _check_caller_function(
     # stop_pod on the failure path — this is only safe if the library
     # guarantees internal cleanup, which is true post-#125).
     # We mark this as clean if the function ALSO has stop_pod somewhere
-    # (the happy-path cleanup).
-    has_stop_anywhere = any(
-        _is_stop_pod_call(n)
-        for n in ast.walk(ast.Module(body=func_def.body, type_ignores=[]))
-    )
+    # in the same scope (the happy-path cleanup).
+    has_stop_anywhere = _contains_stop_pod(func_def.body)
 
     if cleanup_covered or has_stop_anywhere:
         return
@@ -305,7 +348,7 @@ def _check_caller_function(
     # Start_pod called but no stop_pod reachable anywhere in the function
     start_lines = [
         n.lineno
-        for n in ast.walk(ast.Module(body=func_def.body, type_ignores=[]))
+        for n in _iter_body_in_scope(func_def.body)
         if _is_start_pod_call(n) and hasattr(n, "lineno")
     ]
     yield Finding(

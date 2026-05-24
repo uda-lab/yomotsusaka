@@ -282,3 +282,89 @@ def test_main_exit_1_on_drift(tmp_path: Path) -> None:
     lifecycle.write_text(_PRE_125_DRIFT)
     result = _mod.main(["--root", str(tmp_path)])
     assert result == 1
+
+
+# ---------------------------------------------------------------------------
+# Codex P2 regression — nested defs in except/finally do not count as cleanup
+# (PR #132 fixup).
+# ---------------------------------------------------------------------------
+
+
+_NESTED_DEF_DRIFT_G41 = """\
+class ManageRunPodLifecycle:
+    def start_pod(self, config=None):
+        handle = self._create_pod()
+        try:
+            self._wait_for_healthy(handle)
+        except PodUnavailableError:
+            def _maybe_stop():
+                self.stop_pod(handle, terminate=True)
+            # _maybe_stop is never invoked — Pod is orphaned
+            raise
+        return handle
+"""
+
+
+def test_g41_nested_def_with_stop_pod_does_not_count(tmp_path: Path) -> None:
+    """A stop_pod call inside an UNCALLED nested helper must NOT satisfy G4.1.
+
+    Before the codex P2 fixup, ast.walk crossed nested function bodies, so a
+    helper defined in the except block that contained stop_pod was treated as
+    cleanup even when the helper was never invoked.
+    """
+    findings = _parse_and_check_g41(_NESTED_DEF_DRIFT_G41, tmp_path)
+    g41_findings = [
+        f for f in findings
+        if f.rule == "lifecycle_invariant.library_start_pod_has_cleanup"
+    ]
+    assert len(g41_findings) == 1, (
+        f"G4.1 must still fire when stop_pod lives in an uncalled nested def; "
+        f"got {[f.rule for f in findings]}"
+    )
+
+
+_NESTED_DEF_DRIFT_G42 = """\
+def run_lifecycle(lifecycle, config):
+    handle = lifecycle.start_pod(config)
+    def _cleanup():
+        lifecycle.stop_pod(handle, terminate=True)
+    # _cleanup is never invoked — Pod is orphaned
+    return handle
+"""
+
+
+def test_g42_nested_def_with_stop_pod_does_not_count(tmp_path: Path) -> None:
+    """G4.2 must fire when stop_pod lives in an uncalled nested def."""
+    findings = _parse_and_check_g42(_NESTED_DEF_DRIFT_G42, tmp_path)
+    g42_findings = [
+        f for f in findings
+        if f.rule == "lifecycle_invariant.caller_start_pod_paired"
+    ]
+    assert len(g42_findings) == 1, (
+        f"G4.2 must still fire when stop_pod lives in an uncalled nested def; "
+        f"got {[f.rule for f in findings]}"
+    )
+
+
+_NESTED_CLASS_DRIFT_G42 = """\
+def run_lifecycle(lifecycle, config):
+    handle = lifecycle.start_pod(config)
+    class _Helper:
+        def stop(self):
+            lifecycle.stop_pod(handle, terminate=True)
+    # The class body's stop method is never invoked from this scope
+    return handle
+"""
+
+
+def test_g42_nested_class_method_with_stop_pod_does_not_count(tmp_path: Path) -> None:
+    """G4.2 must fire when stop_pod lives in an uncalled nested class method."""
+    findings = _parse_and_check_g42(_NESTED_CLASS_DRIFT_G42, tmp_path)
+    g42_findings = [
+        f for f in findings
+        if f.rule == "lifecycle_invariant.caller_start_pod_paired"
+    ]
+    assert len(g42_findings) == 1, (
+        f"G4.2 must still fire when stop_pod lives in a nested class method; "
+        f"got {[f.rule for f in findings]}"
+    )

@@ -238,12 +238,25 @@ def run_checks(docs_dir: Path, repo_root: Path) -> Report:
     source_files = _collect_source_files(repo_root)
     referenced = _build_source_env_lookup(source_files)
 
-    # Deduplicate: only report each var_name once (across all docs)
-    seen: set[str] = set()
+    # Deduplicate: prefer non-operator-only rows (codex P2 on PR #132).
+    # Naively keeping the first occurrence per var_name lets an
+    # (operator-only) row silence a later non-operator row for the same
+    # variable — a false negative in a hard gate. Group by var_name and
+    # pick a representative entry that is NOT operator-only when any
+    # such row exists; only fall back to the operator-only row when
+    # every documented occurrence carries that annotation.
+    grouped: dict[str, EnvVarEntry] = {}
     for entry in all_entries:
-        if entry.var_name in seen:
+        existing = grouped.get(entry.var_name)
+        if existing is None:
+            grouped[entry.var_name] = entry
             continue
-        seen.add(entry.var_name)
+        # If the existing pick is operator-only and the new one is not,
+        # swap in the stricter (non-operator) row.
+        if existing.operator_only and not entry.operator_only:
+            grouped[entry.var_name] = entry
+
+    for entry in grouped.values():
         report.findings.extend(check_env_vars([entry], referenced))
 
     return report

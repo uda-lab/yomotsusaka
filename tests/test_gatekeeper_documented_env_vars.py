@@ -247,3 +247,57 @@ def test_main_exit_1_on_violation(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path, _DOC_WITH_TEMPLATE_ID, _SRC_WITHOUT_TEMPLATE_ID)
     result = _mod.main(["--root", str(repo)])
     assert result == 1
+
+
+# ---------------------------------------------------------------------------
+# Codex P2 regression — operator-only must not silence a non-operator row
+# for the same variable (PR #132 fixup).
+# ---------------------------------------------------------------------------
+
+
+def test_operator_only_row_does_not_silence_non_operator_row(tmp_path: Path) -> None:
+    """If the same var appears in (operator-only) AND non-operator rows, the
+    non-operator row must drive the decision so an unwired var still fires.
+
+    Before the codex P2 fixup, the first occurrence won in deduplication;
+    if it was operator-only the non-operator row was silently dropped and
+    an unwired variable produced a false negative.
+    """
+    doc_first_operator = """\
+## §X some operator section
+
+| Variable             | Required | Source |
+| -------------------- | -------- | ------ |
+| `RUNPOD_TEMPLATE_ID` | optional | Owner only (operator-only) |
+
+## §Y normal section
+
+| Variable             | Required | Source |
+| -------------------- | -------- | ------ |
+| `RUNPOD_TEMPLATE_ID` | optional | Owner-pinned template |
+"""
+    # Source does NOT wire RUNPOD_TEMPLATE_ID.
+    src = "import os\napi_key = os.environ.get('RUNPOD_API_KEY')\n"
+
+    repo = _make_repo(tmp_path, doc_first_operator, src)
+    report = _mod.run_checks(repo / "docs", repo)
+    template_findings = [
+        f for f in report.findings if f.var_name == "RUNPOD_TEMPLATE_ID"
+    ]
+    assert len(template_findings) == 1, (
+        "operator-only row must not silence the non-operator row for the "
+        "same variable; expected G3.1 to fire on the unwired var"
+    )
+
+
+def test_operator_only_only_rows_still_exempted(tmp_path: Path) -> None:
+    """If every documented occurrence is operator-only, the var IS exempt."""
+    doc_all_operator = """\
+| `OWNER_SECRET` | optional | (operator-only) |
+| `OWNER_SECRET` | optional | (operator-only) — second mention |
+"""
+    src = "x = 1\n"
+    repo = _make_repo(tmp_path, doc_all_operator, src)
+    report = _mod.run_checks(repo / "docs", repo)
+    owner_findings = [f for f in report.findings if f.var_name == "OWNER_SECRET"]
+    assert owner_findings == []
