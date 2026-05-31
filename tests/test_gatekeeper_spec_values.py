@@ -87,6 +87,16 @@ def test_parse_blocks_empty_doc() -> None:
     assert blocks == []
 
 
+def test_parse_blocks_unclosed_block_is_returned_for_parse_error() -> None:
+    text = """\
+<!-- spec-values target=PodConfig.disk_gb -->
+- min: 30
+"""
+    blocks = _mod._parse_blocks(text, "docs/runpod.md")
+    assert len(blocks) == 1
+    assert blocks[0].fields == {"min": "30"}
+
+
 # ---------------------------------------------------------------------------
 # G2.1: Block parseable
 # ---------------------------------------------------------------------------
@@ -213,6 +223,27 @@ def test_target_unresolvable_fires(tmp_path: Path) -> None:
         "spec_values.target_resolvable",
         "spec_values.value_in_range",
     )
+
+
+def test_resolve_class_attr_returns_none_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RUNPOD_TEMPLATE_ID", raising=False)
+    repo_root = Path(__file__).resolve().parents[1]
+    actual = _mod._resolve_class_attr("PodConfig.template_id", repo_root)
+    assert actual is None
+
+
+def test_resolve_class_attr_module_level_constant() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    actual = _mod._resolve_class_attr(
+        "runpod_lifecycle._MANAGE_CLEANUP_MAX_ATTEMPTS", repo_root
+    )
+    assert actual == 2
+
+
+def test_run_checks_missing_docs_dir_fails_closed(tmp_path: Path) -> None:
+    report = _mod.run_checks(tmp_path / "docs", tmp_path)
+    assert len(report.findings) == 1
+    assert report.findings[0].rule == "spec_values.docs_dir_present"
 
 
 # ---------------------------------------------------------------------------

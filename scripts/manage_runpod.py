@@ -518,60 +518,75 @@ def run_lifecycle(
     )
 
     exit_codes: list[int] = []
+    cleanup_attempted = False
 
-    # ---- smoke ----
-    smoke_passed, smoke_category = _run_smoke_subprocess(
-        handle,
-        vllm_api_key=vllm_api_key_for_smoke,
-        repo_root=repo_root or Path(__file__).resolve().parent.parent,
-        runner=smoke_runner,
-    )
-    if smoke_passed:
-        _emit_category(_CATEGORY_SMOKE_PASSED)
-        _append_lifecycle_row(
-            request_id=request_id,
-            category=_CATEGORY_SMOKE_PASSED,
-            log_path=lifecycle_log,
+    try:
+        # ---- smoke ----
+        smoke_passed, smoke_category = _run_smoke_subprocess(
+            handle,
+            vllm_api_key=vllm_api_key_for_smoke,
+            repo_root=repo_root or Path(__file__).resolve().parent.parent,
+            runner=smoke_runner,
         )
-    else:
-        _emit_category(_CATEGORY_SMOKE_FAILED)
-        _append_lifecycle_row(
-            request_id=request_id,
-            category=_CATEGORY_SMOKE_FAILED,
-            log_path=lifecycle_log,
-        )
-        exit_codes.append(EXIT_PHASE_FAILED)
-
-    # ---- cleanup ----
-    if keep_pod:
-        _emit_category(_CATEGORY_KEPT)
-        _append_lifecycle_row(
-            request_id=request_id,
-            category=_CATEGORY_KEPT,
-            log_path=lifecycle_log,
-        )
-        exit_codes.append(EXIT_OK)
-    else:
-        try:
-            lifecycle.stop_pod(handle, terminate=True)
-        except PodUnavailableError:
-            _emit_category(_CATEGORY_CLEANUP_FAILED)
-            _emit_urgent(request_id, log_path=lifecycle_log)
+        if smoke_passed:
+            _emit_category(_CATEGORY_SMOKE_PASSED)
             _append_lifecycle_row(
                 request_id=request_id,
-                category=_CATEGORY_CLEANUP_FAILED,
+                category=_CATEGORY_SMOKE_PASSED,
                 log_path=lifecycle_log,
             )
-            exit_codes.append(EXIT_CLEANUP_FAILED)
         else:
-            _emit_category(_CATEGORY_DELETED)
+            _emit_category(_CATEGORY_SMOKE_FAILED)
             _append_lifecycle_row(
                 request_id=request_id,
-                category=_CATEGORY_DELETED,
+                category=_CATEGORY_SMOKE_FAILED,
                 log_path=lifecycle_log,
             )
+            exit_codes.append(EXIT_PHASE_FAILED)
 
-    return _select_exit_code(exit_codes)
+        # ---- cleanup ----
+        if keep_pod:
+            _emit_category(_CATEGORY_KEPT)
+            _append_lifecycle_row(
+                request_id=request_id,
+                category=_CATEGORY_KEPT,
+                log_path=lifecycle_log,
+            )
+            exit_codes.append(EXIT_OK)
+        else:
+            cleanup_attempted = True
+            try:
+                lifecycle.stop_pod(handle, terminate=True)
+            except PodUnavailableError:
+                _emit_category(_CATEGORY_CLEANUP_FAILED)
+                _emit_urgent(request_id, log_path=lifecycle_log)
+                _append_lifecycle_row(
+                    request_id=request_id,
+                    category=_CATEGORY_CLEANUP_FAILED,
+                    log_path=lifecycle_log,
+                )
+                exit_codes.append(EXIT_CLEANUP_FAILED)
+            else:
+                _emit_category(_CATEGORY_DELETED)
+                _append_lifecycle_row(
+                    request_id=request_id,
+                    category=_CATEGORY_DELETED,
+                    log_path=lifecycle_log,
+                )
+
+        return _select_exit_code(exit_codes)
+    finally:
+        if not keep_pod and not cleanup_attempted:
+            try:
+                lifecycle.stop_pod(handle, terminate=True)
+            except PodUnavailableError:
+                _emit_category(_CATEGORY_CLEANUP_FAILED)
+                _emit_urgent(request_id, log_path=lifecycle_log)
+                _append_lifecycle_row(
+                    request_id=request_id,
+                    category=_CATEGORY_CLEANUP_FAILED,
+                    log_path=lifecycle_log,
+                )
 
 
 # ---------------------------------------------------------------------------

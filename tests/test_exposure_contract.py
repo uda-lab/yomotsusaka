@@ -777,6 +777,35 @@ def test_resolver_failure_artifact_missing_when_private_dict_absent_is_opaque(
         )
 
 
+def test_restoration_error_detail_does_not_echo_kernel_message(
+    canonical_vault: tuple[Path, ProcessResponse, PublicHandle],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault_root, _process_response, handle = canonical_vault
+    leaked = f"{vault_root}/private/exposure-doc-001.json raw_value=Alice Tan"
+
+    def _raise_restoration_error(*_args: Any, **_kwargs: Any) -> None:
+        raise boundary.restoration_api.RestorationError(leaked)
+
+    monkeypatch.setattr(boundary.restoration_api, "restore", _raise_restoration_error)
+    response = restoration_request(
+        _exposure_restoration_request(handle),
+        scope=ResolverScope.PRIVATE_BOUNDARY,
+        vault_root=vault_root,
+    )
+    assert response.outcome == "failed"
+    assert response.reason is boundary.RestorationFailureReason.KernelError
+    assert response.detail == "kernel raised an error while reading private data"
+    blob = response.model_dump_json()
+    assert "Alice Tan" not in blob
+    assert "private/exposure-doc-001.json" not in blob
+    _assert_no_paths(
+        blob,
+        surface="RestorationResponse.KernelError",
+        extra=_scrub_for_path_assertion(vault_root),
+    )
+
+
 def test_resolver_failure_scope_denied_no_leak(
     canonical_vault: tuple[Path, ProcessResponse, PublicHandle],
 ) -> None:

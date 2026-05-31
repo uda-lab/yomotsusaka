@@ -39,6 +39,8 @@ Invocation::
 from __future__ import annotations
 
 import argparse
+import contextlib
+import dataclasses
 import importlib
 import json
 import re
@@ -95,6 +97,7 @@ _OPEN_RE = re.compile(
 )
 _CLOSE_RE = re.compile(r"<!--\s*/spec-values\s*-->", re.IGNORECASE)
 _FIELD_RE = re.compile(r"^\s*-\s*(?P<key>\w+)\s*:\s*(?P<value>.+?)\s*$")
+_MISSING = object()
 
 
 @dataclass
@@ -130,6 +133,8 @@ def _parse_blocks(text: str, rel_path: str) -> list[SpecBlock]:
                 m2 = _FIELD_RE.match(raw)
                 if m2:
                     in_block.fields[m2.group("key")] = m2.group("value")
+    if in_block is not None:
+        blocks.append(in_block)
     return blocks
 
 
@@ -137,54 +142,16 @@ def _parse_blocks(text: str, rel_path: str) -> list[SpecBlock]:
 # Target resolution
 # ---------------------------------------------------------------------------
 
-def _resolve_target(target: str, repo_root: Path) -> Any:
-    """Attempt to import the named attribute and return its value.
-
-    Supports two shapes:
-    * ``Module.attr`` — resolved as ``yomotsusaka.<Module>.attr`` first,
-      then bare ``<Module>.attr`` via module-level access.
-    * ``ClassName.attr`` — instantiates ``ClassName()`` and reads the attr.
-
-    Raises ``ImportError`` / ``AttributeError`` on failure.
-    """
-    parts = target.rsplit(".", 1)
-    if len(parts) != 2:
-        raise ValueError(f"target {target!r} must be of the form Module.attr")
-    module_part, attr_part = parts
-
-    # Try yomotsusaka.<module_part> first.
-    # Insert repo_root/src into sys.path so the package is importable
-    # when the script is run from the repo root.
+@contextlib.contextmanager
+def _repo_src_on_path(repo_root: Path) -> Iterator[None]:
     src_dir = str(repo_root / "src")
+    old_path = sys.path[:]
     if src_dir not in sys.path:
         sys.path.insert(0, src_dir)
-
-    # Try to import from yomotsusaka package
-    for candidate in (
-        f"yomotsusaka.{module_part.lower()}",
-        f"yomotsusaka.{module_part}",
-        module_part,
-    ):
-        try:
-            mod = importlib.import_module(candidate)
-        except (ImportError, ModuleNotFoundError):
-            continue
-        # Look for the attr directly (module-level constant)
-        if hasattr(mod, attr_part):
-            return getattr(mod, attr_part)
-        # Look for a class named module_part inside the module
-        cls = getattr(mod, module_part, None)
-        if cls is not None and isinstance(cls, type):
-            try:
-                instance = cls()
-                return getattr(instance, attr_part)
-            except Exception:
-                pass
-        # Look for the attr as a module-level name
-        # (e.g. target=runpod_lifecycle.PodConfig.disk_gb handled as
-        #  module=runpod_lifecycle, class=PodConfig, attr=disk_gb)
-
-    raise ImportError(f"Cannot resolve target {target!r}")
+    try:
+        yield
+    finally:
+        sys.path[:] = old_path
 
 
 def _resolve_class_attr(target: str, repo_root: Path) -> Any:
@@ -199,10 +166,6 @@ def _resolve_class_attr(target: str, repo_root: Path) -> Any:
         raise ValueError(f"target {target!r} must be of the form ClassName.attr")
     class_name, attr_name = parts
 
-    src_dir = str(repo_root / "src")
-    if src_dir not in sys.path:
-        sys.path.insert(0, src_dir)
-
     # Walk yomotsusaka submodules listed via directory scan
     src_yomo = repo_root / "src" / "yomotsusaka"
     candidate_modules: list[str] = []
@@ -212,25 +175,35 @@ def _resolve_class_attr(target: str, repo_root: Path) -> Any:
             mod_name = ".".join(rel.with_suffix("").parts)
             candidate_modules.append(mod_name)
 
-    for mod_name in candidate_modules:
-        try:
-            mod = importlib.import_module(mod_name)
-        except Exception:
-            continue
-        cls = getattr(mod, class_name, None)
-        if cls is None or not isinstance(cls, type):
-            continue
-        try:
-            instance = cls()
-            val = getattr(instance, attr_name, None)
-            if val is not None:
+    with _repo_src_on_path(repo_root):
+        for mod_name in candidate_modules:
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception:
+                continue
+
+            # Module-level constants use target=module_name.ATTRIBUTE.
+            if mod_name.rsplit(".", 1)[-1] == class_name:
+                val = getattr(mod, attr_name, _MISSING)
+                if val is not _MISSING:
+                    return val
+
+            cls = getattr(mod, class_name, None)
+            if cls is None or not isinstance(cls, type):
+                continue
+            # Prefer class attributes before instantiating constructors that may
+            # require credentials or perform I/O.
+            val = getattr(cls, attr_name, _MISSING)
+            if val is not _MISSING and not isinstance(val, dataclasses.Field):
                 return val
-        except Exception:
-            pass
-        # Try class attribute directly
-        val = getattr(cls, attr_name, None)
-        if val is not None:
-            return val
+            if dataclasses.is_dataclass(cls):
+                for field in dataclasses.fields(cls):
+                    if field.name != attr_name:
+                        continue
+                    if field.default is not dataclasses.MISSING:
+                        return field.default
+                    if field.default_factory is not dataclasses.MISSING:
+                        return None
 
     raise ImportError(
         f"Cannot find class {class_name!r} with attr {attr_name!r} "
@@ -341,10 +314,24 @@ def check_block(block: SpecBlock, repo_root: Path) -> Iterator[Finding]:
 def run_checks(docs_dir: Path, repo_root: Path) -> Report:
     report = Report()
     if not docs_dir.is_dir():
+        report.findings.append(
+            Finding(
+                rule="spec_values.docs_dir_present",
+                severity="error",
+                file=str(docs_dir),
+                line=0,
+                target="<docs>",
+                evidence="docs directory not found",
+                detail="G2 cannot validate spec-values annotations because docs/ is missing.",
+            )
+        )
         return report
 
     for md_file in sorted(docs_dir.glob("*.md")):
-        text = md_file.read_text(encoding="utf-8")
+        try:
+            text = md_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
         try:
             rel_path = str(md_file.relative_to(repo_root))
         except ValueError:

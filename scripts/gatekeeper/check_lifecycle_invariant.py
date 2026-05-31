@@ -54,8 +54,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import io
 import json
 import sys
+import tokenize
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -63,6 +65,7 @@ from typing import Iterator, Sequence
 # Marker that a function explicitly delegates cleanup responsibility to
 # its caller.  Functions carrying this comment are exempt from G4.2.
 _CALLER_RESPONSIBILITY_MARKER = "CLEANUP: caller-responsibility"
+_TRY_NODES = (ast.Try, ast.TryStar)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +202,7 @@ def _source_snippet(source_lines: list[str], node: ast.AST) -> str:
 
 
 def _check_library_start_pod(
-    func_def: ast.FunctionDef,
+    func_def: ast.FunctionDef | ast.AsyncFunctionDef,
     source_lines: list[str],
     rel_path: str,
 ) -> Iterator[Finding]:
@@ -232,7 +235,7 @@ def _check_library_start_pod(
         return False
 
     for node in _iter_body_in_scope(func_def.body):
-        if not isinstance(node, ast.Try):
+        if not isinstance(node, _TRY_NODES):
             continue
         # Does the body of this Try call _wait_for_healthy (scope-respecting)?
         has_wait = any(_is_wait_call(n) for n in _iter_body_in_scope(node.body))
@@ -278,23 +281,39 @@ def _body_has_caller_responsibility_marker(
     func_def: ast.FunctionDef | ast.AsyncFunctionDef,
     source_lines: list[str],
 ) -> bool:
-    """Return True if the function body source contains the marker comment.
+    """Return True if the function source contains the marker comment.
 
     Comments are not AST nodes, so we scan the raw source lines from the
-    function's first line (inclusive) to the last statement's end_lineno.
-    This ensures we catch ``# CLEANUP: caller-responsibility`` comments
-    that appear before the first statement.
+    function's first line through one line after its AST extent. Only actual
+    comments count; marker text inside string literals is ignored.
     """
     body = func_def.body
     if not body:
         return False
-    # Start from the function definition line itself (+1 because lineno is 1-indexed)
-    # to catch comments between the def line and first statement.
-    first_line = func_def.lineno  # 0-indexed in the list (lineno is 1-indexed)
-    last_stmt = body[-1]
-    last_line = getattr(last_stmt, "end_lineno", last_stmt.lineno)  # type: ignore[attr-defined]
+    first_line = func_def.lineno - 1
+    end_lineno = getattr(func_def, "end_lineno", None)
+    if end_lineno is None:
+        last_stmt = body[-1]
+        end_lineno = getattr(last_stmt, "end_lineno", last_stmt.lineno)
+    last_line = min(len(source_lines), end_lineno)
+    trailing_index = end_lineno
+    if trailing_index < len(source_lines):
+        trailing_line = source_lines[trailing_index]
+        if (
+            trailing_line.lstrip().startswith("#")
+            and len(trailing_line) - len(trailing_line.lstrip()) > func_def.col_offset
+        ):
+            last_line = trailing_index + 1
     snippet = "\n".join(source_lines[first_line:last_line])
-    return _CALLER_RESPONSIBILITY_MARKER in snippet
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(snippet).readline)
+        return any(
+            token.type == tokenize.COMMENT
+            and _CALLER_RESPONSIBILITY_MARKER in token.string
+            for token in tokens
+        )
+    except tokenize.TokenError:
+        return False
 
 
 def _check_caller_function(
@@ -312,45 +331,51 @@ def _check_caller_function(
     # part of this caller's reachable code (codex P2 on PR #132).
     if not _contains_start_pod(func_def.body):
         return
-
-    # Check for caller-responsibility marker
-    if _body_has_caller_responsibility_marker(func_def, source_lines):
-        return
-
-    # Check for stop_pod in any except-handler or finally block that
-    # covers a start_pod call.
-    # Strategy: walk the Try nodes (scope-respecting). For each Try node
-    # whose body contains start_pod, check if any handler or the
-    # finalbody has stop_pod (also scope-respecting).
-    cleanup_covered = False
-    for node in _iter_body_in_scope(func_def.body):
-        if isinstance(node, ast.Try):
-            if _contains_start_pod(node.body):
-                for handler in node.handlers:
-                    if _contains_stop_pod(handler.body):
-                        cleanup_covered = True
-                        break
-                if not cleanup_covered and node.finalbody:
-                    if _contains_stop_pod(node.finalbody):
-                        cleanup_covered = True
-
-    # Also accept: stop_pod called after start_pod unconditionally
-    # (the start_pod call raises on failure, so the caller never reaches
-    # stop_pod on the failure path — this is only safe if the library
-    # guarantees internal cleanup, which is true post-#125).
-    # We mark this as clean if the function ALSO has stop_pod somewhere
-    # in the same scope (the happy-path cleanup).
-    has_stop_anywhere = _contains_stop_pod(func_def.body)
-
-    if cleanup_covered or has_stop_anywhere:
-        return
-
-    # Start_pod called but no stop_pod reachable anywhere in the function
     start_lines = [
         n.lineno
         for n in _iter_body_in_scope(func_def.body)
         if _is_start_pod_call(n) and hasattr(n, "lineno")
     ]
+
+    # Check for caller-responsibility marker
+    if _body_has_caller_responsibility_marker(func_def, source_lines):
+        return
+
+    # Check each start_pod occurrence independently. One covered start_pod
+    # must not hide a later unpaired start_pod in the same function.
+    covered_start_lines: set[int] = set()
+    for node in _iter_body_in_scope(func_def.body):
+        if isinstance(node, _TRY_NODES):
+            cleanup_lines: list[int] = []
+            for handler in node.handlers:
+                cleanup_lines.extend(
+                    n.lineno
+                    for n in _iter_body_in_scope(handler.body)
+                    if _is_stop_pod_call(n) and hasattr(n, "lineno")
+                )
+            cleanup_lines.extend(
+                n.lineno
+                for n in _iter_body_in_scope(node.finalbody)
+                if _is_stop_pod_call(n) and hasattr(n, "lineno")
+            )
+            if not cleanup_lines:
+                continue
+            if _contains_start_pod(node.body):
+                covered_start_lines.update(
+                    n.lineno
+                    for n in _iter_body_in_scope(node.body)
+                    if _is_start_pod_call(n) and hasattr(n, "lineno")
+                )
+            elif node.finalbody and cleanup_lines:
+                try_line = getattr(node, "lineno", 0)
+                covered_start_lines.update(
+                    start_line for start_line in start_lines if start_line < try_line
+                )
+
+    if set(start_lines) <= covered_start_lines:
+        return
+
+    # Start_pod called but no stop_pod reachable anywhere in the function
     yield Finding(
         rule="lifecycle_invariant.caller_start_pod_paired",
         severity="error",
@@ -360,10 +385,12 @@ def _check_caller_function(
         evidence=f"start_pod at line(s) {start_lines}; no stop_pod found",
         detail=(
             f"Function {func_def.name!r} (line {func_def.lineno}) calls "
-            f"start_pod but has no stop_pod call anywhere in the function body. "
+            f"start_pod but has no stop_pod call in an except/finally block "
+            f"covering that call. "
             f"An orphan Pod may be left running if start_pod raises after "
             f"creating the Pod.  Fix: add stop_pod in an except/finally block, "
-            f"rely on the library's built-in cleanup (post-#125 contract), or "
+            f"rely on the library's built-in cleanup only for exceptions raised "
+            f"inside start_pod itself, or "
             f"add '# CLEANUP: caller-responsibility' if cleanup is delegated."
         ),
     )
@@ -396,15 +423,46 @@ def _check_file_g41(
 
     source_lines = source.splitlines()
 
+    found_class = False
+    found_start_pod = False
     # Walk the AST looking for ManageRunPodLifecycle class → start_pod method
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef):
             continue
         if node.name != "ManageRunPodLifecycle":
             continue
+        found_class = True
         for item in node.body:
-            if isinstance(item, ast.FunctionDef) and item.name == "start_pod":
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "start_pod":
+                found_start_pod = True
                 yield from _check_library_start_pod(item, source_lines, rel_path)
+    if not found_class:
+        yield Finding(
+            rule="lifecycle_invariant.library_start_pod_has_cleanup",
+            severity="error",
+            file=rel_path,
+            line=0,
+            function="ManageRunPodLifecycle",
+            evidence="class ManageRunPodLifecycle not found",
+            detail=(
+                "G4.1 cannot enforce the RunPod cleanup invariant because "
+                "src/yomotsusaka/runpod_lifecycle.py no longer defines "
+                "ManageRunPodLifecycle."
+            ),
+        )
+    elif not found_start_pod:
+        yield Finding(
+            rule="lifecycle_invariant.library_start_pod_has_cleanup",
+            severity="error",
+            file=rel_path,
+            line=0,
+            function="ManageRunPodLifecycle.start_pod",
+            evidence="start_pod method not found",
+            detail=(
+                "G4.1 cannot enforce the RunPod cleanup invariant because "
+                "ManageRunPodLifecycle no longer defines start_pod."
+            ),
+        )
 
 
 def _check_file_g42(path: Path, repo_root: Path) -> Iterator[Finding]:
@@ -457,11 +515,26 @@ def _collect_files(repo_root: Path) -> list[Path]:
 def run_checks(repo_root: Path) -> Report:
     report = Report()
     lifecycle_file = repo_root / "src" / "yomotsusaka" / "runpod_lifecycle.py"
+    if not lifecycle_file.exists():
+        report.findings.append(
+            Finding(
+                rule="lifecycle_invariant.library_start_pod_has_cleanup",
+                severity="error",
+                file=str(lifecycle_file.relative_to(repo_root)),
+                line=0,
+                function="ManageRunPodLifecycle.start_pod",
+                evidence="runpod_lifecycle.py not found",
+                detail=(
+                    "G4.1 cannot enforce the RunPod cleanup invariant because "
+                    "src/yomotsusaka/runpod_lifecycle.py is missing."
+                ),
+            )
+        )
     for path in _collect_files(repo_root):
-        report.files_scanned += 1
         try:
             report.findings.extend(_check_file_g41(path, repo_root, lifecycle_file))
             report.findings.extend(_check_file_g42(path, repo_root))
+            report.files_scanned += 1
         except OSError:
             pass
     return report

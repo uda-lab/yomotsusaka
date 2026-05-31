@@ -62,6 +62,14 @@ def main() -> None:
     for script_name, extra_args, continue_on_error in _CHECKS:
         script_path = _REPO_ROOT / "scripts" / "gatekeeper" / script_name
         print(f"\n--- {script_name} ---", flush=True)
+        if not script_path.exists():
+            message = f"{script_name} [missing: {script_path}]"
+            if continue_on_error:
+                advisory.append(f"{message} (advisory)")
+            else:
+                failures.append(message)
+            print(f"missing gatekeeper script: {script_path}", flush=True)
+            continue
         result = subprocess.run(
             [sys.executable, str(script_path), *extra_args],
             cwd=str(_REPO_ROOT),

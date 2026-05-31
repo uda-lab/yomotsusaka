@@ -111,8 +111,24 @@ class ManageRunPodLifecycle:
     assert findings == []
 
 
-def test_g41_skips_non_manage_class(tmp_path: Path) -> None:
-    """G4.1 only checks ManageRunPodLifecycle, not other classes."""
+def test_g41_async_start_pod_checked(tmp_path: Path) -> None:
+    """An async ManageRunPodLifecycle.start_pod is still subject to G4.1."""
+    source = """\
+class ManageRunPodLifecycle:
+    async def start_pod(self, config=None):
+        handle = self._create_pod()
+        try:
+            await self._wait_for_healthy(handle)
+        except PodUnavailableError:
+            raise
+        return handle
+"""
+    findings = _parse_and_check_g41(source, tmp_path)
+    assert any(f.rule == "lifecycle_invariant.library_start_pod_has_cleanup" for f in findings)
+
+
+def test_g41_missing_manage_class_fires(tmp_path: Path) -> None:
+    """G4.1 fails closed if runpod_lifecycle.py loses ManageRunPodLifecycle."""
     source = """\
 class MockRunPodLifecycle:
     def start_pod(self, config=None):
@@ -123,8 +139,11 @@ class MockRunPodLifecycle:
         return handle
 """
     findings = _parse_and_check_g41(source, tmp_path)
-    # G4.1 does not fire for MockRunPodLifecycle
-    assert all(f.rule != "lifecycle_invariant.library_start_pod_has_cleanup" for f in findings)
+    assert any(
+        f.rule == "lifecycle_invariant.library_start_pod_has_cleanup"
+        and "not found" in f.evidence
+        for f in findings
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +215,51 @@ def run_lifecycle(lifecycle, config):
     assert findings == []
 
 
+def test_g42_caller_responsibility_marker_on_def_line_exempts(tmp_path: Path) -> None:
+    source = """\
+def run_lifecycle(lifecycle, config):  # CLEANUP: caller-responsibility
+    handle = lifecycle.start_pod(config)
+    return handle
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert findings == []
+
+
+def test_g42_caller_responsibility_marker_trailing_comment_exempts(tmp_path: Path) -> None:
+    source = """\
+def run_lifecycle(lifecycle, config):
+    handle = lifecycle.start_pod(config)
+    return handle
+    # CLEANUP: caller-responsibility
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert findings == []
+
+
+def test_g42_caller_responsibility_marker_after_function_does_not_exempt(tmp_path: Path) -> None:
+    source = """\
+def run_lifecycle(lifecycle, config):
+    handle = lifecycle.start_pod(config)
+    return handle
+# CLEANUP: caller-responsibility
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert len(findings) == 1
+    assert findings[0].rule == "lifecycle_invariant.caller_start_pod_paired"
+
+
+def test_g42_marker_text_inside_string_does_not_exempt(tmp_path: Path) -> None:
+    source = """\
+def run_lifecycle(lifecycle, config):
+    note = "CLEANUP: caller-responsibility"
+    handle = lifecycle.start_pod(config)
+    return handle
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert len(findings) == 1
+    assert findings[0].rule == "lifecycle_invariant.caller_start_pod_paired"
+
+
 def test_g42_start_pod_method_itself_skipped(tmp_path: Path) -> None:
     """The start_pod method itself is exempt from G4.2 (it IS the implementation)."""
     source = """\
@@ -224,6 +288,34 @@ def run_lifecycle(lifecycle, config):
 """
     findings = _parse_and_check_g42(source, tmp_path)
     assert findings == []
+
+
+def test_g42_unrelated_stop_pod_does_not_satisfy_pairing(tmp_path: Path) -> None:
+    source = """\
+def run_lifecycle(lifecycle, config, old_handle):
+    lifecycle.stop_pod(old_handle, terminate=True)
+    handle = lifecycle.start_pod(config)
+    return handle
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert len(findings) == 1
+    assert findings[0].rule == "lifecycle_invariant.caller_start_pod_paired"
+
+
+def test_g42_second_uncovered_start_pod_still_fires(tmp_path: Path) -> None:
+    source = """\
+def run_lifecycle(lifecycle, config1, config2):
+    try:
+        first = lifecycle.start_pod(config1)
+    except Exception:
+        lifecycle.stop_pod(first, terminate=True)
+        raise
+    second = lifecycle.start_pod(config2)
+    return second
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert len(findings) == 1
+    assert findings[0].rule == "lifecycle_invariant.caller_start_pod_paired"
 
 
 # ---------------------------------------------------------------------------
