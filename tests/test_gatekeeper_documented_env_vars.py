@@ -121,6 +121,20 @@ def test_build_source_env_lookup_finds_imported_getenv(tmp_path: Path) -> None:
     assert "RUNPOD_API_KEY" in result
 
 
+def test_build_source_env_lookup_finds_imported_getenv_alias(tmp_path: Path) -> None:
+    py = tmp_path / "mod.py"
+    py.write_text('from os import getenv as env_get\nvalue = env_get("RUNPOD_API_KEY")\n')
+    result = _mod._build_source_env_lookup([py])
+    assert "RUNPOD_API_KEY" in result
+
+
+def test_build_source_env_lookup_ignores_unimported_getenv_name(tmp_path: Path) -> None:
+    py = tmp_path / "mod.py"
+    py.write_text('def getenv(name):\n    return None\nvalue = getenv("RUNPOD_API_KEY")\n')
+    result = _mod._build_source_env_lookup([py])
+    assert "RUNPOD_API_KEY" not in result
+
+
 def test_build_source_env_lookup_finds_module_constant_name(tmp_path: Path) -> None:
     py = tmp_path / "mod.py"
     py.write_text('import os\nRUNPOD_VAR = "RUNPOD_API_KEY"\nvalue = os.getenv(RUNPOD_VAR)\n')

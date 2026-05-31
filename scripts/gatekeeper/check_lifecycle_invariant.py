@@ -295,7 +295,15 @@ def _body_has_caller_responsibility_marker(
     if end_lineno is None:
         last_stmt = body[-1]
         end_lineno = getattr(last_stmt, "end_lineno", last_stmt.lineno)
-    last_line = min(len(source_lines), end_lineno + 1)
+    last_line = min(len(source_lines), end_lineno)
+    trailing_index = end_lineno
+    if trailing_index < len(source_lines):
+        trailing_line = source_lines[trailing_index]
+        if (
+            trailing_line.lstrip().startswith("#")
+            and len(trailing_line) - len(trailing_line.lstrip()) > func_def.col_offset
+        ):
+            last_line = trailing_index + 1
     snippet = "\n".join(source_lines[first_line:last_line])
     try:
         tokens = tokenize.generate_tokens(io.StringIO(snippet).readline)
@@ -333,30 +341,38 @@ def _check_caller_function(
     if _body_has_caller_responsibility_marker(func_def, source_lines):
         return
 
-    # Check for stop_pod in any except-handler or finally block that
-    # covers a start_pod call.
-    # Strategy: walk the Try nodes (scope-respecting). For each Try node
-    # whose body contains start_pod, check if any handler or the
-    # finalbody has stop_pod (also scope-respecting).
-    cleanup_covered = False
+    # Check each start_pod occurrence independently. One covered start_pod
+    # must not hide a later unpaired start_pod in the same function.
+    covered_start_lines: set[int] = set()
     for node in _iter_body_in_scope(func_def.body):
         if isinstance(node, _TRY_NODES):
+            cleanup_lines: list[int] = []
+            for handler in node.handlers:
+                cleanup_lines.extend(
+                    n.lineno
+                    for n in _iter_body_in_scope(handler.body)
+                    if _is_stop_pod_call(n) and hasattr(n, "lineno")
+                )
+            cleanup_lines.extend(
+                n.lineno
+                for n in _iter_body_in_scope(node.finalbody)
+                if _is_stop_pod_call(n) and hasattr(n, "lineno")
+            )
+            if not cleanup_lines:
+                continue
             if _contains_start_pod(node.body):
-                this_try_covered = False
-                for handler in node.handlers:
-                    if _contains_stop_pod(handler.body):
-                        this_try_covered = True
-                        break
-                if not this_try_covered and node.finalbody:
-                    if _contains_stop_pod(node.finalbody):
-                        this_try_covered = True
-                cleanup_covered = cleanup_covered or this_try_covered
-            elif node.finalbody and _contains_stop_pod(node.finalbody):
+                covered_start_lines.update(
+                    n.lineno
+                    for n in _iter_body_in_scope(node.body)
+                    if _is_start_pod_call(n) and hasattr(n, "lineno")
+                )
+            elif node.finalbody and cleanup_lines:
                 try_line = getattr(node, "lineno", 0)
-                if any(start_line < try_line for start_line in start_lines):
-                    cleanup_covered = True
+                covered_start_lines.update(
+                    start_line for start_line in start_lines if start_line < try_line
+                )
 
-    if cleanup_covered:
+    if set(start_lines) <= covered_start_lines:
         return
 
     # Start_pod called but no stop_pod reachable anywhere in the function

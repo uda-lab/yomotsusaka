@@ -166,6 +166,17 @@ def _build_source_env_lookup(src_paths: list[Path]) -> set[str]:
                 continue
             if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
                 literal_names[node.targets[0].id] = node.value.value
+        os_environ_names: set[str] = set()
+        os_getenv_names: set[str] = set()
+        for node in tree.body:
+            if not isinstance(node, ast.ImportFrom) or node.module != "os":
+                continue
+            for alias in node.names:
+                local_name = alias.asname or alias.name
+                if alias.name == "environ":
+                    os_environ_names.add(local_name)
+                elif alias.name == "getenv":
+                    os_getenv_names.add(local_name)
 
         def _env_name(arg: ast.AST) -> str | None:
             if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
@@ -200,11 +211,11 @@ def _build_source_env_lookup(src_paths: list[Path]) -> set[str]:
                     isinstance(func, ast.Attribute)
                     and func.attr == "get"
                     and isinstance(func.value, ast.Name)
-                    and func.value.id == "environ"
+                    and func.value.id in os_environ_names
                     and node.args
                 ):
                     var = _env_name(node.args[0])
-                elif isinstance(func, ast.Name) and func.id == "getenv" and node.args:
+                elif isinstance(func, ast.Name) and func.id in os_getenv_names and node.args:
                     var = _env_name(node.args[0])
                 if var and re.match(r"^[A-Z][A-Z0-9_]+$", var):
                     referenced.add(var)

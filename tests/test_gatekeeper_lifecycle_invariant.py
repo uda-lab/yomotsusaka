@@ -236,6 +236,18 @@ def run_lifecycle(lifecycle, config):
     assert findings == []
 
 
+def test_g42_caller_responsibility_marker_after_function_does_not_exempt(tmp_path: Path) -> None:
+    source = """\
+def run_lifecycle(lifecycle, config):
+    handle = lifecycle.start_pod(config)
+    return handle
+# CLEANUP: caller-responsibility
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert len(findings) == 1
+    assert findings[0].rule == "lifecycle_invariant.caller_start_pod_paired"
+
+
 def test_g42_marker_text_inside_string_does_not_exempt(tmp_path: Path) -> None:
     source = """\
 def run_lifecycle(lifecycle, config):
@@ -284,6 +296,22 @@ def run_lifecycle(lifecycle, config, old_handle):
     lifecycle.stop_pod(old_handle, terminate=True)
     handle = lifecycle.start_pod(config)
     return handle
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert len(findings) == 1
+    assert findings[0].rule == "lifecycle_invariant.caller_start_pod_paired"
+
+
+def test_g42_second_uncovered_start_pod_still_fires(tmp_path: Path) -> None:
+    source = """\
+def run_lifecycle(lifecycle, config1, config2):
+    try:
+        first = lifecycle.start_pod(config1)
+    except Exception:
+        lifecycle.stop_pod(first, terminate=True)
+        raise
+    second = lifecycle.start_pod(config2)
+    return second
 """
     findings = _parse_and_check_g42(source, tmp_path)
     assert len(findings) == 1
