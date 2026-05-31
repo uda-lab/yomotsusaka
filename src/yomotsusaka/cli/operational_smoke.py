@@ -82,6 +82,7 @@ Exit codes
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -593,24 +594,31 @@ def _phase_runpod_lifecycle(
             return _STATUS_FAIL, _CAT_FAIL_RUNPOD_WAIT_TIMEOUT_CLEANUP_FAILED
         return _STATUS_FAIL, _CAT_FAIL_RUNPOD_CREATE
 
-    if keep_pod:
-        # The Pod was created but the caller asked to keep it; this is
-        # ``ok`` for the scenario (the agent successfully drove the
-        # lifecycle through the wait phase) but downgrades the final
-        # result to ``completed_with_warnings`` so the owner knows the
-        # Pod is still running and bills.
-        return _STATUS_WARN, _CAT_KEPT_RUNPOD
-
+    cleanup_attempted = False
     try:
-        lifecycle.stop_pod(handle, terminate=True)
-    except PodUnavailableError:
-        # Cleanup failed: the Pod exists but we could not delete it.
-        # The result-synthesis function below maps this to
-        # ``failed_owner_action`` so the agent caller knows manual
-        # cleanup is required.
-        return _STATUS_FAIL, _CAT_FAIL_RUNPOD_CLEANUP
+        if keep_pod:
+            # The Pod was created but the caller asked to keep it; this is
+            # ``ok`` for the scenario (the agent successfully drove the
+            # lifecycle through the wait phase) but downgrades the final
+            # result to ``completed_with_warnings`` so the owner knows the
+            # Pod is still running and bills.
+            return _STATUS_WARN, _CAT_KEPT_RUNPOD
 
-    return _STATUS_OK, _CAT_OK_RUNPOD
+        cleanup_attempted = True
+        try:
+            lifecycle.stop_pod(handle, terminate=True)
+        except PodUnavailableError:
+            # Cleanup failed: the Pod exists but we could not delete it.
+            # The result-synthesis function below maps this to
+            # ``failed_owner_action`` so the agent caller knows manual
+            # cleanup is required.
+            return _STATUS_FAIL, _CAT_FAIL_RUNPOD_CLEANUP
+
+        return _STATUS_OK, _CAT_OK_RUNPOD
+    finally:
+        if not keep_pod and not cleanup_attempted:
+            with contextlib.suppress(PodUnavailableError):
+                lifecycle.stop_pod(handle, terminate=True)
 
 
 # ---------------------------------------------------------------------------

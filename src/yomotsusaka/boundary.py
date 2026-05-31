@@ -1190,7 +1190,7 @@ def restoration_request(
     * Unknown artifact (kernel raises "No private data found") →
       :data:`RestorationFailureReason.ArtifactMissing`.
     * Other kernel errors → :data:`RestorationFailureReason.KernelError`.
-      ``detail`` strips ``vault_root`` substrings.
+      ``detail`` uses a canned public-safe message.
     """
     # ---- programmer-error guardrails (raise, never return) ----
     if not isinstance(scope, ResolverScope):
@@ -1387,7 +1387,7 @@ def restoration_request(
             detail = "no private data is committed for this document_id"
         else:
             reason_code = RestorationFailureReason.KernelError
-            detail = _strip_vault_root(msg, effective_vault_root)
+            detail = "kernel raised an error while reading private data"
     except Exception:
         # Any non-RestorationError leak (corrupt JSON, schema drift,
         # OSError mid-read, etc.) is a kernel-side failure. Intentionally

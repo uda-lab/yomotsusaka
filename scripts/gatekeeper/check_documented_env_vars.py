@@ -42,6 +42,7 @@ Invocation::
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import sys
@@ -94,7 +95,7 @@ class Report:
 #   | `RUNPOD_API_KEY` | yes | ... |
 #   | `RUNPOD_TEMPLATE_ID` | optional | ... |
 _TABLE_ROW_RE = re.compile(
-    r"^\s*\|\s*`(?P<var>[A-Z][A-Z0-9_]{2,})`\s*\|(?P<rest>[^|]+\|.*)?$"
+    r"^\s*\|\s*`(?P<var>[A-Z][A-Z0-9_]{2,})`\s*\|(?P<rest>.*?)\s*\|?\s*$"
 )
 
 # Annotation that marks a row as operator-only (not consumed by agent code).
@@ -147,22 +148,77 @@ def _parse_env_var_tables(text: str, rel_path: str) -> list[EnvVarEntry]:
 
 def _build_source_env_lookup(src_paths: list[Path]) -> set[str]:
     """Return the set of env-var names referenced in the scanned source."""
-    # Match os.environ.get("VAR") / os.getenv("VAR") / os.environ["VAR"]
-    # We accept both single and double quotes.
-    _ENV_GET_RE = re.compile(
-        r"""os\.(?:environ\.get|getenv)\(\s*['"](?P<var>[A-Z][A-Z0-9_]+)['"]\s*[,)]"""
-        r"""|os\.environ\[\s*['"](?P<var2>[A-Z][A-Z0-9_]+)['"]\s*\]"""
-    )
     referenced: set[str] = set()
     for path in src_paths:
         try:
             source = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        for m in _ENV_GET_RE.finditer(source):
-            var = m.group("var") or m.group("var2")
-            if var:
-                referenced.add(var)
+        try:
+            tree = ast.parse(source, filename=str(path))
+        except SyntaxError:
+            continue
+        literal_names: dict[str, str] = {}
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                continue
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                literal_names[node.targets[0].id] = node.value.value
+
+        def _env_name(arg: ast.AST) -> str | None:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                return arg.value
+            if isinstance(arg, ast.Name):
+                return literal_names.get(arg.id)
+            return None
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                var: str | None = None
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "get"
+                    and isinstance(func.value, ast.Attribute)
+                    and func.value.attr == "environ"
+                    and isinstance(func.value.value, ast.Name)
+                    and func.value.value.id == "os"
+                    and node.args
+                ):
+                    var = _env_name(node.args[0])
+                elif (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "getenv"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                    and node.args
+                ):
+                    var = _env_name(node.args[0])
+                elif (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "get"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "environ"
+                    and node.args
+                ):
+                    var = _env_name(node.args[0])
+                elif isinstance(func, ast.Name) and func.id == "getenv" and node.args:
+                    var = _env_name(node.args[0])
+                if var and re.match(r"^[A-Z][A-Z0-9_]+$", var):
+                    referenced.add(var)
+            elif isinstance(node, ast.Subscript):
+                value = node.value
+                if (
+                    isinstance(value, ast.Attribute)
+                    and value.attr == "environ"
+                    and isinstance(value.value, ast.Name)
+                    and value.value.id == "os"
+                ):
+                    var = _env_name(node.slice)
+                    if var and re.match(r"^[A-Z][A-Z0-9_]+$", var):
+                        referenced.add(var)
     return referenced
 
 
@@ -174,7 +230,7 @@ def _collect_source_files(repo_root: Path) -> list[Path]:
         files.extend(sorted(src_dir.rglob("*.py")))
     scripts_dir = repo_root / "scripts"
     if scripts_dir.is_dir():
-        for py in sorted(scripts_dir.glob("*.py")):
+        for py in sorted(scripts_dir.rglob("*.py")):
             files.append(py)
     return files
 

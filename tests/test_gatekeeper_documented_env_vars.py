@@ -76,6 +76,13 @@ def test_parse_env_var_tables_operator_only() -> None:
     assert entries[0].operator_only is True
 
 
+def test_parse_env_var_tables_allows_two_column_row_without_trailing_pipe() -> None:
+    text = "| `RUNPOD_TEMPLATE_ID` | optional owner-pinned template"
+    entries = _mod._parse_env_var_tables(text, "docs/test.md")
+    assert len(entries) == 1
+    assert entries[0].var_name == "RUNPOD_TEMPLATE_ID"
+
+
 def test_parse_env_var_tables_empty_doc() -> None:
     entries = _mod._parse_env_var_tables("No tables here.", "docs/test.md")
     assert entries == []
@@ -105,6 +112,27 @@ def test_build_source_env_lookup_finds_environ_bracket(tmp_path: Path) -> None:
     py.write_text('value = os.environ["RUNPOD_API_KEY"]\n')
     result = _mod._build_source_env_lookup([py])
     assert "RUNPOD_API_KEY" in result
+
+
+def test_build_source_env_lookup_finds_imported_getenv(tmp_path: Path) -> None:
+    py = tmp_path / "mod.py"
+    py.write_text('from os import getenv\nvalue = getenv("RUNPOD_API_KEY")\n')
+    result = _mod._build_source_env_lookup([py])
+    assert "RUNPOD_API_KEY" in result
+
+
+def test_build_source_env_lookup_finds_module_constant_name(tmp_path: Path) -> None:
+    py = tmp_path / "mod.py"
+    py.write_text('import os\nRUNPOD_VAR = "RUNPOD_API_KEY"\nvalue = os.getenv(RUNPOD_VAR)\n')
+    result = _mod._build_source_env_lookup([py])
+    assert "RUNPOD_API_KEY" in result
+
+
+def test_build_source_env_lookup_ignores_commented_out_usage(tmp_path: Path) -> None:
+    py = tmp_path / "mod.py"
+    py.write_text('# os.environ.get("RUNPOD_TEMPLATE_ID")\n')
+    result = _mod._build_source_env_lookup([py])
+    assert "RUNPOD_TEMPLATE_ID" not in result
 
 
 def test_build_source_env_lookup_excludes_unwired_var(tmp_path: Path) -> None:

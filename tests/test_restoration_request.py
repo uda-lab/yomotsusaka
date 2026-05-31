@@ -505,8 +505,9 @@ def test_kernel_error_strips_vault_root_from_detail(
     assert resp.reason is RestorationFailureReason.KernelError
     assert resp.detail is not None
     assert str(vault_root) not in resp.detail
-    # The placeholder should appear instead.
-    assert "<vault_root>" in resp.detail
+    # Kernel RestorationError details are public-surface data, so the boundary
+    # must not echo even scrubbed kernel text.
+    assert resp.detail == "kernel raised an error while reading private data"
 
     # Kernel-error path also writes a corrective audit record sharing the
     # intent's audit_record_id. Consumers must reconcile by taking the last
