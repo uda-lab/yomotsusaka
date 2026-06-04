@@ -91,7 +91,6 @@ def _valid_request_kwargs() -> dict[str, object]:
     return {
         "job_name": "summarise_private_minutes",
         "purpose": "weekly-review",
-        "scope": ExecutionScope.PRIVATE_BOUNDARY,
         "inputs": {"target_handle": "private://agent_redacted/manifest/doc-001"},
     }
 
@@ -100,7 +99,6 @@ def test_execution_request_constructs_with_valid_kwargs() -> None:
     req = ExecutionRequest(**_valid_request_kwargs())
     assert req.job_name == "summarise_private_minutes"
     assert req.purpose == "weekly-review"
-    assert req.scope is ExecutionScope.PRIVATE_BOUNDARY
     assert req.inputs == {
         "target_handle": "private://agent_redacted/manifest/doc-001"
     }
@@ -144,11 +142,12 @@ def test_execution_request_rejects_blank_purpose(blank: str) -> None:
         ExecutionRequest(**kwargs)
 
 
-def test_execution_request_requires_execution_scope_enum() -> None:
-    """The ``scope`` field must reject arbitrary strings that do not match
-    an :class:`ExecutionScope` member."""
+def test_execution_request_rejects_scope_field() -> None:
+    """``extra="forbid"`` must reject any attempt to pass ``scope=`` to
+    :class:`ExecutionRequest` — an agent cannot self-declare a privileged
+    scope through the request body (security regression marker for #145)."""
     kwargs = _valid_request_kwargs()
-    kwargs["scope"] = "not-a-scope"
+    kwargs["scope"] = ExecutionScope.PRIVATE_BOUNDARY
     with pytest.raises(ValidationError):
         ExecutionRequest(**kwargs)
 
@@ -394,9 +393,9 @@ def test_execute_request_success_summarise(tmp_path: Path) -> None:
         ExecutionRequest(
             job_name="summarise_private_minutes",
             purpose="weekly-review",
-            scope=ExecutionScope.PRIVATE_BOUNDARY,
             inputs={"target_handle": handle.locator},
         ),
+        scope=ExecutionScope.PRIVATE_BOUNDARY,
         vault_root=vault,
     )
 
@@ -429,9 +428,9 @@ def test_execute_request_success_letter(tmp_path: Path) -> None:
         ExecutionRequest(
             job_name="generate_letter_from_private_template",
             purpose="letter-generation",
-            scope=ExecutionScope.PRIVATE_BOUNDARY,
             inputs={"target_handle": handle.locator, "template_body": body},
         ),
+        scope=ExecutionScope.PRIVATE_BOUNDARY,
         vault_root=vault,
     )
 
@@ -495,7 +494,11 @@ def test_failure_schema_invalid(tmp_path: Path, caplog: pytest.LogCaptureFixture
 
     with caplog.at_level(logging.INFO, logger="yomotsusaka"):
         # Passing a non-ExecutionRequest object trips the SchemaInvalid branch.
-        response = execute_request({"not_a_request": True}, vault_root=vault)
+        response = execute_request(
+            {"not_a_request": True},
+            scope=ExecutionScope.ORDINARY_AGENT,
+            vault_root=vault,
+        )
 
     _assert_failure_contract(
         response,
@@ -515,9 +518,9 @@ def test_failure_template_not_found(
             ExecutionRequest(
                 job_name="no_such_template",
                 purpose="lookup-test",
-                scope=ExecutionScope.PRIVATE_BOUNDARY,
                 inputs={"target_handle": handle.locator},
             ),
+            scope=ExecutionScope.PRIVATE_BOUNDARY,
             vault_root=vault,
         )
     _assert_failure_contract(
@@ -538,9 +541,9 @@ def test_failure_scope_denied(
             ExecutionRequest(
                 job_name="summarise_private_minutes",
                 purpose="scope-test",
-                scope=ExecutionScope.ORDINARY_AGENT,  # template requires PRIVATE_BOUNDARY
                 inputs={"target_handle": handle.locator},
             ),
+            scope=ExecutionScope.ORDINARY_AGENT,  # template requires PRIVATE_BOUNDARY
             vault_root=vault,
         )
     _assert_failure_contract(
@@ -562,9 +565,9 @@ def test_failure_schema_invalid_missing_target_handle(
             ExecutionRequest(
                 job_name="summarise_private_minutes",
                 purpose="missing-handle-test",
-                scope=ExecutionScope.PRIVATE_BOUNDARY,
                 inputs={},  # no target_handle
             ),
+            scope=ExecutionScope.PRIVATE_BOUNDARY,
             vault_root=vault,
         )
     _assert_failure_contract(
@@ -592,11 +595,10 @@ def test_failure_purpose_not_permitted(
     bad_request = ExecutionRequest.model_construct(
         job_name="summarise_private_minutes",
         purpose="   ",
-        scope=ExecutionScope.PRIVATE_BOUNDARY,
         inputs={"target_handle": handle.locator},
     )
     with caplog.at_level(logging.INFO, logger="yomotsusaka"):
-        response = execute_request(bad_request, vault_root=vault)
+        response = execute_request(bad_request, scope=ExecutionScope.PRIVATE_BOUNDARY, vault_root=vault)
     _assert_failure_contract(
         response,
         ExecutionFailureReason.PurposeNotPermitted,
@@ -621,9 +623,9 @@ def test_failure_artifact_missing_for_uncommitted_locator(
             ExecutionRequest(
                 job_name="summarise_private_minutes",
                 purpose="missing-artifact-test",
-                scope=ExecutionScope.PRIVATE_BOUNDARY,
                 inputs={"target_handle": never_committed},
             ),
+            scope=ExecutionScope.PRIVATE_BOUNDARY,
             vault_root=vault,
         )
     _assert_failure_contract(
@@ -664,9 +666,9 @@ def test_failure_template_raised(
             ExecutionRequest(
                 job_name="summarise_private_minutes",
                 purpose="raise-test",
-                scope=ExecutionScope.PRIVATE_BOUNDARY,
                 inputs={"target_handle": handle.locator},
             ),
+            scope=ExecutionScope.PRIVATE_BOUNDARY,
             vault_root=vault,
         )
     _assert_failure_contract(
@@ -758,9 +760,9 @@ def test_failure_scrub_failed(
             ExecutionRequest(
                 job_name="summarise_private_minutes",
                 purpose="scrub-test",
-                scope=ExecutionScope.PRIVATE_BOUNDARY,
                 inputs={"target_handle": handle.locator},
             ),
+            scope=ExecutionScope.PRIVATE_BOUNDARY,
             vault_root=vault,
         )
     _assert_failure_contract(
@@ -895,7 +897,11 @@ def test_audit_write_failure_on_schema_invalid_request(
     _force_audit_write_failure(monkeypatch, kind=kind)
 
     with caplog.at_level(logging.INFO, logger="yomotsusaka"):
-        response = execute_request({"not_a_request": True}, vault_root=vault)
+        response = execute_request(
+            {"not_a_request": True},
+            scope=ExecutionScope.ORDINARY_AGENT,
+            vault_root=vault,
+        )
 
     _assert_audit_write_failed_contract(
         response,
@@ -924,9 +930,9 @@ def test_audit_write_failure_on_scope_denied_request(
             ExecutionRequest(
                 job_name="summarise_private_minutes",
                 purpose="scope-test",
-                scope=ExecutionScope.ORDINARY_AGENT,
                 inputs={"target_handle": handle.locator},
             ),
+            scope=ExecutionScope.ORDINARY_AGENT,
             vault_root=vault,
         )
 
@@ -956,9 +962,9 @@ def test_audit_write_failure_on_template_not_found(
             ExecutionRequest(
                 job_name="no_such_template",
                 purpose="lookup-test",
-                scope=ExecutionScope.PRIVATE_BOUNDARY,
                 inputs={"target_handle": handle.locator},
             ),
+            scope=ExecutionScope.PRIVATE_BOUNDARY,
             vault_root=vault,
         )
 
@@ -1007,9 +1013,9 @@ def test_audit_write_failure_on_template_raised(
             ExecutionRequest(
                 job_name="summarise_private_minutes",
                 purpose="raise-test",
-                scope=ExecutionScope.PRIVATE_BOUNDARY,
                 inputs={"target_handle": handle.locator},
             ),
+            scope=ExecutionScope.PRIVATE_BOUNDARY,
             vault_root=vault,
         )
 
@@ -1049,9 +1055,9 @@ def test_audit_write_failure_on_success_path(
             ExecutionRequest(
                 job_name="summarise_private_minutes",
                 purpose="success-audit-fail-test",
-                scope=ExecutionScope.PRIVATE_BOUNDARY,
                 inputs={"target_handle": handle.locator},
             ),
+            scope=ExecutionScope.PRIVATE_BOUNDARY,
             vault_root=vault,
         )
 
@@ -1096,3 +1102,44 @@ def test_restoration_response_still_carries_deferred_value_unchanged() -> None:
     # "deferred" is reserved for the legacy path; the literal type may
     # or may not include it. The structural pin is that #43 did not
     # introduce a new outcome value.
+
+
+# ---------------------------------------------------------------------------
+# Security regression tests for #145: scope as trusted kwarg
+# ---------------------------------------------------------------------------
+
+
+def test_execution_request_rejects_scope_field_security_regression() -> None:
+    """Security regression marker for #145.
+
+    An ordinary agent MUST NOT be able to smuggle a privileged scope
+    through the :class:`ExecutionRequest` body.  ``extra="forbid"`` now
+    enforces this at model-construction time: any attempt to pass
+    ``scope=`` to the constructor raises :class:`pydantic.ValidationError`.
+    """
+    with pytest.raises(ValidationError):
+        ExecutionRequest(
+            job_name="summarise_private_minutes",
+            purpose="security-regression-test",
+            scope=ExecutionScope.PRIVATE_BOUNDARY,
+            inputs={"target_handle": "private://agent_redacted/manifest/x"},
+        )
+
+
+def test_execute_request_requires_scope_kwarg(tmp_path: "Path") -> None:
+    """Calling :func:`boundary.execute_request` without a ``scope=`` kwarg
+    raises :class:`TypeError` (missing required keyword argument).  Scope
+    can never be defaulted or omitted — the call site must explicitly
+    declare the scope, which is the mechanism that pins the privilege ceiling.
+    """
+    from yomotsusaka.boundary import execute_request as _execute_request
+
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True)
+    req = ExecutionRequest(
+        job_name="summarise_private_minutes",
+        purpose="missing-scope-kwarg-test",
+        inputs={"target_handle": "private://agent_redacted/manifest/doc-x"},
+    )
+    with pytest.raises(TypeError):
+        _execute_request(req, vault_root=vault)  # type: ignore[call-arg]

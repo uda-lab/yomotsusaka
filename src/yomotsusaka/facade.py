@@ -201,37 +201,35 @@ class LocalFacade:
     def execute(self, request: ExecutionRequest) -> ExecutionResponse:
         """Delegate to :func:`boundary.execute_request` for the held tenant.
 
-        The facade is hard-wired to ordinary-agent semantics. The incoming
-        :class:`ExecutionRequest`'s ``scope`` field is **always** overridden
-        to :attr:`ExecutionScope.ORDINARY_AGENT` before dispatch, regardless
-        of the value the caller supplied; this is a privilege ceiling, not
-        a default. The dispatcher's scope gate then returns
-        ``status="failed"``, ``reason=ExecutionFailureReason.ScopeDenied``
-        whenever the template's ``min_scope`` exceeds ordinary-agent — and
-        every shipped template requires the narrower scope, so every
-        ordinary-agent caller is denied. One audit row is appended to
-        ``<vault_root>/audit/restoration.jsonl`` per call (including
-        denials), preserving the Chikaeshi audit contract.
+        The facade is hard-wired to ordinary-agent semantics. The privilege
+        ceiling is enforced by passing ``scope=ExecutionScope.ORDINARY_AGENT``
+        as the trusted keyword argument to :func:`~yomotsusaka.boundary.execute_request`
+        — the agent's request body can no longer carry a ``scope`` field at all
+        (``ExecutionRequest`` rejects it with ``pydantic.ValidationError`` due to
+        ``extra="forbid"``). This is structurally stronger than the previous
+        ``model_copy`` override: the request body itself is now incapable of
+        expressing a privileged scope.
+
+        The dispatcher's scope gate returns ``status="failed"``,
+        ``reason=ExecutionFailureReason.ScopeDenied`` whenever the template's
+        ``min_scope`` exceeds ordinary-agent — and every shipped template
+        requires the narrower scope, so every ordinary-agent caller is denied.
+        One audit row is appended to ``<vault_root>/audit/restoration.jsonl``
+        per call (including denials), preserving the Chikaeshi audit contract.
 
         Callers that actually need the narrower scope must invoke
-        :func:`yomotsusaka.boundary.execute_request` directly with an
-        :class:`ExecutionRequest` whose ``scope`` is the narrower value;
-        this facade method MUST NOT widen the caller's scope (the override
-        below pins that invariant in code, mirroring the
-        ``scope=ResolverScope.ORDINARY_AGENT`` kwarg on
+        :func:`yomotsusaka.boundary.execute_request` directly with the
+        appropriate scope value; this facade method MUST NOT pass that value
+        (mirroring the ``scope=ResolverScope.ORDINARY_AGENT`` kwarg on
         :meth:`request_restore`'s call to
-        :func:`yomotsusaka.boundary.restoration_request`).
+        :func:`yomotsusaka.boundary.restoration_request` — the two are now
+        perfectly symmetric).
         """
-        # Pin scope to ordinary-agent — the facade is the ordinary-agent
-        # entry point and MUST NOT forward whatever ``scope`` the caller
-        # supplied (a malicious or buggy caller could otherwise widen
-        # their effective privilege by constructing the request with the
-        # narrower scope value). ``ExecutionRequest`` is frozen, so we
-        # produce a scope-pinned copy.
-        ordinary_request = request.model_copy(
-            update={"scope": ExecutionScope.ORDINARY_AGENT}
+        return execute_request(
+            request,
+            scope=ExecutionScope.ORDINARY_AGENT,
+            tenant=self._tenant,
         )
-        return execute_request(ordinary_request, tenant=self._tenant)
 
     def status_report(
         self, request: StatusReportRequest

@@ -36,7 +36,10 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from yomotsusaka.execution_gateway import ExecutionScope
 
 from pydantic import (
     BaseModel,
@@ -1525,6 +1528,7 @@ def status_report_request(
 def execute_request(
     request: object,
     *,
+    scope: "ExecutionScope",
     tenant: TenantScope | None = None,
     vault_root: Path | None = None,
 ) -> "ExecutionResponse":
@@ -1547,6 +1551,15 @@ def execute_request(
         :class:`yomotsusaka.execution_gateway.ExecutionRequest`. Anything
         else (or a request whose required ``inputs["target_handle"]`` is
         missing/malformed) returns ``ExecutionFailureReason.SchemaInvalid``.
+    scope:
+        Trusted caller scope (:class:`yomotsusaka.execution_gateway.ExecutionScope`).
+        This is a required keyword-only argument supplied by the trusted call
+        site — it is NOT read from the agent-controlled request body (which
+        no longer carries a ``scope`` field). The facade
+        (:meth:`~yomotsusaka.facade.LocalFacade.execute`) pins this to
+        :attr:`~yomotsusaka.execution_gateway.ExecutionScope.ORDINARY_AGENT`,
+        mirroring the ``scope=ResolverScope.ORDINARY_AGENT`` kwarg on
+        :func:`restoration_request`.
     tenant / vault_root:
         Exactly one must be supplied. ``vault_root`` is wrapped via
         :meth:`TenantScope.local`. Cross-tenant locator misses surface
@@ -1574,6 +1587,14 @@ def execute_request(
     )
     from yomotsusaka.scrubber import ScrubError, scrub_stream
     from yomotsusaka.templates import TEMPLATES, TemplateResult
+
+    # Programmer-error guardrail: scope must be a genuine ExecutionScope.
+    # Raises, never returns a failure response, mirroring restoration_request's
+    # isinstance(scope, ResolverScope) guard.
+    if not isinstance(scope, ExecutionScope):
+        raise TypeError(
+            f"scope must be an ExecutionScope; got {type(scope).__name__}"
+        )
 
     effective_tenant = _resolve_tenant(tenant, vault_root)
     effective_vault_root = effective_tenant.vault_root
@@ -1682,7 +1703,7 @@ def execute_request(
         )
 
     template_name = request.job_name
-    caller_scope_value = request.scope.value
+    caller_scope_value = scope.value
     purpose = request.purpose
     locator_input = request.inputs.get("target_handle") if isinstance(request.inputs, dict) else None
     locator = locator_input if isinstance(locator_input, str) else ""
@@ -1709,7 +1730,7 @@ def execute_request(
     # ordinary-agent caller is denied.
     # ------------------------------------------------------------------
     if spec.min_scope is ExecutionScope.PRIVATE_BOUNDARY and (
-        request.scope is not ExecutionScope.PRIVATE_BOUNDARY
+        scope is not ExecutionScope.PRIVATE_BOUNDARY
     ):
         return _emit_failure(
             outcome="scope_denied",

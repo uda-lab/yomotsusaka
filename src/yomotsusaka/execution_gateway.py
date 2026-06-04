@@ -150,6 +150,13 @@ class ExecutionRequest(BaseModel):
     template-supplied opaque payloads (e.g. ``{"target_handle":
     "private://..."}``); the dispatcher in #43 will type-check each
     template's expected schema.
+
+    Scope is intentionally NOT a field on this model. It is supplied
+    out-of-band as the trusted ``scope`` keyword-only argument on
+    :func:`yomotsusaka.boundary.execute_request`, so an agent-controlled
+    request body cannot self-declare a privileged scope. The facade
+    hard-wires the ordinary-agent ceiling by passing
+    ``scope=ExecutionScope.ORDINARY_AGENT`` as that kwarg.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -163,10 +170,6 @@ class ExecutionRequest(BaseModel):
         "Recorded on the audit record for the gateway-mediated restoration. "
         "Empty/whitespace ⇒ the dispatcher returns "
         ":class:`ExecutionFailure` (specification only; not yet enforced).",
-    )
-    scope: ExecutionScope = Field(
-        description="Caller scope. The dispatcher in #43 checks this "
-        "against the template's ``allowed_scopes``.",
     )
     inputs: dict[str, Any] = Field(
         default_factory=dict,

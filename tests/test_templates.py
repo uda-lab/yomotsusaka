@@ -109,7 +109,6 @@ def test_summarise_private_minutes_produces_public_artifact(tmp_path: Path) -> N
     request = ExecutionRequest(
         job_name="summarise_private_minutes",
         purpose="weekly-review",
-        scope=ExecutionScope.PRIVATE_BOUNDARY,
         inputs={"target_handle": handle.locator},
     )
     result = spec.fn(request, private_state, vault)
@@ -133,7 +132,6 @@ def test_summarise_private_minutes_artifact_carries_no_raw_values(
     request = ExecutionRequest(
         job_name="summarise_private_minutes",
         purpose="weekly-review",
-        scope=ExecutionScope.PRIVATE_BOUNDARY,
         inputs={"target_handle": handle.locator},
     )
     result = spec.fn(request, private_state, vault)
@@ -178,7 +176,6 @@ def test_generate_letter_substitutes_then_re_scrubs(tmp_path: Path) -> None:
     request = ExecutionRequest(
         job_name="generate_letter_from_private_template",
         purpose="letter-generation",
-        scope=ExecutionScope.PRIVATE_BOUNDARY,
         inputs={"target_handle": handle.locator, "template_body": body},
     )
     result = spec.fn(request, private_state, vault)
@@ -211,7 +208,6 @@ def test_generate_letter_stdout_carries_no_raw_values(tmp_path: Path) -> None:
     request = ExecutionRequest(
         job_name="generate_letter_from_private_template",
         purpose="letter-stdout-test",
-        scope=ExecutionScope.PRIVATE_BOUNDARY,
         inputs={"target_handle": handle.locator, "template_body": body},
     )
     result = spec.fn(request, private_state, vault)
