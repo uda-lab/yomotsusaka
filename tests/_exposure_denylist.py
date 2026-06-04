@@ -162,7 +162,6 @@ EXPECTED_BOUNDARY_SYMBOLS: frozenset[str] = frozenset(
         "ResolverFailureReason",
         "ResolverScope",
         "ResolverSuccess",
-        "PrivateState",
         "ExecutionResponse",
         "parse_locator",
         "build_locator",
