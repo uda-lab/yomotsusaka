@@ -1338,6 +1338,78 @@ def test_manage_helper_cleanup_failure_surfaces_urgent(
     _assert_no_helper_secret(out.out + "\n" + out.err)
 
 
+def test_manage_helper_emergency_cleanup_failure_escalates_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Issue #144 F2 regression: emergency-cleanup failure must return EXIT_CLEANUP_FAILED.
+
+    When the smoke subprocess raises an unexpected exception (simulating an
+    error that escapes the try block before ``cleanup_attempted`` is set) and
+    the subsequent emergency ``stop_pod`` in the ``finally`` guard also raises
+    ``PodUnavailableError``, ``run_lifecycle`` must:
+
+    (a) return ``EXIT_CLEANUP_FAILED`` (3), not propagate the original
+        exception or return a success/phase-failed code; and
+    (b) still emit the ``cleanup_failed`` category on stdout and write the
+        corresponding JSONL lifecycle row — preserving the urgent signal.
+
+    Prior to the fix the ``finally`` guard caught the ``PodUnavailableError``
+    and emitted all signals, but ``return`` had not yet been reached so the
+    pending original exception propagated instead of yielding exit code 3.
+    """
+    log_path = tmp_path / "lifecycle.jsonl"
+
+    # Fake lifecycle: start_pod succeeds (so we enter the try block), but
+    # stop_pod raises PodUnavailableError to simulate emergency-cleanup failure.
+    class _EmergencyCleanupFakeFails:
+        def __init__(self) -> None:
+            self.stop_calls: list[PodHandle] = []
+
+        def start_pod(self, _config: PodConfig) -> PodHandle:
+            return PodHandle(
+                pod_id="pod-LEAK-SENTINEL-EMERGENCY",
+                endpoint="http://leak-sentinel-emergency.example:8000",
+            )
+
+        def stop_pod(self, handle: PodHandle, *, terminate: bool = True) -> None:
+            self.stop_calls.append(handle)
+            raise PodUnavailableError("cleanup_failed")
+
+    fake = _EmergencyCleanupFakeFails()
+
+    # Smoke runner raises an unexpected exception so that cleanup_attempted
+    # is never set, triggering the finally guard's emergency-cleanup path.
+    def _raising_runner(argv, **kwargs):  # noqa: ANN001
+        raise RuntimeError("unexpected smoke runner error")
+
+    rc = manage_runpod.run_lifecycle(
+        keep_pod=False,
+        pod_config=PodConfig(),
+        lifecycle_factory=lambda: fake,
+        smoke_runner=_raising_runner,
+        lifecycle_log=log_path,
+        env={"RUNPOD_API_KEY": "sk-test"},
+        runpodctl_check=lambda: True,
+    )
+    out = capsys.readouterr()
+
+    # (a) Exit code must escalate to EXIT_CLEANUP_FAILED, not 0 or 1.
+    assert rc == manage_runpod.EXIT_CLEANUP_FAILED, (
+        f"expected EXIT_CLEANUP_FAILED ({manage_runpod.EXIT_CLEANUP_FAILED}); got rc={rc}"
+    )
+
+    # (b) Category signal and JSONL row must still be emitted.
+    assert "lifecycle: cleanup_failed" in out.out, (
+        f"cleanup_failed category missing from stdout: {out.out!r}"
+    )
+    assert "URGENT: manual Pod cleanup required" in out.err
+    rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+    cleanup_rows = [r for r in rows if r["category"] == "cleanup_failed"]
+    assert cleanup_rows, "expected at least one cleanup_failed JSONL row"
+
+
 def test_manage_helper_urgent_line_uses_default_path_when_unspecified(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
