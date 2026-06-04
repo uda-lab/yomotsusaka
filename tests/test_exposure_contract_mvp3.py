@@ -474,10 +474,10 @@ class ContractExecutionRequest:
 
     def _make_request(self, candidate_provider: Any) -> Any:
         request_cls = candidate_provider
-        # Constructor expectations as of #42 (the only landed shape so far):
-        # frozen pydantic model with ``job_name``, ``purpose``, ``scope``,
-        # and optional ``inputs`` dict. Walk a known-safe fixture through
-        # it.
+        # Constructor expectations as of #145 (the landed shape):
+        # frozen pydantic model with ``job_name``, ``purpose``, and optional
+        # ``inputs`` dict. Scope is no longer a request field — it is
+        # supplied out-of-band as a trusted kwarg to ``execute_request``.
         #
         # ``ExecutionScope`` is co-resident in the same module by contract:
         # if ``ExecutionRequest`` activates (i.e., is non-stub), then
@@ -493,12 +493,9 @@ class ContractExecutionRequest:
         # something non-vacuous to validate.
         from pydantic import ValidationError as PydanticValidationError
 
-        from yomotsusaka.execution_gateway import ExecutionScope
-
         kwargs: dict[str, Any] = {
             "job_name": "exposure-contract-fixture-job",
             "purpose": "exposure-contract-fixture-purpose",
-            "scope": ExecutionScope.ORDINARY_AGENT,
             "inputs": {
                 "target_handle": "private://agent_redacted/manifest/fixture-doc-001",
             },
@@ -511,7 +508,7 @@ class ContractExecutionRequest:
             # backend PR must supply a richer fixture.
             pytest.skip(
                 "ExecutionRequest candidate constructor signature differs "
-                "from the #42 shape; backend PR must supply a richer fixture"
+                "from the #145 shape; backend PR must supply a richer fixture"
             )
         except PydanticValidationError:
             # The known-safe fixture failed model validation. The contract
@@ -900,10 +897,9 @@ def _build_canonical_execution_response(
         request = ExecutionRequest(
             job_name="summarise_private_minutes",
             purpose=purpose,
-            scope=ExecutionScope.PRIVATE_BOUNDARY,
             inputs={"target_handle": handle.locator},
         )
-        response = dispatcher(request, vault_root=vault)
+        response = dispatcher(request, scope=ExecutionScope.PRIVATE_BOUNDARY, vault_root=vault)
         # ``ExecutionResponse`` is a frozen Pydantic model that does not
         # carry a back-reference to the on-disk vault, so it is safe to
         # return after the temporary directory is torn down.

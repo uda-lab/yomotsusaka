@@ -78,17 +78,23 @@ are:
 
 > Specification only; not yet enforced.
 
-Every `ExecutionRequest` carries two gate inputs:
+Every `ExecutionRequest` carries one gate input from the request body:
 
-- `scope: ExecutionScope` — caller scope.
 - `purpose: str` — free-form, required, non-empty after `.strip()`
   (validated at construction time by `ExecutionRequest`).
 
-The dispatcher in #43 will:
+Scope is supplied out-of-band as the trusted `scope` keyword-only argument
+on `boundary.execute_request`, not as a field on the request body. The
+facade hard-wires `scope=ExecutionScope.ORDINARY_AGENT`; callers needing the
+narrower scope must invoke `boundary.execute_request` directly with the
+appropriate value.
 
-1. Refuse the request when `request.scope` is not in the template's
-   `allowed_scopes`. Failure mode: `ExecutionFailure` with a stable
-   error code (to be enumerated by #43).
+The dispatcher:
+
+1. Refuse the request when the trusted `scope` kwarg passed to
+   `boundary.execute_request` is not in the template's `allowed_scopes`.
+   Failure mode: `ExecutionFailure` with a stable error code (to be
+   enumerated by #43).
 2. Forward `purpose` into the audit record (§4 below). The purpose
    value is never re-emitted into the response body other than via the
    audit-record id.

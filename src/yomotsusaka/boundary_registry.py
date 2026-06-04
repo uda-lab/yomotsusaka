@@ -892,13 +892,6 @@ REGISTRY: tuple[BoundaryField, ...] = (
     ),
     BoundaryField(
         module="yomotsusaka.execution_gateway",
-        qualname="ExecutionRequest.scope",
-        exposure="agent_public",
-        scrub_mechanism="enum_closed_set",
-        note="ExecutionScope enum",
-    ),
-    BoundaryField(
-        module="yomotsusaka.execution_gateway",
         qualname="ExecutionRequest.inputs",
         exposure="agent_redacted",
         scrub_mechanism="scrubber",
