@@ -436,12 +436,13 @@ def _check_caller_function(
                     for n in _iter_body_in_scope(node.body)
                     if _is_start_pod_call(n) and hasattr(n, "lineno")
                 )
-            elif node.finalbody:
-                # A start_pod acquired BEFORE the try is only covered when this
-                # try's ``finally`` stops the SAME handle.  Crediting any
-                # earlier start_pod just because some finally calls stop_pod
-                # (regardless of which handle) is the #141/#142/#144 false
-                # negative — an unrelated cleanup masked a real orphan.
+            # Independent of the in-body case above: the same try may ALSO
+            # protect a start_pod acquired BEFORE it.  Such a pre-try start_pod
+            # is only covered when this try's ``finally`` stops the SAME handle.
+            # Crediting any earlier start_pod just because some finally calls
+            # stop_pod (regardless of which handle) is the #141/#142/#144 false
+            # negative — an unrelated cleanup masked a real orphan.
+            if node.finalbody:
                 finally_vars = _stop_pod_arg_names(node.finalbody)
                 if finally_vars:
                     try_line = getattr(node, "lineno", 0)

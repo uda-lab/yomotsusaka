@@ -333,6 +333,25 @@ def run_lifecycle(lifecycle, config):
     assert findings == []
 
 
+def test_g42_pretry_and_in_body_start_pod_same_try_both_covered(tmp_path: Path) -> None:
+    """A single try may protect BOTH a pre-try start_pod (via its finally) and
+    an in-body start_pod (via its except). Neither must be falsely flagged."""
+    source = """\
+def run_lifecycle(lifecycle, config1, config2):
+    pre_handle = lifecycle.start_pod(config1)
+    try:
+        in_handle = lifecycle.start_pod(config2)
+        do_work(pre_handle, in_handle)
+    except Exception:
+        lifecycle.stop_pod(in_handle, terminate=True)
+        raise
+    finally:
+        lifecycle.stop_pod(pre_handle, terminate=True)
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert findings == []
+
+
 def test_g42_non_lifecycle_start_pod_function_is_checked(tmp_path: Path) -> None:
     """A free function (or unrelated-class method) named start_pod is NOT the
     library implementation, so it is still subject to G4.2 (#134 F3/#139 F8)."""
@@ -362,7 +381,12 @@ class JobRunner:
 
 def test_g42_lifecycle_class_start_pod_method_still_exempt(tmp_path: Path) -> None:
     """start_pod on a known lifecycle class stays exempt (its cleanup is G4.1)."""
-    for cls in ("RunPodLifecycle", "MockRunPodLifecycle", "AttachRunPodLifecycle"):
+    for cls in (
+        "RunPodLifecycle",
+        "MockRunPodLifecycle",
+        "AttachRunPodLifecycle",
+        "ManageRunPodLifecycle",
+    ):
         source = f"""\
 class {cls}:
     def start_pod(self, config=None):
