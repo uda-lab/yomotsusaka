@@ -67,6 +67,19 @@ from typing import Iterator, Sequence
 _CALLER_RESPONSIBILITY_MARKER = "CLEANUP: caller-responsibility"
 _TRY_NODES = (ast.Try, ast.TryStar)
 
+# Classes whose ``start_pod`` method IS the lifecycle implementation (its
+# cleanup is checked by G4.1, not G4.2).  A function named ``start_pod`` that
+# is NOT a method of one of these classes — a free function or a helper on an
+# unrelated class — is still a *caller* and must satisfy G4.2.
+_LIFECYCLE_CLASS_NAMES = frozenset(
+    {
+        "RunPodLifecycle",
+        "MockRunPodLifecycle",
+        "AttachRunPodLifecycle",
+        "ManageRunPodLifecycle",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -186,6 +199,58 @@ def _contains_start_pod(stmts: list[ast.stmt]) -> bool:
     the current scope (nested function/class bodies are NOT traversed).
     """
     return any(_is_start_pod_call(n) for n in _iter_body_in_scope(stmts))
+
+
+def _stop_pod_arg_names(stmts: list[ast.stmt]) -> set[str]:
+    """Return the variable names passed as arguments to ``stop_pod`` calls
+    reachable in *stmts* (scope-respecting).
+
+    Used to verify that a ``finally``/handler cleanup actually terminates the
+    *same* handle as a given ``start_pod`` — an ``stop_pod(other_handle)`` must
+    not be credited as covering ``handle = start_pod(...)``.
+    """
+    names: set[str] = set()
+    for node in _iter_body_in_scope(stmts):
+        if not _is_stop_pod_call(node):
+            continue
+        for arg in node.args:
+            if isinstance(arg, ast.Name):
+                names.add(arg.id)
+        for kw in node.keywords:
+            if isinstance(kw.value, ast.Name):
+                names.add(kw.value.id)
+    return names
+
+
+def _start_pod_handle_vars(
+    func_def: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> dict[int, str | None]:
+    """Map each ``start_pod`` call line to the variable it is assigned to.
+
+    ``handle = lifecycle.start_pod(config)`` maps the call line to ``"handle"``;
+    a bare ``lifecycle.start_pod(config)`` (no assignment) maps to ``None``.
+    Only direct ``Name`` assignment targets are resolved — anything more complex
+    is treated as an untraceable handle (``None``).
+    """
+    mapping: dict[int, str | None] = {}
+    for node in _iter_body_in_scope(func_def.body):
+        value: ast.expr | None = None
+        target: str | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            value = node.value
+            if isinstance(node.targets[0], ast.Name):
+                target = node.targets[0].id
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            value = node.value
+            if isinstance(node.target, ast.Name):
+                target = node.target.id
+        if value is None:
+            continue
+        if isinstance(value, ast.Await):
+            value = value.value
+        if _is_start_pod_call(value):
+            mapping[value.lineno] = target
+    return mapping
 
 
 def _source_snippet(source_lines: list[str], node: ast.AST) -> str:
@@ -320,10 +385,14 @@ def _check_caller_function(
     func_def: ast.FunctionDef | ast.AsyncFunctionDef,
     source_lines: list[str],
     rel_path: str,
+    class_name: str | None = None,
 ) -> Iterator[Finding]:
     """Yield G4.2 findings for a caller function (not start_pod itself)."""
-    # Skip the start_pod implementation itself
-    if func_def.name == "start_pod":
+    # Skip the start_pod implementation itself — but ONLY when it is a method
+    # of a known lifecycle class (whose cleanup is enforced by G4.1).  A free
+    # function or unrelated-class method that merely happens to be named
+    # start_pod is a genuine caller and must still satisfy G4.2.
+    if func_def.name == "start_pod" and class_name in _LIFECYCLE_CLASS_NAMES:
         return
 
     # Does the function body contain a start_pod call?
@@ -343,6 +412,7 @@ def _check_caller_function(
 
     # Check each start_pod occurrence independently. One covered start_pod
     # must not hide a later unpaired start_pod in the same function.
+    start_handles = _start_pod_handle_vars(func_def)
     covered_start_lines: set[int] = set()
     for node in _iter_body_in_scope(func_def.body):
         if isinstance(node, _TRY_NODES):
@@ -366,11 +436,23 @@ def _check_caller_function(
                     for n in _iter_body_in_scope(node.body)
                     if _is_start_pod_call(n) and hasattr(n, "lineno")
                 )
-            elif node.finalbody and cleanup_lines:
-                try_line = getattr(node, "lineno", 0)
-                covered_start_lines.update(
-                    start_line for start_line in start_lines if start_line < try_line
-                )
+            elif node.finalbody:
+                # A start_pod acquired BEFORE the try is only covered when this
+                # try's ``finally`` stops the SAME handle.  Crediting any
+                # earlier start_pod just because some finally calls stop_pod
+                # (regardless of which handle) is the #141/#142/#144 false
+                # negative — an unrelated cleanup masked a real orphan.
+                finally_vars = _stop_pod_arg_names(node.finalbody)
+                if finally_vars:
+                    try_line = getattr(node, "lineno", 0)
+                    for start_line in start_lines:
+                        handle = start_handles.get(start_line)
+                        if (
+                            start_line < try_line
+                            and handle is not None
+                            and handle in finally_vars
+                        ):
+                            covered_start_lines.add(start_line)
 
     if set(start_lines) <= covered_start_lines:
         return
@@ -465,6 +547,27 @@ def _check_file_g41(
         )
 
 
+def _iter_caller_functions(
+    node: ast.AST, class_name: str | None = None
+) -> Iterator[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str | None]]:
+    """Yield every function/method together with the name of its immediately
+    enclosing class (``None`` for module-level functions).
+
+    A function nested inside a method is yielded with ``class_name=None`` — it
+    is a helper, not a method of the enclosing class.  ``ast.walk`` discards
+    this class context, which is why G4.2's ``start_pod`` exemption needs this
+    dedicated traversal.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.ClassDef):
+            yield from _iter_caller_functions(child, class_name=child.name)
+        elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield child, class_name
+            yield from _iter_caller_functions(child, class_name=None)
+        else:
+            yield from _iter_caller_functions(child, class_name=class_name)
+
+
 def _check_file_g42(path: Path, repo_root: Path) -> Iterator[Finding]:
     """Run G4.2: scan for caller functions that call start_pod."""
     source = path.read_text(encoding="utf-8")
@@ -484,9 +587,10 @@ def _check_file_g42(path: Path, repo_root: Path) -> Iterator[Finding]:
 
     source_lines = source.splitlines()
 
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            yield from _check_caller_function(node, source_lines, rel_path)
+    for func_def, class_name in _iter_caller_functions(tree):
+        yield from _check_caller_function(
+            func_def, source_lines, rel_path, class_name
+        )
 
 
 # ---------------------------------------------------------------------------
