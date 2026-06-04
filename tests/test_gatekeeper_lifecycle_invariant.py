@@ -302,6 +302,102 @@ def run_lifecycle(lifecycle, config, old_handle):
     assert findings[0].rule == "lifecycle_invariant.caller_start_pod_paired"
 
 
+def test_g42_pretry_finally_different_handle_fires(tmp_path: Path) -> None:
+    """A start_pod acquired before a try/finally that stops a DIFFERENT handle
+    is not covered — the pre-try pod can still orphan (#141/#142/#144)."""
+    source = """\
+def run_lifecycle(lifecycle, config, old_handle):
+    handle = lifecycle.start_pod(config)
+    try:
+        do_work()
+    finally:
+        lifecycle.stop_pod(old_handle, terminate=True)
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert len(findings) == 1
+    assert findings[0].rule == "lifecycle_invariant.caller_start_pod_paired"
+    assert findings[0].function == "run_lifecycle"
+
+
+def test_g42_pretry_finally_same_handle_passes(tmp_path: Path) -> None:
+    """The legitimate acquire-before-try/finally pattern (same handle) passes."""
+    source = """\
+def run_lifecycle(lifecycle, config):
+    handle = lifecycle.start_pod(config)
+    try:
+        do_work(handle)
+    finally:
+        lifecycle.stop_pod(handle, terminate=True)
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert findings == []
+
+
+def test_g42_pretry_and_in_body_start_pod_same_try_both_covered(tmp_path: Path) -> None:
+    """A single try may protect BOTH a pre-try start_pod (via its finally) and
+    an in-body start_pod (via its except). Neither must be falsely flagged."""
+    source = """\
+def run_lifecycle(lifecycle, config1, config2):
+    pre_handle = lifecycle.start_pod(config1)
+    try:
+        in_handle = lifecycle.start_pod(config2)
+        do_work(pre_handle, in_handle)
+    except Exception:
+        lifecycle.stop_pod(in_handle, terminate=True)
+        raise
+    finally:
+        lifecycle.stop_pod(pre_handle, terminate=True)
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert findings == []
+
+
+def test_g42_non_lifecycle_start_pod_function_is_checked(tmp_path: Path) -> None:
+    """A free function (or unrelated-class method) named start_pod is NOT the
+    library implementation, so it is still subject to G4.2 (#134 F3/#139 F8)."""
+    source = """\
+def start_pod(lifecycle, config):
+    handle = lifecycle.start_pod(config)
+    return handle
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert len(findings) == 1
+    assert findings[0].rule == "lifecycle_invariant.caller_start_pod_paired"
+    assert findings[0].function == "start_pod"
+
+
+def test_g42_unrelated_class_start_pod_method_is_checked(tmp_path: Path) -> None:
+    """A start_pod method on a class outside the lifecycle set is checked."""
+    source = """\
+class JobRunner:
+    def start_pod(self, lifecycle, config):
+        handle = lifecycle.start_pod(config)
+        return handle
+"""
+    findings = _parse_and_check_g42(source, tmp_path)
+    assert len(findings) == 1
+    assert findings[0].rule == "lifecycle_invariant.caller_start_pod_paired"
+
+
+def test_g42_lifecycle_class_start_pod_method_still_exempt(tmp_path: Path) -> None:
+    """start_pod on a known lifecycle class stays exempt (its cleanup is G4.1)."""
+    for cls in (
+        "RunPodLifecycle",
+        "MockRunPodLifecycle",
+        "AttachRunPodLifecycle",
+        "ManageRunPodLifecycle",
+    ):
+        source = f"""\
+class {cls}:
+    def start_pod(self, config=None):
+        handle = self._create()
+        return handle
+"""
+        findings = _parse_and_check_g42(source, tmp_path)
+        g42 = [f for f in findings if f.rule == "lifecycle_invariant.caller_start_pod_paired"]
+        assert g42 == [], f"{cls}.start_pod should be exempt from G4.2"
+
+
 def test_g42_second_uncovered_start_pod_still_fires(tmp_path: Path) -> None:
     source = """\
 def run_lifecycle(lifecycle, config1, config2):
