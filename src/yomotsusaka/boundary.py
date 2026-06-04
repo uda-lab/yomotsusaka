@@ -705,7 +705,7 @@ class RestorationRequest(BaseModel, frozen=True):
     # ambient string drift. ``policy_profile`` / ``approval_ticket`` /
     # ``production_scope`` are free-form because their wire shape is not
     # yet pinned by any audit consumer.
-    authorization_decision: Literal["accept"] | None = None
+    authorization_decision: Literal["accept"] | None = None  # WARNING: presence-only, not provenance-verified
     policy_profile: str | None = None
     approval_ticket: str | None = None
     production_scope: str | None = None
@@ -1958,7 +1958,6 @@ __all__ = [
     "ResolverScope",
     "ResolverFailureReason",
     "ResolverError",
-    "PrivateState",
     "ResolverFailure",
     "ResolverSuccess",
     "resolve",

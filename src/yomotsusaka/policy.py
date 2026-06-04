@@ -358,7 +358,7 @@ class RestorationPolicyTable:
                 ),
             )
 
-        if row.require_authorization_decision and authorization_decision is None:
+        if row.require_authorization_decision and authorization_decision is None:  # WARNING: presence-only, not provenance-verified
             return PolicyDecision(
                 verdict="deny",
                 matched_profile=matched,

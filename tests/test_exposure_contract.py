@@ -253,6 +253,23 @@ def test_boundary_all_does_not_export_private_kernel_symbols() -> None:
     )
 
 
+def test_private_state_not_in_boundary_all() -> None:
+    """PrivateState must not appear in boundary.__all__.
+
+    PrivateState carries raw private values and absolute vault paths; the
+    module docstring says it must not reach ordinary-agent surfaces. Its
+    class definition is intentionally kept in the module for internal
+    private-boundary code paths, but it must not be exported via __all__
+    (which governs wildcard imports and IDE-advertised public names).
+    See issue #145 finding 2.
+    """
+    assert "PrivateState" not in boundary.__all__, (
+        "boundary.__all__ must not export PrivateState: it carries raw private "
+        "values and vault paths. Remove the entry from __all__ while keeping "
+        "the class accessible internally as boundary.PrivateState."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers (file-local; not exported)
 # ---------------------------------------------------------------------------
