@@ -230,6 +230,13 @@ def _build_source_env_lookup(src_paths: list[Path]) -> set[str]:
                     var = _env_name(node.slice)
                     if var and re.match(r"^[A-Z][A-Z0-9_]+$", var):
                         referenced.add(var)
+                elif (
+                    isinstance(value, ast.Name)
+                    and value.id in os_environ_names
+                ):
+                    var = _env_name(node.slice)
+                    if var and re.match(r"^[A-Z][A-Z0-9_]+$", var):
+                        referenced.add(var)
     return referenced
 
 

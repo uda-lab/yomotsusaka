@@ -332,6 +332,48 @@ def test_operator_only_row_does_not_silence_non_operator_row(tmp_path: Path) -> 
     )
 
 
+# ---------------------------------------------------------------------------
+# Issue #142 regression — environ["VAR"] subscript via direct import
+# ---------------------------------------------------------------------------
+
+
+def test_build_source_env_lookup_finds_imported_environ_subscript(tmp_path: Path) -> None:
+    """environ["VAR"] via 'from os import environ' must be recognised (issue #142).
+
+    Before the fix, the ast.Subscript handler only matched os.environ["VAR"]
+    (attribute form) and missed environ["VAR"] when environ was imported
+    directly.  The fix adds a symmetric branch consulting os_environ_names.
+    """
+    py = tmp_path / "mod.py"
+    py.write_text('from os import environ\nvalue = environ["RUNPOD_API_KEY"]\n')
+    result = _mod._build_source_env_lookup([py])
+    assert "RUNPOD_API_KEY" in result
+
+
+def test_build_source_env_lookup_finds_imported_environ_alias_subscript(tmp_path: Path) -> None:
+    """environ alias subscript: 'from os import environ as env; env["VAR"]'."""
+    py = tmp_path / "mod.py"
+    py.write_text('from os import environ as env\nvalue = env["RUNPOD_API_KEY"]\n')
+    result = _mod._build_source_env_lookup([py])
+    assert "RUNPOD_API_KEY" in result
+
+
+def test_drift_free_fixture_environ_subscript_wired(tmp_path: Path) -> None:
+    """Integration: environ["VAR"] subscript form satisfies G3.1 (no false negative)."""
+    src_via_subscript = """\
+from os import environ
+api_key = environ["RUNPOD_API_KEY"]
+template_id = environ["RUNPOD_TEMPLATE_ID"]
+"""
+    repo = _make_repo(tmp_path, _DOC_WITH_TEMPLATE_ID, src_via_subscript)
+    report = _mod.run_checks(repo / "docs", repo)
+    template_findings = [f for f in report.findings if f.var_name == "RUNPOD_TEMPLATE_ID"]
+    assert template_findings == [], (
+        "environ['RUNPOD_TEMPLATE_ID'] subscript must be recognised as wired; "
+        "got unexpected findings: " + str(template_findings)
+    )
+
+
 def test_operator_only_only_rows_still_exempted(tmp_path: Path) -> None:
     """If every documented occurrence is operator-only, the var IS exempt."""
     doc_all_operator = """\
