@@ -519,6 +519,7 @@ def run_lifecycle(
 
     exit_codes: list[int] = []
     cleanup_attempted = False
+    cleanup_failed = False
 
     try:
         # ---- smoke ----
@@ -574,7 +575,7 @@ def run_lifecycle(
                     log_path=lifecycle_log,
                 )
 
-        return _select_exit_code(exit_codes)
+        result = _select_exit_code(exit_codes)
     finally:
         if not keep_pod and not cleanup_attempted:
             try:
@@ -587,6 +588,11 @@ def run_lifecycle(
                     category=_CATEGORY_CLEANUP_FAILED,
                     log_path=lifecycle_log,
                 )
+                cleanup_failed = True
+            if cleanup_failed:
+                return EXIT_CLEANUP_FAILED
+
+    return result
 
 
 # ---------------------------------------------------------------------------
