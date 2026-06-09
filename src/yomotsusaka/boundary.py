@@ -1590,9 +1590,9 @@ def execute_request(
 
     # Programmer-error guardrail: scope must be a genuine ExecutionScope.
     # Raises, never returns a failure response, mirroring restoration_request's
-    # isinstance(scope, ResolverScope) guard.
+    # isinstance(scope, ResolverScope) guard and exception family.
     if not isinstance(scope, ExecutionScope):
-        raise TypeError(
+        raise ResolverError(
             f"scope must be an ExecutionScope; got {type(scope).__name__}"
         )
 
@@ -1697,7 +1697,7 @@ def execute_request(
             reason=ExecutionFailureReason.SchemaInvalid,
             detail="request must be an ExecutionRequest instance",
             template_name="<invalid>",
-            caller_scope="<invalid>",
+            caller_scope=scope.value,
             purpose="<invalid>",
             locator="",
         )
@@ -1725,9 +1725,12 @@ def execute_request(
 
     # ------------------------------------------------------------------
     # Step 3: ScopeDenied — caller scope vs template min_scope. MVP:
-    # only PRIVATE_BOUNDARY callers may invoke any template (the two
+    # only PRIVATE_BOUNDARY callers may invoke any shipped template (the two
     # shipped templates both declare min_scope=PRIVATE_BOUNDARY). An
-    # ordinary-agent caller is denied.
+    # ordinary-agent caller is denied. ``min_scope`` is a floor, not an exact
+    # allowed-scope set: a PRIVATE_BOUNDARY caller may invoke a future
+    # ORDINARY_AGENT-minimum template unless the registry grows a separate
+    # upper-bound/allowed-scopes field.
     # ------------------------------------------------------------------
     if spec.min_scope is ExecutionScope.PRIVATE_BOUNDARY and (
         scope is not ExecutionScope.PRIVATE_BOUNDARY
@@ -1786,62 +1789,64 @@ def execute_request(
                 locator=locator,
             )
 
-    # ------------------------------------------------------------------
-    # Step 6: Resolve the target locator under PRIVATE_BOUNDARY scope.
-    # This is the only place the dispatcher materialises raw private
-    # values. Cross-tenant misses fall through to ArtifactMissing per
-    # the resolver's existing UnknownArtifact semantics (Fork 9).
-    # ------------------------------------------------------------------
-    resolver_outcome = resolve(
-        locator_input,
-        scope=ResolverScope.PRIVATE_BOUNDARY,
-        purpose=purpose,
-        tenant=effective_tenant,
-    )
-    if isinstance(resolver_outcome, ResolverFailure):
-        # Map resolver failure → execution failure per §D-7.
-        rr = resolver_outcome.reason
-        if rr in (
-            ResolverFailureReason.MalformedLocator,
-            ResolverFailureReason.UnknownArtifact,
-            ResolverFailureReason.ArtifactMissing,
-        ):
-            mapped = ExecutionFailureReason.ArtifactMissing
-        elif rr is ResolverFailureReason.ScopeDenied:
-            mapped = ExecutionFailureReason.ScopeDenied
-        elif rr is ResolverFailureReason.PurposeNotPermitted:
-            mapped = ExecutionFailureReason.PurposeNotPermitted
-        else:  # defensive — should be unreachable
-            mapped = ExecutionFailureReason.ArtifactMissing
-        return _emit_failure(
-            outcome=mapped.value,
-            reason=mapped,
-            detail=(
-                resolver_outcome.detail
-                or f"resolver failure: {rr.value}"
-            ),
-            template_name=template_name,
-            caller_scope=caller_scope_value,
+    private_state: PrivateState | None = None
+    if spec.requires_locator_input:
+        # ------------------------------------------------------------------
+        # Step 6: Resolve the target locator under PRIVATE_BOUNDARY scope.
+        # This is the only place the dispatcher materialises raw private
+        # values. Cross-tenant misses fall through to ArtifactMissing per
+        # the resolver's existing UnknownArtifact semantics (Fork 9).
+        # ------------------------------------------------------------------
+        resolver_outcome = resolve(
+            locator_input,
+            scope=ResolverScope.PRIVATE_BOUNDARY,
             purpose=purpose,
-            locator=locator,
-            resolver_reason=rr.value,
+            tenant=effective_tenant,
         )
+        if isinstance(resolver_outcome, ResolverFailure):
+            # Map resolver failure → execution failure per §D-7.
+            rr = resolver_outcome.reason
+            if rr in (
+                ResolverFailureReason.MalformedLocator,
+                ResolverFailureReason.UnknownArtifact,
+                ResolverFailureReason.ArtifactMissing,
+            ):
+                mapped = ExecutionFailureReason.ArtifactMissing
+            elif rr is ResolverFailureReason.ScopeDenied:
+                mapped = ExecutionFailureReason.ScopeDenied
+            elif rr is ResolverFailureReason.PurposeNotPermitted:
+                mapped = ExecutionFailureReason.PurposeNotPermitted
+            else:  # defensive — should be unreachable
+                mapped = ExecutionFailureReason.ArtifactMissing
+            return _emit_failure(
+                outcome=mapped.value,
+                reason=mapped,
+                detail=(
+                    resolver_outcome.detail
+                    or f"resolver failure: {rr.value}"
+                ),
+                template_name=template_name,
+                caller_scope=caller_scope_value,
+                purpose=purpose,
+                locator=locator,
+                resolver_reason=rr.value,
+            )
 
-    # ResolverSuccess under PRIVATE_BOUNDARY scope carries PrivateState.
-    private_state = resolver_outcome.private_state
-    if private_state is None:
-        # Defensive — the resolver contract guarantees PrivateState is set
-        # under PRIVATE_BOUNDARY scope on success. Treat absence as an
-        # ArtifactMissing failure rather than crash.
-        return _emit_failure(
-            outcome="artifact_missing",
-            reason=ExecutionFailureReason.ArtifactMissing,
-            detail="resolver returned success without PrivateState",
-            template_name=template_name,
-            caller_scope=caller_scope_value,
-            purpose=purpose,
-            locator=locator,
-        )
+        # ResolverSuccess under PRIVATE_BOUNDARY scope carries PrivateState.
+        private_state = resolver_outcome.private_state
+        if private_state is None:
+            # Defensive — the resolver contract guarantees PrivateState is set
+            # under PRIVATE_BOUNDARY scope on success. Treat absence as an
+            # ArtifactMissing failure rather than crash.
+            return _emit_failure(
+                outcome="artifact_missing",
+                reason=ExecutionFailureReason.ArtifactMissing,
+                detail="resolver returned success without PrivateState",
+                template_name=template_name,
+                caller_scope=caller_scope_value,
+                purpose=purpose,
+                locator=locator,
+            )
 
     # ------------------------------------------------------------------
     # Step 7: Invoke the template. Any exception → TemplateRaised. We
@@ -1862,7 +1867,11 @@ def execute_request(
             caller_scope=caller_scope_value,
             purpose=purpose,
             locator=locator,
-            private_dict=list(private_state.private_entries),
+            private_dict=(
+                list(private_state.private_entries)
+                if private_state is not None
+                else []
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -1870,12 +1879,15 @@ def execute_request(
     # ScrubFailed (NOT TemplateRaised) so the caller can disambiguate
     # template-bug vs scrubber-fail-closed.
     # ------------------------------------------------------------------
+    private_entries = (
+        list(private_state.private_entries) if private_state is not None else []
+    )
     try:
         scrubbed_stdout = scrub_stream(
-            result.stdout, list(private_state.private_entries)
+            result.stdout, private_entries
         )
         scrubbed_stderr = scrub_stream(
-            result.stderr, list(private_state.private_entries)
+            result.stderr, private_entries
         )
     except ScrubError as exc:
         return _emit_failure(
@@ -1886,7 +1898,7 @@ def execute_request(
             caller_scope=caller_scope_value,
             purpose=purpose,
             locator=locator,
-            private_dict=list(private_state.private_entries),
+            private_dict=private_entries,
         )
 
     # ------------------------------------------------------------------
@@ -1912,7 +1924,7 @@ def execute_request(
         write_record(
             success_record,
             effective_vault_root,
-            private_dict=list(private_state.private_entries),
+            private_dict=private_entries,
         )
     except (AuditError, OSError):
         # Audit-write failure on the success path. The Chikaeshi audit

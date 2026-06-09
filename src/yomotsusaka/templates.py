@@ -78,8 +78,9 @@ class TemplateResult:
 
 # Callable signature for a template implementation. The dispatcher always
 # invokes templates with ``(request, private_state, vault_root)``; templates
-# that need additional context read it out of ``request.inputs``.
-TemplateFn = Callable[[ExecutionRequest, PrivateState, Path], TemplateResult]
+# that need additional context read it out of ``request.inputs``. Templates
+# with ``requires_locator_input=False`` receive ``private_state=None``.
+TemplateFn = Callable[[ExecutionRequest, PrivateState | None, Path], TemplateResult]
 
 
 @dataclass(frozen=True)
