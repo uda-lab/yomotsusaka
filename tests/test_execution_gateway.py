@@ -319,6 +319,7 @@ import pytest  # noqa: E402, F811
 
 from yomotsusaka.boundary import (  # noqa: E402
     ProcessRequest,
+    ResolverError,
     execute_request,
     process_document_request,
 )
@@ -445,6 +446,50 @@ def test_execute_request_success_letter(tmp_path: Path) -> None:
         assert raw not in response.model_dump_json()
 
 
+def test_execute_request_success_without_locator_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A locatorless template must not fall through to ``resolve(None)``."""
+    from yomotsusaka import templates as templates_mod
+
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True)
+
+    def _locatorless(request, private_state, vault_root):  # noqa: ARG001
+        assert private_state is None
+        return templates_mod.TemplateResult(stdout="locatorless-ok")
+
+    monkeypatch.setitem(
+        templates_mod.TEMPLATES,
+        "locatorless_ping",
+        templates_mod.TemplateSpec(
+            name="locatorless_ping",
+            fn=_locatorless,
+            min_scope=ExecutionScope.PRIVATE_BOUNDARY,
+            description="test-only locatorless template",
+            requires_locator_input=False,
+        ),
+    )
+
+    response = execute_request(
+        ExecutionRequest(
+            job_name="locatorless_ping",
+            purpose="locatorless-test",
+            inputs={},
+        ),
+        scope=ExecutionScope.PRIVATE_BOUNDARY,
+        vault_root=vault,
+    )
+
+    assert response.status == "accepted"
+    assert response.reason is None
+    assert response.scrubbed_stdout == "locatorless-ok"
+    rows = _audit_lines_for_request(vault, response.audit_record_id)
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "success"
+    assert rows[0]["locator"] == ""
+
+
 # ---------------------------------------------------------------------------
 # Each ExecutionFailureReason branch (§D-10 acceptance criterion 4)
 # ---------------------------------------------------------------------------
@@ -507,6 +552,23 @@ def test_failure_schema_invalid(tmp_path: Path, caplog: pytest.LogCaptureFixture
         caplog.records,
         surface="SchemaInvalid(non-request)",
     )
+    rows = _audit_lines_for_request(vault, response.audit_record_id)
+    assert rows[0]["caller_scope"] == ExecutionScope.ORDINARY_AGENT.value
+
+
+def test_execute_request_rejects_invalid_scope_with_resolver_error(
+    tmp_path: Path,
+) -> None:
+    """Bad trusted-scope arguments use the resolver programmer-error type."""
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True)
+
+    with pytest.raises(ResolverError, match="scope"):
+        execute_request(
+            {"not_a_request": True},
+            scope="private_boundary",  # type: ignore[arg-type]
+            vault_root=vault,
+        )
 
 
 def test_failure_template_not_found(

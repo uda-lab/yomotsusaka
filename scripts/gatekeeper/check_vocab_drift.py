@@ -138,6 +138,11 @@ CATEGORY_SYNONYM_ALLOWLIST: frozenset[str] = frozenset(
         "audit_record_id",
         "audit_file_missing",
         "audit_write_failed",
+        "audit_row_count",
+        "index_loadable",
+        "restoration_outcome",
+        "runpod_cleanup_confirmed",
+        "runpod_lifecycle_category",
         # ---------------------------------------------------------------
         # Pre-#111 baseline: the operational_smoke CLI emits its own
         # local category vocabulary that runs parallel to (and is
