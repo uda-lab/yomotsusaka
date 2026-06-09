@@ -457,7 +457,7 @@ def test_execute_request_success_without_locator_input(
 
     def _locatorless(request, private_state, vault_root):  # noqa: ARG001
         assert private_state is None
-        return templates_mod.TemplateResult(stdout="locatorless-ok")
+        return templates_mod.TemplateResult()
 
     monkeypatch.setitem(
         templates_mod.TEMPLATES,
@@ -483,11 +483,59 @@ def test_execute_request_success_without_locator_input(
 
     assert response.status == "accepted"
     assert response.reason is None
-    assert response.scrubbed_stdout == "locatorless-ok"
+    assert response.scrubbed_stdout == ""
     rows = _audit_lines_for_request(vault, response.audit_record_id)
     assert len(rows) == 1
     assert rows[0]["outcome"] == "success"
     assert rows[0]["locator"] == ""
+
+
+def test_locatorless_template_free_form_output_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Without a private dictionary, locatorless stdout/stderr is unsafe."""
+    from yomotsusaka import templates as templates_mod
+
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True)
+
+    def _locatorless(request, private_state, vault_root):  # noqa: ARG001
+        assert private_state is None
+        return templates_mod.TemplateResult(stdout="could contain private data")
+
+    monkeypatch.setitem(
+        templates_mod.TEMPLATES,
+        "locatorless_output",
+        templates_mod.TemplateSpec(
+            name="locatorless_output",
+            fn=_locatorless,
+            min_scope=ExecutionScope.PRIVATE_BOUNDARY,
+            description="test-only unsafe locatorless template",
+            requires_locator_input=False,
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger="yomotsusaka"):
+        response = execute_request(
+            ExecutionRequest(
+                job_name="locatorless_output",
+                purpose="locatorless-output-test",
+                inputs={},
+            ),
+            scope=ExecutionScope.PRIVATE_BOUNDARY,
+            vault_root=vault,
+        )
+
+    _assert_failure_contract(
+        response,
+        ExecutionFailureReason.ScrubFailed,
+        vault,
+        caplog.records,
+        surface="ScrubFailed(locatorless-free-form-output)",
+    )
+    assert "without a scrub dictionary" in (response.detail or "")
 
 
 # ---------------------------------------------------------------------------

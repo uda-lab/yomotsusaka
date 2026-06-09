@@ -1882,6 +1882,19 @@ def execute_request(
     private_entries = (
         list(private_state.private_entries) if private_state is not None else []
     )
+    if private_state is None and (result.stdout or result.stderr):
+        return _emit_failure(
+            outcome="scrub_failed",
+            reason=ExecutionFailureReason.ScrubFailed,
+            detail=(
+                "locatorless template returned free-form output without "
+                "a scrub dictionary"
+            ),
+            template_name=template_name,
+            caller_scope=caller_scope_value,
+            purpose=purpose,
+            locator=locator,
+        )
     try:
         scrubbed_stdout = scrub_stream(
             result.stdout, private_entries
