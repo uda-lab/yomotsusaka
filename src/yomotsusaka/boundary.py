@@ -1894,6 +1894,7 @@ def execute_request(
             caller_scope=caller_scope_value,
             purpose=purpose,
             locator=locator,
+            private_dict=private_entries,
         )
     try:
         scrubbed_stdout = scrub_stream(
