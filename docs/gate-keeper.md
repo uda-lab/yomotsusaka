@@ -192,14 +192,24 @@ gate-keeper validate policy/repo-rules.md \
     --target uda-lab/yomotsusaka#<PR> --backend github
 ```
 
-### `--allow-command-adapter` is disabled
+### `--allow-command-adapter` (default off; one scoped exception)
 
 `gate-keeper` exposes an `external` adapter that can execute an
 arbitrary `argv` provided by a rule document. The CLI disables this
 adapter by default and requires `--allow-command-adapter` to opt in.
-Yomotsusaka **never** passes `--allow-command-adapter`; rule documents
-must not assume it is available. Treat any future rule that requires
-`tool: command` execution as out of scope for this repository.
+The default policy document (`policy/repo-rules.md`) **never** requires
+the flag, and its rules must not assume it is available.
+
+The sole exception is the advisory manifest-coverage trial described
+below. It runs a separate rule document (`policy/dependency-gates.json`)
+whose only rule is a `tool: command` external check, and it opts in to
+`--allow-command-adapter` deliberately and in isolation from the default
+policy path. The trust boundary — only pass the flag against a rule
+document you trust, because the rule supplies the `argv` — is exactly
+why the trial pins the validator to a specific gate-keeper commit and
+vendors it in-repo. Any *other* rule that requires `tool: command`
+execution remains out of scope until it is promoted through its own
+review.
 
 ## Scope of the first policy file
 
