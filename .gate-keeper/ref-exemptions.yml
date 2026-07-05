@@ -1,0 +1,42 @@
+# Explicit exemptions for the gate-keeper manifest-coverage validator
+# (uda-lab/yomotsusaka#158).
+#
+# Schema: t-uda/gate-keeper docs/design/dependency-gates.md §6.2. A changed
+# file that is neither a manifest-edge endpoint nor listed here emits
+# `uncovered_file` (FAIL). Each entry exempts one repo-relative POSIX path
+# matching `git diff --name-only` output exactly.
+#
+# These bootstrap entries cover only the trial's own tooling and infra files:
+# paths this PR introduces or edits that carry no doc↔source dependency and so
+# should not trip the coverage gate. Kept intentionally minimal.
+
+exemptions:
+  # ---- vendored validator tooling ----
+  - path: scripts/dependency_gates/check_manifest_coverage.py
+    category: manual
+    reason: "vendored gate-keeper validator — tooling, not a document artifact"
+  - path: scripts/dependency_gates/manifest.py
+    category: manual
+    reason: "vendored gate-keeper manifest loader — tooling, not a document artifact"
+  - path: scripts/dependency_gates/__init__.py
+    category: manual
+    reason: "vendored package marker — tooling, not a document artifact"
+
+  # ---- trial configuration / rule doc ----
+  - path: policy/dependency-gates.json
+    category: manual
+    reason: "gate-keeper rule doc for the trial — configuration, not a tracked artifact"
+  - path: .gate-keeper/dependency-manifest.yml
+    category: manual
+    reason: "the manifest itself — configuration, self-referential"
+  - path: .gate-keeper/ref-exemptions.yml
+    category: manual
+    reason: "this exemption file — configuration, self-referential"
+
+  # ---- CI + trial documentation ----
+  - path: .github/workflows/gatekeeper.yml
+    category: manual
+    reason: "CI workflow — no doc↔source dependency edge"
+  - path: docs/gate-keeper.md
+    category: manual
+    reason: "trial documentation — describes the wiring; no upstream source dependency"

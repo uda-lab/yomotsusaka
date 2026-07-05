@@ -11,6 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history so the manifest-coverage trial can resolve
+          # `origin/main...HEAD` (git merge-base) for its changed-file set.
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -52,3 +56,33 @@ jobs:
       # G4: assert ManageRunPodLifecycle.start_pod has stop_pod on failure paths.
       - name: check_lifecycle_invariant (G4, hard gate)
         run: uv run python scripts/gatekeeper/check_lifecycle_invariant.py
+
+      # gate-keeper manifest-coverage validator trial (uda-lab/yomotsusaka#158).
+      # First real gate-keeper CLI invocation in this repo. Runs the vendored
+      # validator through a pinned gate-keeper build, one invocation per changed
+      # file (the external command adapter is single-target). Advisory
+      # (continue-on-error) for the trial duration — mirrors the check_vocab_drift
+      # advisory precedent above. See docs/gate-keeper.md.
+      - name: manifest-coverage (gate-keeper trial, advisory)
+        continue-on-error: true
+        env:
+          GATE_KEEPER_BASE_REF: origin/main
+          GK_SPEC: "gate-keeper @ git+https://github.com/t-uda/gate-keeper@a5123016e4a337b69928c5b9729695d25b1450ab"
+        run: |
+          set -uo pipefail
+          base="origin/main"
+          mapfile -t changed < <(git diff --name-only "${base}...HEAD")
+          if [ "${#changed[@]}" -eq 0 ]; then
+            echo "manifest-coverage: no changed files vs ${base}; nothing to check"
+            exit 0
+          fi
+          rc=0
+          for f in "${changed[@]}"; do
+            [ -n "${f}" ] || continue
+            echo "::group::manifest-coverage ${f}"
+            uv run --with "${GK_SPEC}" gate-keeper validate policy/dependency-gates.json \
+              --rules-format ir --target "${f}" --allow-command-adapter --verbose || rc=1
+            echo "::endgroup::"
+          done
+          echo "manifest-coverage: advisory result rc=${rc} (non-zero = at least one uncovered_file)"
+          exit "${rc}"
