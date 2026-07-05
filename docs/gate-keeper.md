@@ -221,6 +221,59 @@ Expansion into multiple `policy/**/*.md` files, CI wiring, and a
 canonical "blocking vs advisory" promotion ladder are out of scope here
 and tracked separately.
 
+## manifest-coverage trial (advisory)
+
+This repository runs a time-boxed trial of gate-keeper's `manifest-coverage`
+validator — the first place the gate-keeper CLI is actually invoked here.
+Upstream defers the validator's core-promotion decision until it is exercised
+in an external project; this trial produces that signal. It is **advisory**:
+the CI step sets `continue-on-error: true` (mirroring the `check_vocab_drift`
+advisory precedent) so the trial collects data without blocking unrelated PRs.
+Promotion to a required gate is a later decision.
+
+**What it checks.** For each file changed in a PR (relative to `origin/main`),
+the validator requires that the path is either an endpoint of a declared
+dependency edge or an explicit exemption. A changed file that is neither emits
+`uncovered_file` (FAIL); a covered file emits `covering_edge` (PASS); an
+exempted file emits `exemption_applied` (PASS); an unchanged file passes as
+`dependent_artifact_unaffected`. It is a *coverage/exemption* gate — every
+changed file must be accounted for — not an affected-set staleness gate; it
+does not require a documented file to change when its source changes.
+
+**Where the wiring lives.**
+
+- `.gate-keeper/dependency-manifest.yml` — the dependency graph (`nodes` with
+  exact repo-relative paths, `documents` `edges`). Two groups: `src/yomotsusaka/`
+  modules toward `docs/scaffold-status.md`, and the example configs plus the
+  policy and schema modules toward `docs/architecture.md`. Node paths are matched
+  exactly; the loader does not expand globs, so each source file is its own node
+  and a full source mapping would enumerate every module.
+- `.gate-keeper/ref-exemptions.yml` — minimal `manual` exemptions for the
+  trial's own tooling and infra files (the vendored validator, the rule doc,
+  the manifest/exemption files themselves, the workflow, and this doc).
+- `policy/dependency-gates.json` — the gate-keeper rule doc (one
+  `external_check` / `command` rule). `policy/repo-rules.md` is untouched.
+- `scripts/dependency_gates/` — the validator (`check_manifest_coverage.py`),
+  its manifest loader (`manifest.py`), and a package marker, vendored verbatim
+  from gate-keeper with provenance headers. The validator lives outside the
+  installed gate-keeper package, so it must be vendored; re-sync from the
+  source repo rather than editing these copies.
+
+**How CI runs it.** The command adapter is single-target, so the CI step loops
+over the changed set and invokes the pinned gate-keeper once per file:
+
+~~~sh
+uv run --with "gate-keeper @ git+https://github.com/t-uda/gate-keeper@<pinned-sha>" \
+  gate-keeper validate policy/dependency-gates.json \
+  --rules-format ir --target "<one-changed-file>" --allow-command-adapter --verbose
+~~~
+
+The validator computes its own changed-file set with
+`git diff --name-only origin/main...HEAD`, so CI checks out full history
+(`fetch-depth: 0`) and sets `GATE_KEEPER_BASE_REF=origin/main`. Because it is
+an `external_check` rule, the CLI needs `--allow-command-adapter` to permit the
+subprocess.
+
 ## Non-goals
 
 - `gate-keeper` does not validate runtime invariants. The Yomotsusaka

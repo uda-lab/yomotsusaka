@@ -1,0 +1,28 @@
+{
+  "rules": [
+    {
+      "id": "manifest-coverage",
+      "title": "Changed files must have a manifest edge or an explicit exemption",
+      "source": {
+        "path": "policy/dependency-gates.json",
+        "line": 1,
+        "heading": "manifest-coverage"
+      },
+      "text": "gate-keeper manifest-coverage trial (uda-lab/yomotsusaka#158). For each changed file in a PR, requires either (a) at least one manifest edge in .gate-keeper/dependency-manifest.yml whose from/to node resolves to that path, or (b) an explicit entry in .gate-keeper/ref-exemptions.yml. Uncovered changed files emit uncovered_file (FAIL). Covered files emit covering_edge (PASS). Exempted files emit exemption_applied (PASS). Files not in the changed-file set pass as dependent_artifact_unaffected. Fail-closed on unreadable manifest, unreadable/malformed exemption file, or unavailable git diff. Advisory (severity warning) for the duration of the trial.",
+      "kind": "external_check",
+      "severity": "warning",
+      "backend_hint": "external",
+      "confidence": "high",
+      "params": {
+        "tool": "command",
+        "argv": [
+          "python",
+          "scripts/dependency_gates/check_manifest_coverage.py"
+        ],
+        "manifest": ".gate-keeper/dependency-manifest.yml",
+        "exemptions": ".gate-keeper/ref-exemptions.yml",
+        "timeout_seconds": 30
+      }
+    }
+  ]
+}

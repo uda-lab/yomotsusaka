@@ -1,0 +1,76 @@
+# Project-local dependency manifest for the gate-keeper manifest-coverage
+# trial (uda-lab/yomotsusaka#158).
+#
+# Schema: t-uda/gate-keeper docs/design/dependency-gates.md §3 (graph-shaped:
+# `nodes` with id+path, `edges` with from/to/relation). Node `path` values are
+# matched EXACTLY against `git diff --name-only` output — the loader does not
+# expand globs, so each source file is listed as its own node.
+#
+# Two dependency groups are declared:
+#
+#   Group 1 — modules under src/yomotsusaka/ are canonically classified by
+#             docs/scaffold-status.md (see that file's intro). Representative
+#             core-pipeline modules are listed; a full mapping would enumerate
+#             every module (no glob support — see docs/gate-keeper.md).
+#
+#   Group 2 — the example configs and the policy/schema modules whose shapes
+#             docs/architecture.md documents (architecture.md references
+#             config/policy.example.yaml and config/model.example.yaml).
+
+nodes:
+  # ---- Group 1: src modules -> scaffold-status.md ----
+  - id: pipeline-impl
+    path: src/yomotsusaka/pipeline.py
+    kind: code
+  - id: facade-impl
+    path: src/yomotsusaka/facade.py
+    kind: code
+  - id: redactor-impl
+    path: src/yomotsusaka/redactor.py
+    kind: code
+  - id: scaffold-status-doc
+    path: docs/scaffold-status.md
+    kind: reference
+
+  # ---- Group 2: example configs + policy/schema -> architecture.md ----
+  - id: policy-example-config
+    path: config/policy.example.yaml
+    kind: config
+  - id: model-example-config
+    path: config/model.example.yaml
+    kind: config
+  - id: policy-impl
+    path: src/yomotsusaka/policy.py
+    kind: code
+  - id: schemas-impl
+    path: src/yomotsusaka/schemas.py
+    kind: code
+  - id: architecture-doc
+    path: docs/architecture.md
+    kind: reference
+
+edges:
+  # Group 1
+  - from: pipeline-impl
+    to: scaffold-status-doc
+    relation: documents
+  - from: facade-impl
+    to: scaffold-status-doc
+    relation: documents
+  - from: redactor-impl
+    to: scaffold-status-doc
+    relation: documents
+
+  # Group 2
+  - from: policy-example-config
+    to: architecture-doc
+    relation: documents
+  - from: model-example-config
+    to: architecture-doc
+    relation: documents
+  - from: policy-impl
+    to: architecture-doc
+    relation: documents
+  - from: schemas-impl
+    to: architecture-doc
+    relation: documents
